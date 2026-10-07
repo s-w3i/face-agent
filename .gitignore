@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+test-output/
+
+robot-config.json
+robot-config.json.*
+__pycache__/
+.venv/
+.env
+.env.*

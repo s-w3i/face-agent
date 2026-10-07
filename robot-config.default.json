@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "renderer": "original-dots",
+  "resourceRevision": "d3088a21304c701f8c4925ee32c4ccb62dd86a98df310028180131fc1ec5c203",
+  "appearance": {
+    "name": "Shiro",
+    "presetId": "",
+    "signatureAvailable": false,
+    "state": "T1JCQVNUMQAQAAAAc2l4X2xvYmVkX2Zsb3dlcgQAAABwaW5rEgAAAGhpZ2hsaWdodF9jYXBzdWxlcwQAAABub25lAQAAAAUAAABjcm93bgEAAAADAAAAYm93BgAAAG9yY2hpZAAAAAA/AQAAAAAAAIA/AACAPwAAgD8zM7M+AACAPwABH4VrvpqZGT4AAAAAAAAAAAAAAAAAAAAAPQpXP9ejcD+amVk/AAEfhWs+mpkZPgAAAAAAAAAAAAAAAAAAAAA9Clc/16NwP5qZWT8AAQEAAAAAAACAPwAAgD8AAIA/AACAPwAAgD8AAIA/AAAAAAAAAgAAAAQAAABib2R5BqRwPT8pXA8+AwAAAGJvdwe7uro+l5aWPoOCAj8Urkc/j8L1PQAAAIA/AACAPwAAgD9PUkJSSUcxAAAAAAAAAIA/AACAPwAAQD8AAEA/"
+  },
+  "settings": {
+    "quality": 1,
+    "reducedMotion": false,
+    "autoIdle": false,
+    "idleInterval": 5,
+    "motionStrength": 0.6,
+    "speechSource": "demo",
+    "speechLevel": 0.5,
+    "background": "light",
+    "ttsVoice": "coral"
+  }
+}

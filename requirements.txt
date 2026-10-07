@@ -1,0 +1,2 @@
+# Server-side OpenAI Realtime speech; no additional browser dependencies.
+websockets>=16.0,<17

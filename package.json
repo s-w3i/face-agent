@@ -1,0 +1,24 @@
+{
+  "name": "mimo-character-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --test test/*.test.js",
+    "import:dots": "python3 scripts/import_dots.py",
+    "robot": "python3 scripts/serve.py",
+    "dots": "python3 scripts/dotsctl.py"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "vite": "7.1.9"
+  }
+}
