@@ -58,6 +58,30 @@ API key. The Pi still sets up its own voice API key using the existing prompt.
 The ROS installation paths must exist on that device; cloning face-agent does
 not install ROS or the camera driver.
 
+## Automatic tracking during chat
+
+With the camera and robot display running, start chat from the face-agent folder:
+
+```sh
+.venv/bin/python scripts/chat.py --url http://127.0.0.1:5174
+```
+
+Chat starts the tracker automatically in its separate environment. It sources
+`/opt/ros/humble/setup.bash` for the tracker, or the selected `ROS_DISTRO` if set;
+the camera driver still runs separately. You do not need a separate `./track.sh`
+terminal. Tracking output, including first-time setup, goes to
+`~/.cache/face-agent/tracking-chat.log` (`XDG_CACHE_HOME` overrides the cache root).
+The chat terminal shows no routine tracking messages. A failed tracker produces
+one short error pointing to that log, and chat can continue.
+
+Typing `/quit`, closing chat input, or pressing Ctrl+C stops the tracker chat
+started and restores the original eyes. A tracker already running for the same
+robot service is reused and remains running after chat exits. Use `--no-track`
+for chat without camera tracking; keep the manual `./track.sh --stats` command
+above for diagnostics. Both launches keep the same wake-session person lock.
+
+## Check tracking setup
+
 Run this check before starting tracking on a new device:
 
 ```sh

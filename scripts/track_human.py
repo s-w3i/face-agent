@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Track one wake-session customer from a ROS color topic into Shiro's local gaze API."""
 import argparse
+import fcntl
 import json
 import math
 import os
+from pathlib import Path
 import platform
 import signal
 import sys
@@ -18,6 +20,21 @@ import numpy as np
 
 from human_tracker import PersonTracker, Vision
 from setup_tracking import MODEL_DIR, model_paths
+
+
+def tracker_lock(url):
+    """Manual and chat launches share one tracker per local service port."""
+    directory = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent'
+    directory.mkdir(parents=True, exist_ok=True)
+    address = urlparse(url)
+    port = address.port or (443 if address.scheme == 'https' else 80)
+    lock = (directory / f'tracking-{port}.lock').open('a')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
 
 
 def api(base, path, value=None):
@@ -154,6 +171,12 @@ def main():
     paths = model_paths()
     if not all(path.is_file() for path in paths):
         parser.exit(1, f'Missing tracking models in {MODEL_DIR}. Run ./track.sh for first-time setup.\n')
+    lock = None
+    if not args.check:
+        lock = tracker_lock(args.url)
+        if lock is None:
+            print('Tracker already running for this robot service; using the existing tracker.', flush=True)
+            return 0
     vision = Vision(*paths, threads=args.threads)
     if args.check:
         blank = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -224,6 +247,7 @@ def main():
         executor.shutdown(timeout_sec=2); spin.join(timeout=2); rclpy.shutdown()
         node.destroy_subscription(subscription); node.destroy_node()
         tracker.reset()
+        lock.close()
         print('Tracker stopped; original eyes restored.', flush=True)
     return 0
 

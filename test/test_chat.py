@@ -1,5 +1,6 @@
 """Verify conversation continuity and display cleanup without API calls."""
 import asyncio
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import json
 import io
@@ -8,17 +9,35 @@ from pathlib import Path
 import sys
 import tempfile
 import queue
+import subprocess
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from chat import Chatbot, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement
+from chat import Chatbot, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement, start_tracking
 from agents import WebSearchTool
 from agents.tool_context import ToolContext
 
 
 class ChatCheck(unittest.TestCase):
+    def setUp(self):
+        tracking = patch('chat.start_tracking')
+        self.tracking = tracking.start()
+        self.addCleanup(tracking.stop)
+
+    def test_tracking_starts_for_selected_service_and_can_be_disabled(self):
+        for flags in ([], ['--no-track']):
+            self.tracking.reset_mock()
+            with patch('sys.argv', ['chat.py', '--url', 'http://127.0.0.1:5174', *flags]), patch('chat.load_key'), patch('chat.robot_name', return_value='Shiro'), patch('chat.read_terminal', return_value='/quit'), patch('chat.Chatbot'):
+                self.assertEqual(asyncio.run(main()), 0)
+            if flags:
+                self.tracking.assert_not_called()
+            else:
+                self.tracking.assert_called_once_with('http://127.0.0.1:5174')
+                self.tracking.return_value.__exit__.assert_called_once()
+
     def test_closing_reply_finishes_before_sleep(self):
         async def check():
             with patch('chat.request', return_value={}):
@@ -172,6 +191,55 @@ class ChatCheck(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     await bot.reply(' ')
         asyncio.run(check())
+
+
+class TrackingLaunchCheck(unittest.TestCase):
+    def test_quiet_child_stops_on_exit_and_chat_failure(self):
+        original_popen = subprocess.Popen
+        for fail in (False, True):
+            with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {'XDG_CACHE_HOME': cache, 'OPENAI_API_KEY': 'must-not-be-inherited'}):
+                children = []
+                def spawn(command, **options):
+                    self.assertEqual(command[-2:], ['--url', 'http://127.0.0.1:5174'])
+                    self.assertNotIn('OPENAI_API_KEY', options['env'])
+                    self.assertEqual(options['stdin'], subprocess.DEVNULL)
+                    self.assertTrue(options['start_new_session'])
+                    child = original_popen([sys.executable, '-c', 'import sys,time; print("Tracking: debug", flush=True); print("ROS debug", file=sys.stderr, flush=True); time.sleep(60)'], **options)
+                    children.append(child)
+                    return child
+                console = io.StringIO()
+                with patch('chat.subprocess.Popen', side_effect=spawn), redirect_stdout(console), redirect_stderr(console):
+                    try:
+                        with start_tracking('http://127.0.0.1:5174'):
+                            log = Path(cache) / 'face-agent/tracking-chat.log'
+                            deadline = time.monotonic() + 3
+                            while 'ROS debug' not in log.read_text() and time.monotonic() < deadline:
+                                time.sleep(.01)
+                            self.assertIn('Tracking: debug', log.read_text())
+                            if fail:
+                                raise ValueError('chat failed')
+                    except ValueError:
+                        if not fail:
+                            raise
+                self.assertEqual(console.getvalue(), '')
+                self.assertIsNotNone(children[0].poll())
+
+    def test_tracker_failure_has_one_short_error_without_debug_output(self):
+        with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {'XDG_CACHE_HOME': cache}), patch('chat.subprocess.Popen', return_value=Mock(wait=Mock(return_value=1))), patch('chat.stop'), redirect_stderr(io.StringIO()) as console:
+            with start_tracking('http://127.0.0.1:5174'):
+                deadline = time.monotonic() + 2
+                while not console.getvalue() and time.monotonic() < deadline:
+                    time.sleep(.01)
+            self.assertEqual(console.getvalue().count('Eye tracking is unavailable.'), 1)
+            self.assertIn('tracking-chat.log', console.getvalue())
+
+    def test_launch_failure_keeps_chat_available(self):
+        with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {'XDG_CACHE_HOME': cache}), patch('chat.subprocess.Popen', side_effect=OSError('private launch detail')), redirect_stderr(io.StringIO()) as console:
+            with start_tracking('http://127.0.0.1:5174'):
+                continued = True
+            self.assertTrue(continued)
+            self.assertIn('Eye tracking could not start.', console.getvalue())
+            self.assertNotIn('private launch detail', console.getvalue())
 
 
 if __name__ == '__main__':

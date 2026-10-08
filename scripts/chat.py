@@ -3,13 +3,15 @@
 import argparse
 import asyncio
 from datetime import datetime
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 import json
 import os
 from pathlib import Path
 import sys
 import re
 import select
+import signal
+import subprocess
 import time
 import queue
 import threading
@@ -19,6 +21,47 @@ from zoneinfo import ZoneInfo
 from agents import Agent, Runner, WebSearchTool, function_tool, set_tracing_disabled
 from agents.mcp import MCPServerStdio
 from dotsctl import request
+from launch_robot import stop
+
+
+@contextmanager
+def start_tracking(url):
+    """Own a quiet tracker without changing chat's Python/ROS environment."""
+    root = Path(__file__).resolve().parents[1]
+    log_path = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent/tracking-chat.log'
+    output = None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        output = log_path.open('a')
+        env = os.environ.copy()
+        env.pop('OPENAI_API_KEY', None)
+        env.setdefault('TRACKING_PYTHON', '/usr/bin/python3')
+        setup = Path('/opt/ros') / env.get('ROS_DISTRO', 'humble') / 'setup.bash'
+        process = subprocess.Popen(
+            ['bash', '-c', 'if [ -f "$1" ]; then source "$1"; fi; shift; exec "$@"',
+             'shiro-tracker', str(setup), str(root / 'track.sh'), '--url', url],
+            cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError:
+        if output:
+            output.close()
+        print(f'Eye tracking could not start. Check {log_path}. Chat can continue.', file=sys.stderr)
+        yield
+        return
+    closing = threading.Event()
+    def watch():
+        if process.wait() != 0 and not closing.is_set():
+            print(f'Eye tracking is unavailable. Check {log_path}. Chat can continue.', file=sys.stderr)
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        closing.set()
+        stop(process)
+        watcher.join(timeout=2)
+        output.close()
 
 
 def current_datetime(timezone: str = '') -> dict[str, str]:
@@ -313,6 +356,8 @@ async def main():
     parser.add_argument('--speak', action=argparse.BooleanOptionalAction, default=True,
                         help='Play spoken replies (default); --no-speak disables speech.')
     parser.add_argument('--turtlesim', action='store_true', help='Connect the local ROS 2 turtlesim MCP server.')
+    parser.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
+                        help='Start human eye tracking quietly (default); --no-track disables it.')
     args = parser.parse_args()
     try:
         load_key()
@@ -322,6 +367,8 @@ async def main():
     # Keep conversation text out of SDK trace uploads.
     set_tracing_disabled(True)
     async with AsyncExitStack() as stack:
+        if args.track:
+            stack.enter_context(start_tracking(args.url))
         server = None
         if args.turtlesim:
             server = await stack.enter_async_context(MCPServerStdio(
@@ -426,6 +473,9 @@ async def chat_loop(args, server=None):
 
 
 if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:

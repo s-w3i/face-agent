@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -15,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from human_tracker import PersonTracker
-from track_human import LatestFrame, RobotLink, api, decode
+from track_human import LatestFrame, RobotLink, api, decode, tracker_lock
 from serve import RobotServer
 from urllib.error import HTTPError
 import setup_tracking
@@ -50,6 +51,17 @@ class HumanTrackerCheck(unittest.TestCase):
         for now in (0, .34, .68):
             packet = self.tracker.process(self.image, now)
         self.assertTrue(packet['detected']); self.assertEqual(self.tracker.state, 'tracking')
+
+    def test_only_one_tracker_per_robot_service_and_lock_releases(self):
+        with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {'XDG_CACHE_HOME': cache}):
+            first = tracker_lock('http://127.0.0.1:5174')
+            with first:
+                self.assertIsNone(tracker_lock('http://localhost:5174/'))
+                self.assertIsNone(tracker_lock('http://[::1]:5174'))
+                with tracker_lock('http://127.0.0.1:5175'):
+                    pass
+            with tracker_lock('http://localhost:5174'):
+                pass
 
     def test_first_person_stays_locked_and_identity_never_expires(self):
         self.acquire(); original = self.tracker.identity.copy()
