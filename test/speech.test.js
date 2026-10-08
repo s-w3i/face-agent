@@ -2,6 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SpeechPlayer } from '../src/speech.js';
 
+test('voice startup initializes audio while a browser permission leaves resume pending', async () => {
+  const savedContext = globalThis.AudioContext;
+  let allowAudio;
+  globalThis.AudioContext = class {
+    state = 'suspended';
+    resume() { return new Promise(resolve => { allowAudio = () => { this.state = 'running'; resolve(); }; }); }
+    close() {}
+  };
+  const player = new SpeechPlayer();
+  let ready = false;
+  try {
+    const enabling = player.enable().then(() => { ready = true; });
+    assert.equal(player.context.state, 'suspended');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ready, false);
+    allowAudio(); await enabling;
+    assert.equal(player.context.state, 'running');
+    assert.equal(ready, true);
+  } finally { player.dispose(); globalThis.AudioContext = savedContext; }
+});
+
 test('speech measures actual audio, ends cleanly, and cancels delayed decoding', async () => {
   const sources = [];
   const savedContext = globalThis.AudioContext;

@@ -231,6 +231,25 @@ function openKeySetup() {
   $('#tts-key-error').textContent = ''; $('#tts-key-input').value = '';
   $('#tts-key-dialog').showModal();
 }
+async function enableRobotVoice() {
+  const gate = $('#robot-audio-gate');
+  try {
+    const enabled = speech.enable();
+    gate.hidden = speech.context?.state === 'running';
+    await enabled;
+    gate.hidden = speech.context?.state === 'running';
+    if (!gate.hidden || !pendingSpeech) return;
+    const { url, text } = pendingSpeech, request = speechRequest; pendingSpeech = null;
+    speechFetch = new AbortController();
+    const response = await fetch(url, { cache: 'no-store', signal: speechFetch.signal });
+    if (request !== speechRequest) return;
+    if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
+    await playSpeech(response, text);
+  } catch (error) {
+    gate.hidden = speech.context?.state === 'running';
+    if (error.name !== 'AbortError') toast(error.message);
+  }
+}
 async function setupVoice() {
   voiceInfo = await api('voice'); keyConfigured = voiceInfo.configured;
   $('#tts-model').textContent = `Model · ${voiceInfo.model}`;
@@ -274,18 +293,14 @@ async function setupVoice() {
     name = event.target.value.slice(0, 24); $('#native-name').textContent = name;
     $('#tts-sample-text').textContent = `“Hi, I am ${name}.”`; requestSave();
   });
-  if (robotView) $('#robot-enable-voice').addEventListener('click', async () => {
-    try {
-      await speech.enable(); $('#robot-audio-gate').hidden = true;
-      if (pendingSpeech) {
-        const { url, text } = pendingSpeech; pendingSpeech = null;
-        speechFetch = new AbortController();
-        const response = await fetch(url, { cache: 'no-store', signal: speechFetch.signal });
-        if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
-        await playSpeech(response, text);
-      }
-    } catch (error) { toast(error.message); }
-  });
+  if (robotView) {
+    $('#robot-enable-voice').addEventListener('click', enableRobotVoice);
+    const retryVoice = () => { if (speech.context?.state !== 'running') enableRobotVoice(); };
+    document.addEventListener('click', retryVoice, { once: true });
+    document.addEventListener('keydown', retryVoice, { once: true });
+    // A blocked resume can wait for a gesture; let the character load meanwhile.
+    enableRobotVoice();
+  }
 }
 function syncVoiceControls() {
   const enabled = !!voiceState;

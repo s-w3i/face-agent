@@ -34,7 +34,15 @@ When no key is available, the page asks for one. Paste it into the password fiel
 
 The server stores the key in `~/.config/mimo-dots/openai-api-key` (or beneath `XDG_CONFIG_HOME`), outside the workspace and web files. The directory is mode `0700` and the file is mode `0600`; writes are atomic. This is a private plaintext file protected by OS permissions, not an encrypted vault: processes running as your OS account or root can read it. Alternatively, provide `OPENAI_API_KEY` through the server environment, which takes precedence over the saved file. Credential setup and billable speech requests accept only local-machine access with a localhost Host header; cross-origin JSON requests are rejected. Configure the Pi's own key locally rather than putting it in `dist/` or `robot-config.json`.
 
-On the robot page, click **Enable voice** once to permit browser audio, then issue `say` from either animation terminal. `say` alone speaks the saved greeting; `say Hello, I am your robot` speaks custom text using the saved voice. The audio drives Speaking and returns to idle after it finishes. If the browser has not allowed sound yet, the latest clip waits for **Enable voice**. Audio clips stay in server memory, with only the latest robot clip retained; they are not written to disk.
+The robot page enables voice automatically on every launch, then accepts `say` from either animation terminal. Browser autoplay rules can still require an interaction: when that happens, the character loads normally and **Enable voice** remains available. The first tap/click or key press also retries audio activation, and the latest queued clip plays once sound is allowed. `say` alone speaks the saved greeting; `say Hello, I am your robot` speaks custom text using the saved voice. The audio drives Speaking and returns to idle after it finishes. Audio clips stay in server memory, with only the latest robot clip retained; they are not written to disk.
+
+For unattended voice playback on the Pi, start a separate Chromium robot profile with its [documented autoplay flag](https://developer.chrome.com/blog/autoplay/#developer-switches), alongside the running service:
+
+```sh
+chromium --user-data-dir="$HOME/.config/face-agent-chromium" --autoplay-policy=no-user-gesture-required --app=http://127.0.0.1:5174/robot.html
+```
+
+Use the service's actual port in that URL. Voice still needs the configured OpenAI API key and an audio output device.
 
 ```sh
 python3 scripts/dotsctl.py --url http://127.0.0.1:5174 say
