@@ -76,8 +76,9 @@ an optional server environment override and is never exported.
 Shiro's bundled pack includes eye positions for each body frame. The lightweight
 player moves the original eye pair using small Canvas 2D image patches, easing
 the surrounding fur back to fixed edges. The body, crown, blinks, highlights and
-audio-driven speaking poses still come from the saved WebP sheets. No camera
-capture or person detector is included yet.
+audio-driven speaking poses still come from the saved WebP sheets. The optional
+[local ROS camera tracker](human-tracking.md) selects one person per wake session
+and supplies live targets while retaining the pre-rendered body.
 
 **Human eye tracking** is on by default while awake. A critically damped filter
 smooths target changes, with a small dead zone for camera jitter. **Gaze response**
@@ -93,7 +94,7 @@ pointer**, to simulate a continuous camera target. Test `idle`, `listening`,
 eyes** stops the simulated target. Close the panel to leave the display clear.
 Simulation continues until you turn it off or close the page.
 
-A future camera tracker should send the person's face center at 10–30 Hz:
+A camera integration can send the person's face center at 10–30 Hz:
 
 ```sh
 curl -X POST http://127.0.0.1:5174/api/gaze \

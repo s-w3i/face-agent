@@ -135,6 +135,7 @@ class RobotServer(ThreadingHTTPServer):
         self.changed = threading.Condition()
         self.generation = uuid.uuid4().hex
         self.command = dict(generation=self.generation, sequence=0, state='idle', level=None)
+        self.wake_session = 0
         self.actions = []; self.ack = None; self.displays = 0
         self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
         super().__init__(address, Handler)
@@ -144,6 +145,18 @@ class RobotServer(ThreadingHTTPServer):
 
     def gaze_value(self):
         return dict(self.gaze, ageMs=round((time.monotonic() - self.gaze_at) * 1000))
+
+    def tracking_session(self):
+        return f'{self.generation}:{self.wake_session}'
+
+    def change_command(self, state, **fields):
+        # A session token preserves fast sleep/wake transitions between tracker polls.
+        if (state == 'sleeping') != (self.command['state'] == 'sleeping'):
+            self.wake_session += 1
+            self.gaze = dict(sequence=self.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
+            self.gaze_at = time.monotonic()
+        self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
+                            state=state, **fields)
 
     def api_key(self):
         key = os.environ.get('OPENAI_API_KEY', '').strip()
@@ -371,7 +384,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
                                     displays=self.server.displays, command=self.server.command,
-                                    acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value()))
+                                    acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value(),
+                                    trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping'))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -399,11 +413,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.reply(dict(saved=True)); return
             value = self.body()
             if path == '/api/gaze':
-                if not isinstance(value, dict) or type(value.get('detected')) is not bool or set(value) - {'detected', 'x', 'y'}:
+                if not isinstance(value, dict) or type(value.get('detected')) is not bool or set(value) - {'detected', 'x', 'y', 'session'}:
                     raise ValueError('Send detected and normalized x/y coordinates for gaze.')
+                if 'session' in value and not isinstance(value['session'], str):
+                    raise ValueError('Invalid tracking session.')
                 if value['detected'] and any(type(value.get(k)) not in (int, float) or not math.isfinite(value[k]) or not 0 <= value[k] <= 1 for k in ('x', 'y')):
                     raise ValueError('Gaze x and y must be between 0 and 1.')
                 with self.server.changed:
+                    if 'session' in value and (value['session'] != self.server.tracking_session() or
+                                              value['detected'] and self.server.command['state'] == 'sleeping'):
+                        self.reply(dict(error='Tracking session changed; discard the old camera target.'), 409); return
                     self.server.gaze = dict(sequence=self.server.gaze['sequence'] + 1, detected=value['detected'], x=value.get('x', .5) if value['detected'] else .5, y=value.get('y', .5) if value['detected'] else .5)
                     self.server.gaze_at = time.monotonic(); self.server.changed.notify_all(); self.reply(self.server.gaze_value())
                 return
@@ -447,8 +466,7 @@ class Handler(SimpleHTTPRequestHandler):
                         self.reply(dict(error='Speech cancelled by a newer animation command.'), 409); return
                     identifier = uuid.uuid4().hex
                     self.server.audio = (identifier, audio)
-                    self.server.command = dict(generation=self.server.generation, sequence=self.server.command['sequence'] + 1,
-                                               state='speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip())
+                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip())
                     self.server.ack = None; self.server.changed.notify_all()
                     if streaming:
                         threading.Thread(target=self.server.finish_clip, args=(audio, events, self.server.command['sequence']), daemon=True).start()
@@ -483,7 +501,7 @@ class Handler(SimpleHTTPRequestHandler):
                     level = value.get('level')
                     if level is not None and (action['id'] != 'speaking' or isinstance(level, bool) or not isinstance(level, (int, float)) or not math.isfinite(level) or not 0 <= level <= 1):
                         raise ValueError('Speech level is only valid with speaking, between 0 and 1.')
-                    self.server.command = dict(generation=self.server.generation, sequence=self.server.command['sequence'] + 1, state=action['id'], level=level)
+                    self.server.change_command(action['id'], level=level)
                     self.server.ack = None; self.server.changed.notify_all()
                     self.reply(dict(**self.server.command, displays=self.server.displays))
                 return

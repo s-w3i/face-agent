@@ -1,0 +1,3 @@
+# CPU-only ARM64 wheels; keep this environment separate from voice and ROS packages.
+numpy>=1.24,<2
+opencv-python-headless==4.11.0.86
