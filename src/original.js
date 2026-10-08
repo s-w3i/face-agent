@@ -3,6 +3,7 @@ import { attachVoiceMotion, voiceMotionPose } from './native-voice.js';
 import { REST_POSE } from './motion.js';
 import { ORIGINAL_ACTIONS, VOICE_ACTIONS, signatureActions, IdleMovements } from './native-actions.js';
 import { SpeechPlayer } from './speech.js';
+import { NativeFraming } from './native-framing.js';
 
 const $ = selector => document.querySelector(selector);
 const robotView = document.body.dataset.view === 'robot';
@@ -52,6 +53,7 @@ let sequence = 0n, episode = 0n, savePending = false, syncPending = false, signa
 let quality = 1, lastFrame = 0, statsAt = 0, frames = 0, tourIndex = -1, nextTourAt = 0;
 let actions = [...ORIGINAL_ACTIONS, ...VOICE_ACTIONS], tour = [], activeAction = null, previewLook = null, pointerInside = false;
 const idleMovements = new IdleMovements();
+const framing = robotView ? new NativeFraming() : null;
 let configLoaded = false, fileConfig, saveQueued = null, saving = false, events, commandLevel = null, desiredState = 'idle', lastCommand = -1;
 let saveAfter = 0;
 let commandGeneration = '';
@@ -169,6 +171,7 @@ function connectRobot() {
 }
 function resize() {
   if (!character) return;
+  framing?.reset();
   const rect = $('#native-viewport').getBoundingClientRect();
   const size = Math.max(1, Math.round(Math.min(quality === 1 ? 512 : 1024, Math.min(rect.width, rect.height) * (quality === 1 ? 1 : Math.min(devicePixelRatio, 1.5)))));
   character.resize(size, size); character.setDisplayScale(size / Math.min(rect.width, rect.height));
@@ -333,6 +336,7 @@ function startActivity(activity) {
 }
 function playAction(id, manual = true, keepSpeech = false) {
   const definition = actions.find(action => action.id === id); if (!definition) return;
+  framing?.reset();
   if (!keepSpeech) stopSpeech();
   if (manual) stopTour();
   commandLevel = null;
@@ -431,7 +435,19 @@ function frame(now) {
       voice.update(voicePose);
       if (!voicePaused) $('#voice-time').value = voiceState ? voiceTime : 0;
       $('#voice-time-label').textContent = `${(voiceState ? voiceTime : 0).toFixed(2)} s`;
-      if (character.render(now / 1000)) frames++;
+      const rendered = character.render(now / 1000);
+      if (rendered) frames++;
+      if (framing) {
+        const rect = $('#native-viewport').getBoundingClientRect();
+        let bottom = rect.bottom;
+        for (const id of ['robot-subtitles', 'robot-audio-gate']) {
+          const overlay = $(`#${id}`);
+          if (!overlay.hidden) bottom = Math.min(bottom, overlay.getBoundingClientRect().top - 12);
+        }
+        const canvas = $('#original-character');
+        const size = framing.update(canvas, rect.width, Math.max(1, bottom - rect.top), rendered);
+        if (size) character.setDisplayScale(canvas.width / size);
+      }
       if (((savePending && now >= saveAfter) || syncPending) && !previewLook && !character.hasPendingUpdate()) {
         appearance = character.state(); syncAppearance(); syncPending = false;
         if (savePending) { savePending = false; persistConfig(configSnapshot()); }
