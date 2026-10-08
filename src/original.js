@@ -4,6 +4,7 @@ import { REST_POSE } from './motion.js';
 import { ORIGINAL_ACTIONS, VOICE_ACTIONS, signatureActions, IdleMovements } from './native-actions.js';
 import { SpeechPlayer } from './speech.js';
 import { NativeFraming } from './native-framing.js';
+import { matchingBake } from './prerendered.js';
 
 const $ = selector => document.querySelector(selector);
 const robotView = document.body.dataset.view === 'robot';
@@ -35,6 +36,7 @@ ${actionGroup('Added voice motions', VOICE_ACTIONS)}
 <label class="field-label spaced" for="native-quality">Rendering</label><select class="full-select" id="native-quality" disabled><option value="1">Compact · 30 fps target</option><option value="2">Balanced · 60 fps target</option></select>
 <label class="toggle-row"><span><strong>Reduced motion</strong><small>Use the native quiet-motion setting</small></span><input id="native-reduced" type="checkbox" role="switch" disabled><span class="switch"></span></label>
 <label class="field-label" for="robot-background">Robot display background</label><select class="full-select" id="robot-background" disabled><option value="light">Light</option><option value="dark">Dark</option></select>
+<section class="bake-settings" aria-label="Pre-rendered playback"><h3>Raspberry Pi playback</h3><label class="field-label" for="robot-playback">Robot renderer</label><select class="full-select" id="robot-playback" disabled><option value="live">Live 3D · editable</option><option value="prerendered">Pre-rendered · lightweight</option></select><p class="settings-note">Bake this look on your computer: transparent 512 px frames, all original actions, listening, and 21 speaking poses driven by live audio. Keep this page visible while baking.</p><div class="speech-buttons"><button id="robot-bake" class="outline-button" disabled>Bake saved character</button><button id="robot-bake-cancel" class="text-button" hidden>Cancel</button></div><p id="robot-bake-status" class="settings-note" role="status">Checking saved animation pack…</p><a id="robot-bake-preview" class="text-button" href="./robot.html?renderer=prerendered" target="_blank" rel="noopener" hidden>Test pre-rendered display ↗</a><p class="settings-note">Saved in <code>public/prerendered/</code>. Copy this folder and <code>robot-config.json</code> to your Pi. Re-bake after changing the look, motion strength, reduced motion or background.</p></section>
 <div class="robot-file-note"><strong>One local configuration</strong><code id="robot-config-path">robot-config.json</code><small>Appearance and settings save automatically. The robot display follows this file.</small></div>
 <details class="robot-terminal"><summary>Animation terminal</summary><p>Open the robot display, then enter a state. Try <code>sleeping</code>, <code>speaking 0.8</code>, <code>idle</code>, <code>wave</code>, or <code>say Hello!</code> for speech.</p><form id="robot-command"><label class="field-label" for="robot-command-input">Animation state or speech</label><div><input id="robot-command-input" autocomplete="off" spellcheck="false" list="robot-states" placeholder="say Hi, I am your robot" disabled><button type="submit" disabled>Send</button></div></form><datalist id="robot-states"></datalist><pre id="robot-command-log" aria-live="polite">dots&gt; ready</pre><p>OS terminal: <code>python3 scripts/dotsctl.py</code></p></details>
 <div class="render-stats"><div><span>Frame rate</span><strong id="native-fps">—</strong></div><div><span>Triangles</span><strong id="native-triangles">—</strong></div><div><span>Renderer version</span><strong id="native-version">—</strong></div></div>
@@ -65,6 +67,7 @@ let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch 
 let voiceInfo = null;
 let voiceMigrationNote = '';
 let toastTimer;
+let bakedManifest = null, bakeController = null;
 const base = new URL('./local-dots/', location.href);
 const encode = bytes => btoa(String.fromCharCode(...bytes));
 const decode = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
@@ -81,7 +84,7 @@ async function api(path, value, method = 'POST') {
 function settingsSnapshot() {
   return { quality, reducedMotion: $('#native-reduced').checked, autoIdle: $('#native-auto').checked,
     idleInterval: Number($('#native-interval').value), motionStrength: Number($('#voice-strength').value),
-    speechSource: $('#voice-source').value, speechLevel: Number($('#voice-level').value), background: $('#robot-background').value, ttsVoice: $('#tts-voice').value || 'marin' };
+    speechSource: $('#voice-source').value, speechLevel: Number($('#voice-level').value), background: $('#robot-background').value, ttsVoice: $('#tts-voice').value || 'marin', playback: $('#robot-playback').value };
 }
 function configSnapshot() {
   return { version: 1, renderer: 'original-dots', resourceRevision: bundle.resourceRevision,
@@ -96,6 +99,7 @@ function applySettings(settings) {
   $('#voice-source').value = settings.speechSource; $('#voice-level').value = settings.speechLevel;
   $('#voice-level-label').textContent = `${Math.round(settings.speechLevel * 100)}%`;
   $('#robot-background').value = settings.background;
+  $('#robot-playback').value = settings.playback || 'live';
   const selectedVoice = settings.ttsVoice || 'marin';
   const supportedVoice = voiceInfo.voices.includes(selectedVoice);
   $('#tts-voice').value = supportedVoice ? selectedVoice : 'marin';
@@ -118,6 +122,7 @@ async function persistConfig(value) {
     while (saveQueued) {
       const next = saveQueued; saveQueued = null;
       const result = await api('config', next, 'PUT');
+      fileConfig = next; syncBakeStatus();
       $('#robot-config-path').textContent = result.path;
       $('#native-save').textContent = 'Configuration saved to robot-config.json';
     }
@@ -132,6 +137,7 @@ function connectRobot() {
   events.addEventListener('config', event => {
     try {
       const value = JSON.parse(event.data), state = readConfigLook(value);
+      if (value.settings.playback === 'prerendered') { location.reload(); return; }
       if (fileConfig && JSON.stringify(value) === JSON.stringify(fileConfig)) return;
       const level = commandLevel; playAction('idle', false, true);
       const error = character.restore(state); if (error) throw new Error(error);
@@ -194,6 +200,37 @@ function syncAppearance() {
   $('[data-action="signature"]').disabled = !signatureAvailable;
 }
 function requestSave() { if (!robotView && configLoaded) { savePending = true; saveAfter = performance.now() + 250; $('#native-save').textContent = 'Saving configuration…'; } }
+function syncBakeStatus() {
+  if (robotView || bakeController) return;
+  $('#robot-bake-preview').hidden = !bakedManifest;
+  $('#robot-playback option[value="prerendered"]').disabled = !bakedManifest;
+  $('#robot-bake-status').textContent = !bakedManifest ? 'No baked library yet. Bake your saved character here.' :
+    matchingBake(configSnapshot(), bakedManifest) ? `Saved library · ${bakedManifest.clips.length} animations · 512 px / 16 fps` : 'Saved library needs a new bake to match these settings.';
+}
+async function bakeSavedCharacter() {
+  if (bakeController) return;
+  playAction('idle'); stopTour();
+  // Finish native appearance updates before taking a snapshot.
+  while (character.hasPendingUpdate()) await new Promise(resolve => requestAnimationFrame(resolve));
+  const config = configSnapshot(); savePending = false;
+  await persistConfig(config);
+  const saved = await api('config');
+  if (JSON.stringify(saved) !== JSON.stringify(config)) { toast('Save the current configuration before baking.'); return; }
+  const controller = bakeController = new AbortController();
+  const controls = [...document.querySelectorAll('button, select, input')].filter(control => control.id !== 'robot-bake-cancel');
+  const disabled = controls.map(control => control.disabled); controls.forEach(control => { control.disabled = true; });
+  $('#robot-bake-cancel').hidden = false; $('#robot-bake-cancel').disabled = false;
+  character.setActive(false);
+  try {
+    const { bakeDots } = await import('./bake-dots.js');
+    bakedManifest = await bakeDots(engine, config, actions, controller.signal, message => { $('#robot-bake-status').textContent = `Baking · ${message}`; });
+    toast('Saved pre-rendered library. Open Test pre-rendered display, or select the lightweight robot renderer.');
+  } catch (error) { toast(error.name === 'AbortError' ? 'Bake cancelled. Your previous library is preserved.' : error.message); }
+  finally {
+    bakeController = null; controls.forEach((control, i) => { control.disabled = disabled[i]; });
+    $('#robot-bake-cancel').hidden = true; character?.setActive(true); syncBakeStatus();
+  }
+}
 function syncName() {
   $('#native-name').textContent = name; $('#robot-name').value = name;
   $('#tts-sample-text').textContent = `“Hi, I am ${name}.”`;
@@ -404,6 +441,7 @@ function stepTour(now) {
   $('#native-tour').textContent = `Stop · ${tourIndex + 1}/${tour.length}`; nextTourAt = Infinity;
 }
 function frame(now) {
+  if (bakeController) { requestAnimationFrame(frame); return; }
   if (character && !document.hidden && now - lastFrame >= 1000 / (quality === 1 ? 30 : 60)) {
     const interval = 1000 / (quality === 1 ? 30 : 60);
     lastFrame = now - ((now - lastFrame) % interval);
@@ -500,6 +538,7 @@ async function start() {
     document.querySelectorAll('button, select, input').forEach(control => control.disabled = false); syncAppearance(); syncVoiceControls(); syncIdleControls();
     $('#tts-stop').disabled = true; voiceReady();
     configLoaded = true;
+    if (!robotView) { bakedManifest = await api('prerender'); syncBakeStatus(); }
     if (!robotView && (!fileConfig?.appearance || !voiceInfo.voices.includes(fileConfig?.settings?.ttsVoice || 'marin'))) requestSave();
     const status = await api('status'); $('#robot-config-path').textContent = status.configFile;
     await api('actions', actions.map(({ id, label }) => ({ id, label })));
@@ -507,7 +546,9 @@ async function start() {
     if (robotView) connectRobot();
     if (!keyConfigured) openKeySetup();
     $('#robot-save').addEventListener('click', () => { requestSave(); saveAfter = 0; });
-    for (const id of ['native-quality', 'native-reduced', 'native-auto', 'native-interval', 'voice-strength', 'voice-source', 'voice-level', 'robot-background']) {
+    $('#robot-bake').addEventListener('click', () => bakeSavedCharacter().catch(error => toast(error.message)));
+    $('#robot-bake-cancel').addEventListener('click', () => bakeController?.abort());
+    for (const id of ['native-quality', 'native-reduced', 'native-auto', 'native-interval', 'voice-strength', 'voice-source', 'voice-level', 'robot-background', 'robot-playback']) {
       $(`#${id}`).addEventListener(['native-interval', 'voice-strength', 'voice-level'].includes(id) ? 'input' : 'change', requestSave);
     }
     $('#robot-background').addEventListener('change', () => { document.body.dataset.robotBackground = $('#robot-background').value; });
@@ -582,15 +623,16 @@ async function start() {
       document.addEventListener('fullscreenchange', () => { $('#robot-fullscreen').textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Enter fullscreen'; resize(); });
     }
     document.addEventListener('visibilitychange', () => {
+      if (document.hidden) bakeController?.abort();
       if (document.hidden && !robotView && savePending) { savePending = false; persistConfig(configSnapshot()); }
-      character?.setActive(!document.hidden);
+      character?.setActive(!document.hidden && !bakeController);
       if (!document.hidden) {
         voiceNow = performance.now(); idleMovements.reset(); pointerInside = false;
         if (activeAction) playAction(activeAction.definition.id, false);
         else nextTourAt = performance.now() + 6000;
       }
     });
-    addEventListener('pagehide', () => { if (!robotView && savePending) persistConfig(configSnapshot()); stopTour(); events?.close(); speech.dispose(); character?.delete(); character = undefined; voice?.dispose(); }, { once: true });
+    addEventListener('pagehide', () => { bakeController?.abort(); if (!robotView && savePending) persistConfig(configSnapshot()); stopTour(); events?.close(); speech.dispose(); character?.delete(); character = undefined; voice?.dispose(); }, { once: true });
     requestAnimationFrame(frame);
   } catch (error) { $('#native-loading').textContent = error.message; $('#native-save').textContent = 'Original renderer unavailable'; console.error(error); }
 }

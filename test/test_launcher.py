@@ -27,7 +27,7 @@ class LauncherCheck(unittest.TestCase):
                 shutil.copy2(ROOT / name, origin / name)
             shutil.copytree(ROOT / 'dist', origin / 'dist')
             (origin / 'scripts').mkdir()
-            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py'):
+            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py', 'prerender.py'):
                 shutil.copy2(ROOT / 'scripts' / name, origin / 'scripts' / name)
             subprocess.run(['git', 'init', '--quiet', str(origin)], check=True)
             subprocess.run(['git', '-C', str(origin), 'add', '.'], check=True)
@@ -66,6 +66,11 @@ class LauncherCheck(unittest.TestCase):
                             self.assertEqual(response.headers['Cross-Origin-Embedder-Policy'], 'require-corp')
                         with urlopen(base + '/local-dots/orbit-characters.wasm') as response:
                             self.assertEqual(response.read(4), b'\0asm')
+                        if (clone / 'dist/prerendered/manifest.json').exists():
+                            with urlopen(base + '/api/prerender') as response:
+                                pack = json.load(response)
+                            with urlopen(base + f'/prerendered/{pack["id"]}/{pack["clips"][0]["sheets"][0]}') as response:
+                                self.assertEqual(response.read(4), b'RIFF')
                         with urlopen(base + '/api/voice') as response:
                             self.assertFalse(json.load(response)['configured'])
                     finally:

@@ -14,6 +14,7 @@ import time
 import uuid
 import wave
 from urllib.parse import urlparse
+from prerender import RenderPacks
 try:
     from websockets.sync.client import connect
     from websockets.exceptions import InvalidStatus, WebSocketException
@@ -86,8 +87,10 @@ def validate_config(value, pending=False):
         raise ValueError('Invalid speech source or background.')
     if settings.get('ttsVoice', 'marin') not in VOICES + (LEGACY_VOICES if pending else ()):
         raise ValueError('Choose an available OpenAI voice.')
+    if settings.get('playback', 'live') not in ('live', 'prerendered'):
+        raise ValueError('Choose live or pre-rendered playback.')
     # Only these fields can reach the public configuration/event stream.
-    if set(value) - {'version', 'renderer', 'resourceRevision', 'appearance', 'settings'} or set(settings) - {'autoIdle', 'reducedMotion', 'idleInterval', 'motionStrength', 'speechLevel', 'quality', 'speechSource', 'background', 'ttsVoice'} or (look and set(look) - {'name', 'presetId', 'signatureAvailable', 'state'}):
+    if set(value) - {'version', 'renderer', 'resourceRevision', 'appearance', 'settings'} or set(settings) - {'autoIdle', 'reducedMotion', 'idleInterval', 'motionStrength', 'speechLevel', 'quality', 'speechSource', 'background', 'ttsVoice', 'playback'} or (look and set(look) - {'name', 'presetId', 'signatureAvailable', 'state'}):
         raise ValueError('Unknown configuration fields. API keys belong in the private key setup.')
     return value
 
@@ -116,6 +119,10 @@ class RobotServer(ThreadingHTTPServer):
     def __init__(self, address, config_file=None, static_root=None, key_file=None):
         self.config_file = Path(config_file or os.environ.get('DOTS_CONFIG', ROOT / 'robot-config.json')).resolve()
         self.static_root = Path(static_root or ROOT / 'dist').resolve()
+        packs = ROOT / 'public/prerendered'
+        if not packs.exists() and (self.static_root / 'prerendered/manifest.json').is_file():
+            packs = self.static_root / 'prerendered'
+        self.render_packs = RenderPacks(packs)
         self.key_file = Path(key_file or Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'mimo-dots' / 'openai-api-key').resolve()
         if self.key_file.is_relative_to(self.static_root) or self.key_file.is_relative_to(ROOT):
             raise ValueError('The private key must be outside the workspace and web files.')
@@ -270,6 +277,12 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(args[2].static_root), **kwargs)
 
+    def translate_path(self, path):
+        path = urlparse(path).path
+        if re.fullmatch(r'/prerendered/[a-f0-9]{32}/[a-z0-9-]{1,80}-[0-9]{1,3}\.webp', path):
+            return str(self.server.render_packs.root / path.removeprefix('/prerendered/'))
+        return super().translate_path(path)
+
     def end_headers(self):
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
@@ -308,12 +321,15 @@ class Handler(SimpleHTTPRequestHandler):
         if self.client_address[0] not in ('127.0.0.1', '::1') or urlparse('http://' + self.headers.get('Host', '')).hostname not in ('localhost', '127.0.0.1', '::1'):
             raise ValueError('Open Voice settings on localhost to set up or use the API key.')
 
-    def body(self):
+    def check_origin(self):
         origin = self.headers.get('Origin')
         if origin:
             source = urlparse(origin)
             if source.netloc != self.headers.get('Host') and not (source.hostname in ('localhost', '127.0.0.1') and source.port in (5173, 5174, self.server.server_port)):
                 raise ValueError('Commands and saves must come from the local studio.')
+
+    def body(self):
+        self.check_origin()
         if self.headers.get_content_type() != 'application/json':
             raise ValueError('Send application/json to the local service.')
         size = int(self.headers.get('Content-Length', '0'))
@@ -324,6 +340,9 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         try:
+            if path == '/api/prerender':
+                manifest = self.server.render_packs.root / 'manifest.json'
+                self.reply(json.loads(manifest.read_text()) if manifest.exists() else None); return
             if path == '/api/voice':
                 self.local_voice()
                 self.reply(dict(configured=bool(self.server.api_key()), source='environment' if os.environ.get('OPENAI_API_KEY', '').strip() else 'private file', voices=VOICES, model=SPEECH_MODEL)); return
@@ -360,7 +379,26 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            upload = re.fullmatch(r'/api/prerender/([a-f0-9]{32})/([a-z0-9-]{1,80}-[0-9]{1,3}\.webp)', path)
+            if upload:
+                self.local_voice(); self.check_origin()
+                size = int(self.headers.get('Content-Length', '0'))
+                if self.headers.get_content_type() != 'image/webp' or not 0 < size <= 8_000_000:
+                    raise ValueError('Upload a WebP sheet smaller than 8 MB.')
+                self.server.render_packs.upload(*upload.groups(), self.rfile.read(size))
+                self.reply(dict(saved=True)); return
             value = self.body()
+            if path == '/api/prerender':
+                self.local_voice()
+                self.reply(dict(id=self.server.render_packs.begin())); return
+            commit = re.fullmatch(r'/api/prerender/([a-f0-9]{32})(/cancel)?', path)
+            if commit:
+                self.local_voice()
+                if commit[2]: self.server.render_packs.cancel(commit[1])
+                else:
+                    self.server.render_packs.publish(commit[1], value, validate_config)
+                    with self.server.changed: self.server.changed.notify_all()
+                self.reply(dict(saved=True)); return
             if path == '/api/key':
                 self.local_voice()
                 if not isinstance(value, dict): raise ValueError('Supply an OpenAI API key.')
@@ -433,7 +471,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1
+        seen_config = None; seen_command = -1; seen_pack = None
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -445,6 +483,11 @@ class Handler(SimpleHTTPRequestHandler):
                     except (OSError, ValueError) as error:
                         self.event('config-error', dict(error=str(error)))
                     seen_config = stamp
+                manifest = self.server.render_packs.root / 'manifest.json'
+                pack_stamp = manifest.stat().st_mtime_ns if manifest.exists() else 0
+                if pack_stamp != seen_pack:
+                    self.event('prerender', dict(id=json.loads(manifest.read_text())['id'] if pack_stamp else None))
+                    seen_pack = pack_stamp
                 with self.server.changed:
                     command = self.server.command.copy()
                 if command['sequence'] != seen_command:

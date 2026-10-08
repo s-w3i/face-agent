@@ -58,8 +58,9 @@ def main():
                 if time.monotonic() >= deadline:
                     raise RuntimeError('Timed out waiting for the local service.')
                 time.sleep(.1)
+        display = base + '/robot.html' + ('?renderer=prerendered' if os.environ.get('DOTS_RENDERER') == 'prerendered' else '')
         window = subprocess.Popen([browser, f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check',
-                                   '--autoplay-policy=no-user-gesture-required', f'--app={base}/robot.html'], start_new_session=True)
+                                   '--autoplay-policy=no-user-gesture-required', f'--app={display}'], start_new_session=True)
         print('Robot voice is on automatically. Close the robot window or press Ctrl+C to stop.', flush=True)
         while window.poll() is None and service.poll() is None:
             time.sleep(.2)
