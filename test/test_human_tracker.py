@@ -118,6 +118,20 @@ class HumanTrackerCheck(unittest.TestCase):
         self.assertTrue(packet['detected'])
         self.assertAlmostEqual(packet['x'], 1 - 130 / 320, places=3)
 
+    def test_horizontal_mirroring_reverses_x_only_and_keeps_identity(self):
+        original = PersonTracker(FakeVision(), mirror=False)
+        mirrored = PersonTracker(FakeVision(), mirror=True)
+        for tracker in (original, mirrored):
+            tracker.set_session('same-person', True)
+        for now in (0, .34, .68):
+            first = original.process(self.image, now)
+            second = mirrored.process(self.image, now)
+        self.assertTrue(first['detected']); self.assertTrue(second['detected'])
+        self.assertLess(first['x'], .5); self.assertGreater(second['x'], .5)
+        self.assertAlmostEqual(first['x'] + second['x'], 1)
+        self.assertEqual(first['y'], second['y'])
+        np.testing.assert_array_equal(original.identity, mirrored.identity)
+
     def test_crowd_identity_work_is_bounded(self):
         self.acquire(); self.tracker.lost()
         self.vision.faces = [face(2, x) for x in (0, 70, 140, 210)]

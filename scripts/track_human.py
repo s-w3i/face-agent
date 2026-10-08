@@ -127,7 +127,8 @@ def main():
     parser.add_argument('--url', default=os.environ.get('DOTS_URL', 'http://127.0.0.1:' + os.environ.get('PORT', '5173')))
     parser.add_argument('--topic', help='Color topic; defaults to head_camera color, compressed unless --raw.')
     parser.add_argument('--raw', action='store_true', help='Subscribe to sensor_msgs/Image instead of CompressedImage.')
-    parser.add_argument('--mirror', action='store_true', help='Reverse horizontal gaze for your camera mounting.')
+    parser.add_argument('--mirror', action=argparse.BooleanOptionalAction, default=True,
+                        help='Mirror camera X for a front-facing robot (default: on); --no-mirror keeps camera X unchanged.')
     parser.add_argument('--threshold', type=float, default=.55, help='SFace cosine match threshold; validate on your robot (default: .55).')
     parser.add_argument('--threads', type=int, default=1, help='OpenCV CPU threads (default: 1).')
     parser.add_argument('--check', action='store_true', help='Check ROS imports and warm both CPU models, then exit.')
@@ -162,7 +163,8 @@ def main():
         if not np.isfinite(feature).all():
             raise ValueError('SFace returned invalid features.')
         print(json.dumps(dict(platform=platform.machine(), python=sys.version.split()[0], opencv=cv2.__version__,
-                              threads=cv2.getNumThreads(), ros='available', models='loaded and executed', topic=args.topic)))
+                              threads=cv2.getNumThreads(), ros='available', models='loaded and executed', topic=args.topic,
+                              mirror=args.mirror)))
         return 0
     frames = LatestFrame(); link = RobotLink(args.url); tracker = PersonTracker(vision, args.threshold, args.mirror)
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)

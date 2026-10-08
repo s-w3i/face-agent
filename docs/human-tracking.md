@@ -60,7 +60,11 @@ Run this check before starting tracking on a new device:
 It checks ROS imports and actually executes both CPU models, then exits. The Pi
 output should show `platform: aarch64`. If your active `python3` does not match
 ROS, select its interpreter, for example `TRACKING_PYTHON=/usr/bin/python3`.
-Use `--mirror` if horizontal eye movement is reversed for your camera mounting.
+Horizontal camera coordinates are mirrored by default for the front-facing robot:
+Shiro's eyes should move toward the person in front of the screen. This changes
+only gaze X, leaving detection, the person lock, and vertical gaze unchanged.
+Use `--no-mirror` if your camera input is already mirrored or its mounting needs
+the opposite direction. `./track.sh --check` also reports the selected `mirror` value.
 
 ## Person lock and motion
 
