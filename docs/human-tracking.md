@@ -18,11 +18,18 @@ Install Python venv support if it is missing:
 sudo apt install python3-venv
 ```
 
-Launch the camera in its own terminal, using your existing installation paths:
+Keep the camera workspace in a persistent directory such as `~/orbbec_ws`.
+The previous `/tmp/orbbec-ros-check` build disappeared when the temporary directory
+was cleared. On a new device, follow the
+[Orbbec installation guide](https://orbbec.github.io/OrbbecSDK_ROS2/en/source/camera_devices/2_installation/build_the_package.html)
+and build the driver in that persistent workspace. The current computer uses
+OrbbecSDK ROS2 release `v2.10.6` under `~/orbbec_ws`.
+
+Launch the camera in its own terminal:
 
 ```sh
 source /opt/ros/humble/setup.bash
-source /tmp/orbbec-ros-check/install/setup.bash
+source ~/orbbec_ws/install/setup.bash
 ros2 launch orbbec_camera gemini_330_series.launch.py \
   camera_name:=head_camera \
   color_width:=640 color_height:=480 color_fps:=15 \
@@ -40,7 +47,7 @@ In a third terminal, from the same folder:
 
 ```sh
 source /opt/ros/humble/setup.bash
-source /tmp/orbbec-ros-check/install/setup.bash
+source ~/orbbec_ws/install/setup.bash
 ./track.sh --url http://127.0.0.1:5174 --stats
 ```
 
