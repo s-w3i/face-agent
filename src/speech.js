@@ -1,6 +1,6 @@
 // Native Web Audio keeps playback and amplitude analysis lightweight on the Pi.
 export class SpeechPlayer {
-  constructor() { this.context = null; this.source = null; this.generation = 0; this.sources = new Set(); }
+  constructor(onSubtitle = () => {}) { this.context = null; this.source = null; this.generation = 0; this.sources = new Set(); this.onSubtitle = onSubtitle; }
 
   async enable() {
     this.context ||= new AudioContext();
@@ -18,10 +18,10 @@ export class SpeechPlayer {
       if (!this.streaming) { this.source.stop(); this.source.disconnect(); }
       this.source = null;
     }
-    this.analyser?.disconnect(); this.streaming = false;
+    this.analyser?.disconnect(); this.streaming = false; this.onSubtitle('');
   }
 
-  async play(blob, onStart, onEnd) {
+  async play(blob, onStart, onEnd, text = '') {
     this.stop();
     const generation = this.generation;
     this.context ||= new AudioContext();
@@ -35,12 +35,12 @@ export class SpeechPlayer {
     this.source = source;
     source.onended = () => {
       if (this.source !== source) return;
-      this.source = null; source.disconnect(); this.analyser.disconnect(); onEnd();
+      this.source = null; source.disconnect(); this.analyser.disconnect(); this.onSubtitle(''); onEnd();
     };
-    onStart(); source.start();
+    this.onSubtitle(text); onStart(); source.start();
   }
 
-  async stream(response, onStart, onEnd, onTiming = () => {}) {
+  async stream(response, onStart, onEnd, onTiming = () => {}, text = '') {
     this.stop(); const generation = this.generation;
     this.context ||= new AudioContext();
     if (this.context.state !== 'running') throw new Error('Enable voice on the robot display to allow sound.');
@@ -53,7 +53,7 @@ export class SpeechPlayer {
     const finish = () => {
       if (!complete || this.sources.size || generation !== this.generation) return;
       this.source = null; this.analyser.disconnect(); this.finishStream = null;
-      onEnd(); resolvePlayback();
+      this.onSubtitle(''); onEnd(); resolvePlayback();
     };
     const event = packet => {
       if (packet.type === 'error') throw new Error(packet.error);
@@ -75,7 +75,7 @@ export class SpeechPlayer {
         finish();
       };
       source.start(at); at += buffer.duration;
-      if (first) { onTiming(packet); onStart(); }
+      if (first) { onTiming(packet); this.onSubtitle(text); onStart(); }
     };
     try {
       while (generation === this.generation && !complete) {

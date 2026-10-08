@@ -41,6 +41,7 @@ ${actionGroup('Added voice motions', VOICE_ACTIONS)}
 <footer class="page-footer"><span>Original geometry, materials, fur, and motion.</span><a href="./">Back to procedural studio →</a></footer></main><div id="toast" class="toast" role="status"></div>
 <dialog id="tts-key-dialog" class="key-dialog" aria-labelledby="tts-key-title"><form id="tts-key-form"><h2 id="tts-key-title">Add your OpenAI API key</h2><p>Give your dot a voice. The key stays in a private file on this computer, outside the web files and character configuration.</p><label class="field-label" for="tts-key-input">OpenAI API key</label><input id="tts-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">Create an API key ↗</a> · Speech uses your OpenAI API billing.</p><p id="tts-key-error" role="alert"></p><div class="speech-buttons"><button id="tts-key-submit" class="outline-button" type="submit">Save API key</button><button id="tts-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
 if (robotView) {
+  document.querySelector('#app').insertAdjacentHTML('beforeend', '<p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>');
   document.querySelector('#app').insertAdjacentHTML('beforeend', '<div class="robot-hud"><a href="./original-dots.html">Studio</a><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="robot-audio-gate" class="robot-audio-gate"><span>AI-generated voice · OpenAI</span><button id="robot-enable-voice">Enable voice</button></div>');
   for (const selector of ['.topbar', '.intro', '.playback', '.idle-controls', '.animation-library', '.custom-panel', '.page-footer', '.stage-top', '.stage-name', '.stage-bottom']) $(selector).hidden = true;
 }
@@ -54,7 +55,10 @@ const idleMovements = new IdleMovements();
 let configLoaded = false, fileConfig, saveQueued = null, saving = false, events, commandLevel = null, desiredState = 'idle', lastCommand = -1;
 let saveAfter = 0;
 let commandGeneration = '';
-const speech = new SpeechPlayer();
+const speech = new SpeechPlayer(text => {
+  const subtitles = $('#robot-subtitles');
+  if (subtitles) { subtitles.textContent = text; subtitles.hidden = !text; }
+});
 let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch = null;
 let voiceInfo = null;
 let voiceMigrationNote = '';
@@ -149,13 +153,13 @@ function connectRobot() {
         const request = speechRequest;
         try {
           if (speech.context?.state !== 'running') {
-            pendingSpeech = command.speech; $('#robot-audio-gate').hidden = false;
+            pendingSpeech = { url: command.speech, text: command.text || '' }; $('#robot-audio-gate').hidden = false;
             return;
           }
           speechFetch = new AbortController();
           const response = await fetch(command.speech, { cache: 'no-store', signal: speechFetch.signal });
           if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
-          if (request === speechRequest) await playSpeech(response);
+          if (request === speechRequest) await playSpeech(response, command.text || '');
         } catch (failure) { if (request !== speechRequest) return; error = failure.message; }
       }
     }
@@ -208,7 +212,7 @@ function stopSpeech() {
   $('#tts-sample').disabled = false; $('#tts-sample').textContent = 'Play sample'; $('#tts-stop').disabled = true;
   if (voiceInfo) voiceReady();
 }
-async function playSpeech(response) {
+async function playSpeech(response, text) {
   const onStart = () => {
       pendingSpeech = null; desiredState = 'speaking'; playAction('speaking', true, true);
       $('#tts-status').textContent = 'Streaming · body motion follows the voice.';
@@ -220,8 +224,8 @@ async function playSpeech(response) {
   if (response.headers.get('Content-Type')?.includes('application/x-ndjson')) {
     await speech.stream(response, onStart, onEnd, packet => {
       $('#tts-latency').textContent = `First audio · ${(packet.firstAudioMs / 1000).toFixed(2)} s · ${packet.warm ? 'warm connection' : 'new connection'}`;
-    });
-  } else await speech.play(await response.blob(), onStart, onEnd);
+    }, text);
+  } else await speech.play(await response.blob(), onStart, onEnd, text);
 }
 function openKeySetup() {
   $('#tts-key-error').textContent = ''; $('#tts-key-input').value = '';
@@ -246,7 +250,7 @@ async function setupVoice() {
   });
   $('#tts-sample').addEventListener('click', async () => {
     if (!keyConfigured) { openKeySetup(); return; }
-    stopSpeech(); const request = speechRequest;
+    stopSpeech(); const request = speechRequest, text = `Hi, I am ${name}.`;
     $('#tts-sample').disabled = true; $('#tts-sample').textContent = 'Generating…'; $('#tts-stop').disabled = false;
     $('#tts-status').textContent = 'Generating your greeting…';
     try {
@@ -254,10 +258,10 @@ async function setupVoice() {
       if (request !== speechRequest) return;
       speechFetch = new AbortController();
       const response = await fetch('/api/speech-stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: speechFetch.signal,
-        body: JSON.stringify({ text: `Hi, I am ${name}.`, voice: $('#tts-voice').value }) });
+        body: JSON.stringify({ text, voice: $('#tts-voice').value }) });
       if (!response.ok) throw new Error((await response.json()).error || 'Unable to generate speech.');
       if (request !== speechRequest) return;
-      await playSpeech(response);
+      await playSpeech(response, text);
       $('#tts-sample').textContent = 'Play sample';
     } catch (error) {
       if (request !== speechRequest) return;
@@ -274,11 +278,11 @@ async function setupVoice() {
     try {
       await speech.enable(); $('#robot-audio-gate').hidden = true;
       if (pendingSpeech) {
-        const url = pendingSpeech; pendingSpeech = null;
+        const { url, text } = pendingSpeech; pendingSpeech = null;
         speechFetch = new AbortController();
         const response = await fetch(url, { cache: 'no-store', signal: speechFetch.signal });
         if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
-        await playSpeech(response);
+        await playSpeech(response, text);
       }
     } catch (error) { toast(error.message); }
   });

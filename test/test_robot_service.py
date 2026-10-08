@@ -98,10 +98,12 @@ class RobotServiceCheck(unittest.TestCase):
                     self.assertEqual(response['response']['input'][0]['content'][0]['text'], 'Hi, I am Otto.')
                     self.assertEqual(response['response']['output_modalities'], ['audio'])
                     self.assertFalse(connections[0].closed)
-                    command = api('say', {'text': 'Robot test', 'voice': 'marin'})
+                    command = api('say', {'text': '  Robot test  ', 'voice': 'marin'})
                     self.assertEqual(command['state'], 'speaking')
+                    self.assertEqual(command['text'], 'Robot test')
                     self.assertEqual(api(command['speech'].removeprefix('/api/')), audio)
                     execute(base, 'say Hello robot')
+                    self.assertEqual(api('status')['command']['text'], 'Hello robot')
                     next_clip = api('status')['command']['speech']
                     self.assertNotEqual(next_clip, command['speech'])
                     with self.assertRaises(HTTPError): api(command['speech'].removeprefix('/api/'))
@@ -181,6 +183,7 @@ class RobotServiceCheck(unittest.TestCase):
                 socket.recv = pause_second_chunk
                 with patch.object(serve, 'connect', return_value=socket):
                     command = api('say', {'stream': True})
+                    self.assertEqual(command['text'], 'Hi, I am Otto.')
                     self.assertTrue(waiting.wait(1))
                     try: api('command', dict(state='idle'))
                     finally: release.set()

@@ -370,6 +370,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.local_voice(); self.stream_reply(self.server.speech_events(value)); return
             if path in ('/api/speech', '/api/say'):
                 self.local_voice()
+                if isinstance(value, dict) and 'text' not in value:
+                    value = dict(value, text=f"Hi, I am {self.server.config()['appearance']['name']}.")
                 with self.server.changed:
                     previous_sequence = self.server.command['sequence']
                 streaming = path == '/api/say' and isinstance(value, dict) and value.get('stream') is True
@@ -384,7 +386,7 @@ class Handler(SimpleHTTPRequestHandler):
                     identifier = uuid.uuid4().hex
                     self.server.audio = (identifier, audio)
                     self.server.command = dict(generation=self.server.generation, sequence=self.server.command['sequence'] + 1,
-                                               state='speaking', level=None, speech='/api/audio/' + identifier)
+                                               state='speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip())
                     self.server.ack = None; self.server.changed.notify_all()
                     if streaming:
                         threading.Thread(target=self.server.finish_clip, args=(audio, events, self.server.command['sequence']), daemon=True).start()
