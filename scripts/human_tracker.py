@@ -57,10 +57,14 @@ class PersonTracker:
     def __init__(self, vision, threshold=.55, mirror=False):
         self.vision = vision; self.threshold = threshold; self.mirror = mirror
         self.session = None; self.awake = False
+        self.input_mode = 'words'; self.speech_hint = None
+        self.mic_forward = 0.; self.mic_clockwise = False
+        self.intrinsics = None
         self.reset()
 
     def reset(self):
         self.identity = None; self.pending = None; self.confirmations = 0
+        self.voice_turn = None
         self.face = self.points = self.gray = None
         self.last_frame = self.last_verified = -math.inf
         self.next_detection = 0
@@ -69,6 +73,33 @@ class PersonTracker:
         if session != self.session or awake != self.awake:
             self.reset()
         self.session = session; self.awake = awake
+
+    def set_input(self, mode, hint=None, forward=0, clockwise=False):
+        if mode != self.input_mode:
+            self.reset()
+        self.input_mode = mode; self.speech_hint = hint
+        self.mic_forward = forward; self.mic_clockwise = clockwise
+
+    def set_camera_info(self, width, fx, cx):
+        if not all(math.isfinite(value) for value in (width, fx, cx)) or width <= 0 or fx <= 0 or not 0 <= cx < width:
+            raise ValueError('Invalid color-camera intrinsics.')
+        self.intrinsics = width, fx, cx
+
+    def speech_face(self, faces, width):
+        hint = self.speech_hint
+        if not self.intrinsics or not hint or hint.get('session') != self.session or not 0 <= hint.get('ageMs', math.inf) < 2000:
+            return None
+        bearing = (hint['doaDeg'] - self.mic_forward + 180) % 360 - 180
+        bearing *= 1 if self.mic_clockwise else -1  # Camera X increases to its right.
+        if abs(bearing) >= 90:
+            return None  # A rear source cannot select a face in the front camera.
+        camera_width, fx, cx = self.intrinsics
+        scale = width / camera_width
+        ranked = sorted((abs(math.degrees(math.atan((face[0] + face[2] / 2 - cx * scale) / (fx * scale))) - bearing), index)
+                        for index, face in enumerate(faces))
+        if not ranked or ranked[0][0] > 20 or len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 5:
+            return None  # Close angular matches need more evidence than a DOA hint.
+        return faces[ranked[0][1]]
 
     @property
     def state(self):
@@ -150,12 +181,22 @@ class PersonTracker:
         return target
 
     def acquire(self, image, small, gray, scale, now):
+        if self.pending is not None and self.pending[1] is None:
+            self.pending = None; self.confirmations = 0
         faces = self.vision.detect(small)
         self.next_detection = now + 1 / 3
         if not faces:
             self.pending = None; self.confirmations = 0
             return
-        if self.pending is None:
+        if self.input_mode == 'voice':
+            face = self.speech_face(faces, small.shape[1])
+            if face is None:
+                self.pending = None; self.confirmations = 0
+                return
+            if self.pending is not None and overlap(face, self.pending[0]) < .2:
+                self.pending = None; self.confirmations = 0
+                return
+        elif self.pending is None:
             # First confirmed face wins; simultaneous arrivals use the camera center.
             face = min(faces, key=lambda row: abs(row[0] + row[2] / 2 - small.shape[1] / 2))
         else:
@@ -177,6 +218,8 @@ class PersonTracker:
             self.pending = None; self.confirmations = 0
             self.seed(gray, face)
             self.last_verified = now
+            if self.input_mode == 'voice':
+                self.voice_turn = self.speech_hint.get('utterance', 0)
 
     def recover(self, image, small, gray, scale, now):
         self.next_detection = now + 1
@@ -205,12 +248,19 @@ class PersonTracker:
             if self.face is not None:
                 self.lost()
         self.last_frame = now
+        voice_selection = (self.input_mode == 'voice' and self.intrinsics and self.speech_hint and
+                           self.speech_hint.get('session') == self.session and
+                           0 <= self.speech_hint.get('ageMs', math.inf) < 2000 and
+                           self.speech_hint.get('utterance', 0) != self.voice_turn and now >= self.next_detection)
         if self.identity is None:
             if now >= self.next_detection:
                 self.acquire(image, small, gray, scale, now)
         elif self.face is None:
             if now >= self.next_detection:
-                self.recover(image, small, gray, scale, now)
+                if voice_selection:
+                    self.acquire(image, small, gray, scale, now)
+                else:
+                    self.recover(image, small, gray, scale, now)
         else:
             if not self.flow(gray):
                 self.lost(); self.next_detection = now
@@ -229,6 +279,9 @@ class PersonTracker:
                 corrected = nearest.copy()
                 corrected[:4] = self.face[:4] * .7 + nearest[:4] * .3
                 self.seed(gray, corrected)
+            if voice_selection:
+                # A new spoken turn can replace the lock only after three identity confirmations.
+                self.acquire(image, small, gray, scale, now)
         if self.face is None:
             return dict(detected=False)
         x, y, w, h = self.face[:4]

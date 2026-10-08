@@ -9,11 +9,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def request(base, path, payload=None):
+def request(base, path, payload=None, *, timeout=None):
     body = json.dumps(payload).encode() if payload is not None else None
     try:
         with urlopen(Request(base.rstrip('/') + '/api/' + path, data=body,
-                             headers={'Content-Type': 'application/json'}), timeout=120 if path == 'say' else 5) as response:
+                             headers={'Content-Type': 'application/json'}), timeout=timeout if timeout is not None else (120 if path == 'say' else 5)) as response:
             return json.load(response)
     except HTTPError as error:
         raise ValueError(json.load(error).get('error', str(error))) from None

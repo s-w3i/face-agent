@@ -30,13 +30,54 @@ class ChatCheck(unittest.TestCase):
     def test_tracking_starts_for_selected_service_and_can_be_disabled(self):
         for flags in ([], ['--no-track']):
             self.tracking.reset_mock()
-            with patch('sys.argv', ['chat.py', '--url', 'http://127.0.0.1:5174', *flags]), patch('chat.load_key'), patch('chat.robot_name', return_value='Shiro'), patch('chat.read_terminal', return_value='/quit'), patch('chat.Chatbot'):
+            with patch('sys.argv', ['chat.py', '--url', 'http://127.0.0.1:5174', *flags]), patch('chat.load_key'), patch('chat.robot_name', return_value='Shiro'), patch('chat.read_terminal', return_value='/quit'), patch('chat.Chatbot'), patch('chat.request'):
                 self.assertEqual(asyncio.run(main()), 0)
             if flags:
                 self.tracking.assert_not_called()
             else:
                 self.tracking.assert_called_once_with('http://127.0.0.1:5174')
                 self.tracking.return_value.__exit__.assert_called_once()
+
+    def test_voice_uses_same_agent_without_wake_word_and_pauses_until_playback_ends(self):
+        async def check():
+            events = []
+            voice = Mock()
+            voice.read = AsyncMock(side_effect=['What is your name?', '/quit'])
+            voice.hold = AsyncMock(side_effect=lambda held: events.append('pause' if held else 'resume'))
+            bot = Mock(sleep_requested=False)
+            bot.reply = AsyncMock(side_effect=lambda *args, **kwargs: events.append('infer') or 'I am Shiro.')
+            async def ended(*args):
+                events.append('playback ended'); return True
+            def api(*args):
+                events.append('say'); return dict(generation='session', sequence=1, displays=1)
+            with patch('sys.argv', ['chat.py', '--mode', 'voice']), patch('chat.load_key'), \
+                    patch('chat.VoiceInput') as factory, patch('chat.Chatbot', return_value=bot), \
+                    patch('chat.request', side_effect=api), patch('chat.wait_for_speech', side_effect=ended):
+                factory.return_value.__aenter__ = AsyncMock(return_value=voice)
+                factory.return_value.__aexit__ = AsyncMock()
+                self.assertEqual(await main(), 0)
+                bot.reply.assert_awaited_once_with('What is your name?', motion_update=False)
+                self.assertEqual(events, ['pause', 'infer', 'say', 'playback ended', 'resume'])
+                self.assertEqual(bot.show_state.call_args_list[0].args, ('listening',))
+        asyncio.run(check())
+
+    def test_voice_cancels_unconfirmed_playback_before_resuming_input(self):
+        async def check():
+            events = []
+            voice = Mock(read=AsyncMock(side_effect=['Hello', '/quit']),
+                         hold=AsyncMock(side_effect=lambda held: events.append('pause' if held else 'resume')))
+            bot = Mock(sleep_requested=False, reply=AsyncMock(return_value='Hi'))
+            def api(url, path, value):
+                events.append(path)
+                return dict(generation='session', sequence=1, displays=1)
+            with patch('sys.argv', ['chat.py', '--mode', 'voice']), patch('chat.load_key'), \
+                    patch('chat.VoiceInput') as factory, patch('chat.Chatbot', return_value=bot), \
+                    patch('chat.request', side_effect=api), patch('chat.wait_for_speech', AsyncMock(return_value=False)):
+                factory.return_value.__aenter__ = AsyncMock(return_value=voice)
+                factory.return_value.__aexit__ = AsyncMock()
+                self.assertEqual(await main(), 0)
+                self.assertEqual(events, ['pause', 'say', 'command', 'resume'])
+        asyncio.run(check())
 
     def test_closing_reply_finishes_before_sleep(self):
         async def check():
@@ -163,7 +204,7 @@ class ChatCheck(unittest.TestCase):
             with self.subTest(options=options), patch('sys.argv', ['chat.py'] + options), patch('chat.load_key'), patch('chat.robot_name', return_value='Shiro'), patch('chat.read_terminal', side_effect=['Hi Shiro', '/quit']), patch('chat.Chatbot') as bot, patch('chat.request', return_value={}) as speech:
                 bot.return_value.reply = AsyncMock(return_value='Hi')
                 self.assertEqual(asyncio.run(main()), 0)
-                self.assertEqual(speech.called, spoken)
+                self.assertEqual(any(call.args[1] == 'say' for call in speech.call_args_list), spoken)
                 if spoken:
                     self.assertEqual(speech.call_args.args[1:], ('say', {'text': 'Hi', 'stream': True}))
 

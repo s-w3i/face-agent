@@ -151,6 +151,57 @@ class HumanTrackerCheck(unittest.TestCase):
         self.assertFalse(self.tracker.process(self.image, 2)['detected'])
         self.assertEqual(self.vision.recognitions, count)
 
+    def test_voice_selects_left_speaker_instead_of_camera_centre_and_keeps_lock(self):
+        self.vision.faces = [face(1, 130), face(2, 20)]
+        self.tracker.set_camera_info(640, 400, 320)
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=28.8, ageMs=0))
+        self.acquire()
+        np.testing.assert_array_equal(self.tracker.identity, [0, 1])
+        self.tracker.lost()
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=0, ageMs=0))
+        self.vision.faces = [face(1, 130)]
+        self.assertFalse(self.tracker.process(self.image, 2)['detected'])
+        np.testing.assert_array_equal(self.tracker.identity, [0, 1])
+
+    def test_voice_requires_current_unambiguous_front_hint_and_camera_intrinsics(self):
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=0, ageMs=0))
+        self.assertIsNone(self.tracker.speech_face([face(1, 130)], 320))
+        self.tracker.set_camera_info(320, 200, 160)
+        for hint in (None, dict(session='old', doaDeg=0, ageMs=0),
+                     dict(session='wake-one', doaDeg=0, ageMs=2001),
+                     dict(session='wake-one', doaDeg=180, ageMs=0)):
+            self.tracker.set_input('voice', hint)
+            self.assertIsNone(self.tracker.speech_face([face(1, 130)], 320))
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=0, ageMs=0))
+        self.assertIsNone(self.tracker.speech_face([face(1, 120), face(2, 140)], 320))
+        self.assertIsNotNone(self.tracker.speech_face([face(1, 130)], 320))
+
+    def test_mic_offset_wraparound_and_clockwise_convention(self):
+        self.tracker.set_camera_info(320, 200, 160)
+        rows = [face(1, 130), face(2, 20)]
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=18.8, ageMs=0), forward=350)
+        self.assertEqual(self.tracker.speech_face(rows, 320)[-1], 2)
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=331.2, ageMs=0), clockwise=True)
+        self.assertEqual(self.tracker.speech_face(rows, 320)[-1], 2)
+        self.tracker.set_input('words', dict(session='wake-one', doaDeg=28.8, ageMs=0))
+        self.acquire()
+        np.testing.assert_array_equal(self.tracker.identity, [1, 0])
+
+    def test_new_voice_turn_can_confirm_another_speaker_without_switching_on_one_hint(self):
+        self.tracker.set_camera_info(320, 200, 160)
+        self.vision.faces = [face(1, 130), face(2, 20)]
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=0, ageMs=0, utterance=1))
+        self.acquire()
+        original = self.tracker.identity.copy()
+        self.tracker.set_input('voice', dict(session='wake-one', doaDeg=28.8, ageMs=0, utterance=2))
+        with patch.object(self.tracker, 'flow', return_value=True):
+            for now in (1.02, 1.36):
+                self.assertTrue(self.tracker.process(self.image, now)['detected'])
+                np.testing.assert_array_equal(self.tracker.identity, original)
+            self.assertTrue(self.tracker.process(self.image, 1.70)['detected'])
+        np.testing.assert_array_equal(self.tracker.identity, [0, 1])
+        self.assertEqual(self.tracker.voice_turn, 2)
+
     def test_latest_frame_drops_backlog_and_raw_rgb_handles_stride(self):
         slot = LatestFrame()
         for message in range(20): slot.receive(message)

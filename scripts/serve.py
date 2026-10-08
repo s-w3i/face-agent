@@ -138,6 +138,9 @@ class RobotServer(ThreadingHTTPServer):
         self.wake_session = 0
         self.actions = []; self.ack = None; self.displays = 0
         self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
+        self.input_mode = 'words'
+        self.mic_forward = 0.; self.mic_clockwise = False
+        self.speech_hint = None; self.speech_hint_at = 0
         super().__init__(address, Handler)
 
     def config(self):
@@ -149,10 +152,22 @@ class RobotServer(ThreadingHTTPServer):
     def tracking_session(self):
         return f'{self.generation}:{self.wake_session}'
 
+    def speech_pending(self):
+        ack = self.ack or {}
+        return bool(self.command.get('speech') and
+                    (ack.get('generation', self.generation), ack.get('sequence')) !=
+                    (self.command['generation'], self.command['sequence']))
+
+    def speech_hint_value(self):
+        if self.speech_hint is None:
+            return None
+        return dict(self.speech_hint, ageMs=round((time.monotonic() - self.speech_hint_at) * 1000))
+
     def change_command(self, state, **fields):
         # A session token preserves fast sleep/wake transitions between tracker polls.
         if (state == 'sleeping') != (self.command['state'] == 'sleeping'):
             self.wake_session += 1
+            self.speech_hint = None
             self.gaze = dict(sequence=self.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
             self.gaze_at = time.monotonic()
         self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
@@ -385,7 +400,10 @@ class Handler(SimpleHTTPRequestHandler):
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
                                     displays=self.server.displays, command=self.server.command,
                                     acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value(),
-                                    trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping'))
+                                    trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping',
+                                    inputMode=self.server.input_mode, micForwardDeg=self.server.mic_forward,
+                                    micClockwise=self.server.mic_clockwise, speechHint=self.server.speech_hint_value(),
+                                    speechPending=self.server.speech_pending()))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -412,6 +430,32 @@ class Handler(SimpleHTTPRequestHandler):
                 self.server.render_packs.upload(*upload.groups(), self.rfile.read(size))
                 self.reply(dict(saved=True)); return
             value = self.body()
+            if path == '/api/input-mode':
+                self.local_voice()
+                if not isinstance(value, dict) or set(value) - {'mode', 'micForwardDeg', 'micClockwise'} or value.get('mode') not in ('words', 'voice'):
+                    raise ValueError('Choose words or voice input mode.')
+                forward = value.get('micForwardDeg', 0)
+                clockwise = value.get('micClockwise', False)
+                if type(forward) not in (int, float) or not math.isfinite(forward) or not 0 <= forward < 360 or type(clockwise) is not bool:
+                    raise ValueError('Supply a microphone forward angle in [0,360) and a boolean angle convention.')
+                with self.server.changed:
+                    self.server.input_mode = value['mode']
+                    self.server.mic_forward = forward; self.server.mic_clockwise = clockwise
+                    self.server.wake_session += 1; self.server.speech_hint = None
+                    self.server.gaze = dict(sequence=self.server.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
+                    self.server.gaze_at = time.monotonic()
+                    self.server.changed.notify_all(); self.reply(dict(mode=self.server.input_mode))
+                return
+            if path == '/api/speaker':
+                self.local_voice()
+                if not isinstance(value, dict) or not {'session', 'doaDeg'} <= set(value) or set(value) - {'session', 'doaDeg', 'utterance'} or not isinstance(value['session'], str) or type(value['doaDeg']) not in (int, float) or not math.isfinite(value['doaDeg']) or not 0 <= value['doaDeg'] < 360 or type(value.get('utterance', 0)) is not int or value.get('utterance', 0) < 0:
+                    raise ValueError('Supply a tracking session and native speech DOA in [0,360).')
+                with self.server.changed:
+                    if self.server.input_mode != 'voice' or value['session'] != self.server.tracking_session() or self.server.command['state'] == 'sleeping' or self.server.speech_pending():
+                        self.reply(dict(error='Speech hint is inactive or belongs to an old session.'), 409); return
+                    self.server.speech_hint = value; self.server.speech_hint_at = time.monotonic()
+                    self.reply(dict(received=True))
+                return
             if path == '/api/gaze':
                 if not isinstance(value, dict) or type(value.get('detected')) is not bool or set(value) - {'detected', 'x', 'y', 'session'}:
                     raise ValueError('Send detected and normalized x/y coordinates for gaze.')

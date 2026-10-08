@@ -63,7 +63,7 @@ not install ROS or the camera driver.
 With the camera and robot display running, start chat from the face-agent folder:
 
 ```sh
-.venv/bin/python scripts/chat.py --url http://127.0.0.1:5174
+.venv/bin/python scripts/chat.py --mode words --url http://127.0.0.1:5174
 ```
 
 Chat starts the tracker automatically in its separate environment. It sources
@@ -78,7 +78,58 @@ Typing `/quit`, closing chat input, or pressing Ctrl+C stops the tracker chat
 started and restores the original eyes. A tracker already running for the same
 robot service is reused and remains running after chat exits. Use `--no-track`
 for chat without camera tracking; keep the manual `./track.sh --stats` command
-above for diagnostics. Both launches keep the same wake-session person lock.
+above for diagnostics. Words mode keeps the same wake-session person lock as a
+manual tracker launch.
+
+## Voice input and speaker selection
+
+Complete the one-time [ReSpeaker setup](../README.md#respeaker-robot-microphone),
+then start voice chat with the updated robot service and camera running:
+
+```sh
+.venv/bin/python scripts/chat.py --mode voice --url http://127.0.0.1:5174
+```
+
+Stay silent during startup background calibration. After `Voice mode ready`,
+speak normally; voice mode needs no wake phrase. Partial and final transcription
+appear in the terminal and feed the existing agent, history and tools. The
+microphone pauses before inference and robot speech, discards buffered input,
+and resumes after the display confirms playback completion plus a 0.5-second
+clearance. Speak when Shiro returns to Listening. `/reset` and `/quit` still work
+as terminal commands. Words mode starts no microphone process.
+
+A USB microphone interruption triggers automatic restart attempts and background
+recalibration while input remains closed. Chat history survives, but old buffered
+speech and camera hints are cleared. The tracker gets a fresh session before
+new speech can select someone. Wait through recalibration and robot playback
+before speaking again. Recovery cannot repair a faulty USB cable or hub.
+
+The confirmed microphone mounting is native DOA **0° straight ahead at camera
+centre, increasing toward camera left**. `--mic-forward-deg` and
+`--mic-clockwise` override this alignment. Alignment changes only the camera
+association; the microphone's native angle is preserved. Gaze mirroring remains
+independent of this physical alignment.
+
+The tracker subscribes to `/head_camera/color/camera_info` alongside compressed
+images. It uses the camera's width, horizontal focal length and principal point
+to convert each face centre to a bearing. It waits for valid intrinsics instead
+of estimating a field of view. A speech hint must belong to the current wake
+session and be less than two seconds old. Rear sound is rejected. A candidate
+face must be within 20° of the sound and at least 5° closer than any other face,
+then pass three successive location and identity confirmations.
+
+Once confirmed, the existing visual tracking follows that person while they
+move and while Shiro responds. A new utterance can select a different person
+after the same confirmations. Ambiguous hints cannot replace the selected
+identity; gaze pauses if the existing visual track is ambiguous. Sleep clears
+the target. Hints received during robot playback or from an old session are
+rejected. Missing camera calibration leaves voice input usable but cannot
+select a person for gaze.
+
+DOA guides attention; it does not isolate that person's channel-0 audio. Nearby
+faces at similar bearings, overlapping voices, dominant music vocals and echoes
+can prevent a reliable match. Validate speaker selection and transcription in
+the robot's actual environment.
 
 ## Check tracking setup
 
@@ -97,7 +148,7 @@ only gaze X, leaving detection, the person lock, and vertical gaze unchanged.
 Use `--no-mirror` if your camera input is already mirrored or its mounting needs
 the opposite direction. `./track.sh --check` also reports the selected `mirror` value.
 
-## Person lock and motion
+## Words-mode person lock and motion
 
 - Awake: confirm the first visible face across three detections, including
   identity agreement. If several faces first appear together, select the one
@@ -169,7 +220,8 @@ the robot display and voice running together on the actual Pi.
 The implementation has tests for optical-flow motion and occlusion, identity
 locking without an expiry, refusing bystanders, recovery, ambiguous crossings,
 sleep/wake resets, stale camera updates, ROI-only checks, bounded recognition
-work, RGB image stride, and interrupted model downloads. Run them with:
+work, RGB image stride, interrupted model downloads, microphone/camera angle
+alignment, ambiguous speech hints and confirmed speaker changes. Run them with:
 
 ```sh
 ~/.cache/face-agent/tracking-venv/bin/python -m unittest discover -s test -p test_human_tracker.py

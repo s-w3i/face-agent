@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Track one wake-session customer from a ROS color topic into Shiro's local gaze API."""
+"""Track a camera-selected or DOA-selected customer into Shiro's local gaze API."""
 import argparse
 import fcntl
 import json
@@ -165,7 +165,7 @@ def main():
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         from rclpy.signals import SignalHandlerOptions
-        from sensor_msgs.msg import CompressedImage, Image
+        from sensor_msgs.msg import CameraInfo, CompressedImage, Image
     except ImportError:
         parser.exit(1, 'Source ROS first and use ./track.sh (a separate environment matching ROS Python).\n')
     paths = model_paths()
@@ -189,12 +189,15 @@ def main():
                               threads=cv2.getNumThreads(), ros='available', models='loaded and executed', topic=args.topic,
                               mirror=args.mirror)))
         return 0
-    frames = LatestFrame(); link = RobotLink(args.url); tracker = PersonTracker(vision, args.threshold, args.mirror)
+    frames = LatestFrame(); calibration = LatestFrame()
+    link = RobotLink(args.url); tracker = PersonTracker(vision, args.threshold, args.mirror)
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
     node = Node('shiro_human_tracker')
     qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT,
                      durability=DurabilityPolicy.VOLATILE)
     subscription = node.create_subscription(Image if args.raw else CompressedImage, args.topic, frames.receive, qos)
+    info_topic = args.topic.removesuffix('/compressed').rsplit('/', 1)[0] + '/camera_info'
+    info_subscription = node.create_subscription(CameraInfo, info_topic, calibration.receive, qos)
     executor = SingleThreadedExecutor(); executor.add_node(node)
     spin = threading.Thread(target=executor.spin, daemon=True)
     started = time.monotonic(); last_stats = started; count = 0; processing = 0; state = None; camera_error = False
@@ -203,7 +206,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     print(f'Shiro tracker · {args.topic} → {args.url} · one CPU thread' if args.threads == 1 else
           f'Shiro tracker · {args.topic} → {args.url} · {args.threads} CPU threads', flush=True)
-    print('The first confirmed person stays locked until sleep. No camera images or identity features are saved.', flush=True)
+    print('Words mode locks a person until sleep; voice mode confirms speakers using DOA hints. No camera images or identity features are saved.', flush=True)
     try:
         spin.start(); link.thread.start()
         while rclpy.ok() and (not args.duration or time.monotonic() - started < args.duration):
@@ -212,6 +215,14 @@ def main():
             fresh = status is not None and tick - status_at < 1
             if fresh:
                 tracker.set_session(status['trackingSession'], status['awake'])
+                tracker.set_input(status.get('inputMode', 'words'), status.get('speechHint'),
+                                  status.get('micForwardDeg', 0), status.get('micClockwise', False))
+            info = calibration.take()
+            if info is not None:
+                try:
+                    tracker.set_camera_info(info[1].width, info[1].k[0], info[1].k[2])
+                except ValueError:
+                    tracker.intrinsics = None
             value = frames.take()
             packet = dict(detected=False)
             if fresh and tracker.awake and value is not None and tick - value[2] < .25:
@@ -245,7 +256,7 @@ def main():
     finally:
         link.close()
         executor.shutdown(timeout_sec=2); spin.join(timeout=2); rclpy.shutdown()
-        node.destroy_subscription(subscription); node.destroy_node()
+        node.destroy_subscription(subscription); node.destroy_subscription(info_subscription); node.destroy_node()
         tracker.reset()
         lock.close()
         print('Tracker stopped; original eyes restored.', flush=True)

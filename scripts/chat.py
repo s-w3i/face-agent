@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chat with the robot using terminal text and the OpenAI Agents SDK."""
+"""Chat with the robot using typed words or ReSpeaker voice input."""
 import argparse
 import asyncio
 from datetime import datetime
@@ -22,6 +22,7 @@ from agents import Agent, Runner, WebSearchTool, function_tool, set_tracing_disa
 from agents.mcp import MCPServerStdio
 from dotsctl import request
 from launch_robot import stop
+from voice_input import VoiceInput
 
 
 @contextmanager
@@ -141,7 +142,7 @@ class Chatbot:
                 'give more detail when the user asks or the subject needs it. '
                 'Do not use canned introductions, headings, bullet lists, technical labels, '
                 'or repeated explanations of your tools and settings in ordinary conversation. '
-                'Your user currently types in a terminal, but your replies are spoken aloud. '
+                'User messages are typed text or microphone speech transcribed to text; replies can be spoken aloud. '
                 'If the current user message is a farewell (goodbye, bye) or gratitude '
                 '(thank you, thankyou, thanks) with no further question or request, call '
                 'end_conversation and give a brief natural closing reply. Do not ask another '
@@ -213,7 +214,7 @@ class Chatbot:
             pass  # Chat still works with the display closed or service offline.
 
     async def reply(self, text, *, motion_update=False):
-        """Accept text from the terminal (or a future speech transcriber)."""
+        """Accept typed or transcribed text with the same history and tools."""
         if not isinstance(text, str) or not text.strip() or len(text) > 12000:
             raise ValueError('Enter between 1 and 12000 characters.')
         self.animated = False
@@ -358,7 +359,15 @@ async def main():
     parser.add_argument('--turtlesim', action='store_true', help='Connect the local ROS 2 turtlesim MCP server.')
     parser.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                         help='Start human eye tracking quietly (default); --no-track disables it.')
+    parser.add_argument('--mode', choices=['words', 'voice'], default='words', help='Typed words (default) or ReSpeaker microphone input.')
+    parser.add_argument('--stt-model', choices=['gpt-live-transcribe', 'gpt-transcribe'], default='gpt-live-transcribe')
+    parser.add_argument('--language', help='Optional speech language hint, e.g. en, ms, zh.')
+    parser.add_argument('--mic-forward-deg', type=float, default=0, help='Native DOA of camera centre; this robot uses 0 degrees.')
+    parser.add_argument('--mic-clockwise', action=argparse.BooleanOptionalAction, default=False,
+                        help='Angles increase to camera right; default increases to camera left.')
     args = parser.parse_args()
+    if not 0 <= args.mic_forward_deg < 360:
+        parser.error('--mic-forward-deg must be a finite angle in [0,360).')
     try:
         load_key()
     except (ValueError, OSError) as error:
@@ -366,6 +375,11 @@ async def main():
         return 1
     # Keep conversation text out of SDK trace uploads.
     set_tracing_disabled(True)
+    if args.mode == 'words':
+        try:
+            await asyncio.to_thread(request, args.url, 'input-mode', dict(mode='words'))
+        except (ValueError, OSError):
+            pass  # Typed chat remains available with the display service offline.
     async with AsyncExitStack() as stack:
         if args.track:
             stack.enter_context(start_tracking(args.url))
@@ -381,25 +395,34 @@ async def main():
                                 'TURTLESIM_REQUIRE_ANNOUNCEMENT': '1'}},
                 client_session_timeout_seconds=15,
             ))
-        return await chat_loop(args, server)
+        try:
+            voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
+                args.mic_forward_deg, args.mic_clockwise)) if args.mode == 'voice' else None
+            return await chat_loop(args, server, voice)
+        except (RuntimeError, OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
 
 
-async def chat_loop(args, server=None):
+async def chat_loop(args, server=None, voice=None):
     bot = Chatbot(args.url, args.model)
     if server:
         bot.agent.mcp_servers = [server]
     notices = queue.Queue() if server else None
     shutdown = threading.Event()
     watcher = asyncio.create_task(watch_motion(server, notices)) if server else None
-    awake = False
+    awake = bool(voice)
     conversation_closed = False
     speech_command = None
-    bot.show_state('sleeping')
-    print(f'Robot chatbot · asleep. Say "Hi {robot_name(args.url)}" to wake. /reset clears history; /quit exits.')
+    bot.show_state('listening' if voice else 'sleeping')
+    if not voice:
+        print(f'Robot chatbot · asleep. Say "Hi {robot_name(args.url)}" to wake. /reset clears history; /quit exits.')
     try:
         while True:
             try:
-                if server:
+                if voice:
+                    text = await voice.read(30 if awake else None, notices=notices)
+                elif server:
                     text = await asyncio.to_thread(read_terminal, 30 if awake else None,
                                                    speech=speech_command, url=args.url, notices=notices, shutdown=shutdown)
                 else:
@@ -429,22 +452,28 @@ async def chat_loop(args, server=None):
             if not text:
                 continue
             if not awake and not motion_update:
-                if not wake_trigger(text, robot_name(args.url)):
+                if not voice and not wake_trigger(text, robot_name(args.url)):
                     continue
                 awake = True
                 conversation_closed = False
                 bot.show_state('listening')
+            if voice:
+                await voice.hold(True)  # Confirm microphone pause before inference or spoken playback.
             try:
                 answer = await bot.reply(text, motion_update=motion_update)
             except ValueError as error:
                 print(str(error), file=sys.stderr)
                 if server:
                     await start_after_announcement(server, None, args.url)
+                if voice:
+                    await voice.hold(False)
                 continue
             except Exception:
                 print('Chat request failed. Check your API key, model access, billing, and network; then retry.', file=sys.stderr)
                 if server:
                     await start_after_announcement(server, None, args.url)
+                if voice:
+                    await voice.hold(False)
                 continue
             print('robot> ' + answer)
             if args.speak:
@@ -454,13 +483,23 @@ async def chat_loop(args, server=None):
                     print('Reply is above; speech could not play. Check the local service and Voice settings.', file=sys.stderr)
             if server and not motion_update:
                 await start_after_announcement(server, speech_command, args.url, args.speak)
+            if voice and args.speak:
+                finished = await wait_for_speech(speech_command, args.url)
+                if speech_command and not finished:
+                    # Cancelling the command also cancels browser audio before reopening input.
+                    await asyncio.to_thread(request, args.url, 'command', dict(state='idle'))
+                speech_command = None
             if bot.sleep_requested is True or (motion_update and conversation_closed):
                 conversation_closed = True
-                if args.speak:
+                if args.speak and not voice:
                     await wait_for_speech(speech_command, args.url)
                 awake = False
                 speech_command = None
                 bot.show_state('sleeping')
+            if voice:
+                await voice.hold(False)
+                if awake:
+                    bot.show_state('listening')
     finally:
         shutdown.set()
         if watcher:
