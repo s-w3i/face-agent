@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -eu
 cd "$(dirname "$0")"
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--robot" ]; }; then
+  printf '%s\n' 'Usage: ./run.sh [--robot]' '--robot opens the display with automatic voice playback.' >&2
+  exit 1
+fi
 for asset in dist/index.html dist/original-dots.html dist/robot.html dist/local-dots/orbit-characters.mjs dist/local-dots/orbit-characters.wasm dist/local-dots/orbit-characters.data dist/local-dots/bundle.json; do
   if [ ! -f "$asset" ]; then
     printf '%s\n' "Missing bundled file: $asset. Include dist/ when pushing this project." 'For development, rebuild with pnpm install --frozen-lockfile && pnpm build (Node 22.12+).' >&2
@@ -29,5 +33,8 @@ robot_config_path="${DOTS_CONFIG:-robot-config.json}"
 if [ ! -e "$robot_config_path" ]; then
   mkdir -p -- "$(dirname "$robot_config_path")"
   cp -- robot-config.default.json "$robot_config_path"
+fi
+if [ "${1:-}" = "--robot" ]; then
+  exec .venv/bin/python scripts/launch_robot.py
 fi
 exec .venv/bin/python scripts/serve.py

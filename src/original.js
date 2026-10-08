@@ -43,7 +43,7 @@ ${actionGroup('Added voice motions', VOICE_ACTIONS)}
 <dialog id="tts-key-dialog" class="key-dialog" aria-labelledby="tts-key-title"><form id="tts-key-form"><h2 id="tts-key-title">Add your OpenAI API key</h2><p>Give your dot a voice. The key stays in a private file on this computer, outside the web files and character configuration.</p><label class="field-label" for="tts-key-input">OpenAI API key</label><input id="tts-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">Create an API key ↗</a> · Speech uses your OpenAI API billing.</p><p id="tts-key-error" role="alert"></p><div class="speech-buttons"><button id="tts-key-submit" class="outline-button" type="submit">Save API key</button><button id="tts-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
 if (robotView) {
   document.querySelector('#app').insertAdjacentHTML('beforeend', '<p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>');
-  document.querySelector('#app').insertAdjacentHTML('beforeend', '<div class="robot-hud"><a href="./original-dots.html">Studio</a><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="robot-audio-gate" class="robot-audio-gate"><span>AI-generated voice · OpenAI</span><button id="robot-enable-voice">Enable voice</button></div>');
+  document.querySelector('#app').insertAdjacentHTML('beforeend', '<div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div>');
   for (const selector of ['.topbar', '.intro', '.playback', '.idle-controls', '.animation-library', '.custom-panel', '.page-footer', '.stage-top', '.stage-name', '.stage-bottom']) $(selector).hidden = true;
 }
 
@@ -152,17 +152,10 @@ function connectRobot() {
       desiredState = command.state;
       playAction(command.speech ? 'idle' : command.state, false); commandLevel = command.level;
       if (command.speech) {
-        const request = speechRequest;
-        try {
-          if (speech.context?.state !== 'running') {
-            pendingSpeech = { url: command.speech, text: command.text || '' }; $('#robot-audio-gate').hidden = false;
-            return;
-          }
-          speechFetch = new AbortController();
-          const response = await fetch(command.speech, { cache: 'no-store', signal: speechFetch.signal });
-          if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
-          if (request === speechRequest) await playSpeech(response, command.text || '');
-        } catch (failure) { if (request !== speechRequest) return; error = failure.message; }
+        pendingSpeech = command;
+        resumeRobotVoice();
+        if (speech.context?.state !== 'running') toast('This browser blocks automatic audio. Use ./run.sh --robot, or tap anywhere here.');
+        return;
       }
     }
     if (error) toast(error);
@@ -234,24 +227,22 @@ function openKeySetup() {
   $('#tts-key-error').textContent = ''; $('#tts-key-input').value = '';
   $('#tts-key-dialog').showModal();
 }
-async function enableRobotVoice() {
-  const gate = $('#robot-audio-gate');
+async function resumeRobotVoice() {
+  let command, request, error = '';
   try {
-    const enabled = speech.enable();
-    gate.hidden = speech.context?.state === 'running';
-    await enabled;
-    gate.hidden = speech.context?.state === 'running';
-    if (!gate.hidden || !pendingSpeech) return;
-    const { url, text } = pendingSpeech, request = speechRequest; pendingSpeech = null;
+    await speech.enable();
+    if (speech.context?.state !== 'running' || !pendingSpeech) return;
+    command = pendingSpeech; request = speechRequest; pendingSpeech = null;
     speechFetch = new AbortController();
-    const response = await fetch(url, { cache: 'no-store', signal: speechFetch.signal });
+    const response = await fetch(command.speech, { cache: 'no-store', signal: speechFetch.signal });
     if (request !== speechRequest) return;
     if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
-    await playSpeech(response, text);
-  } catch (error) {
-    gate.hidden = speech.context?.state === 'running';
-    if (error.name !== 'AbortError') toast(error.message);
+    await playSpeech(response, command.text || '');
+  } catch (failure) {
+    if (failure.name === 'AbortError' || (request !== undefined && request !== speechRequest)) return;
+    error = failure.message; toast(error);
   }
+  if (command) api('ack', { generation: command.generation, sequence: command.sequence, state: command.state, error }).catch(error => toast(error.message));
 }
 async function setupVoice() {
   voiceInfo = await api('voice'); keyConfigured = voiceInfo.configured;
@@ -297,12 +288,12 @@ async function setupVoice() {
     $('#tts-sample-text').textContent = `“Hi, I am ${name}.”`; requestSave();
   });
   if (robotView) {
-    $('#robot-enable-voice').addEventListener('click', enableRobotVoice);
-    const retryVoice = () => { if (speech.context?.state !== 'running') enableRobotVoice(); };
-    document.addEventListener('click', retryVoice, { once: true });
-    document.addEventListener('keydown', retryVoice, { once: true });
+    const retryVoice = () => { if (speech.context?.state !== 'running') resumeRobotVoice(); };
+    document.addEventListener('click', retryVoice);
+    document.addEventListener('keydown', retryVoice);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) retryVoice(); });
     // A blocked resume can wait for a gesture; let the character load meanwhile.
-    enableRobotVoice();
+    resumeRobotVoice();
   }
 }
 function syncVoiceControls() {
@@ -440,10 +431,8 @@ function frame(now) {
       if (framing) {
         const rect = $('#native-viewport').getBoundingClientRect();
         let bottom = rect.bottom;
-        for (const id of ['robot-subtitles', 'robot-audio-gate']) {
-          const overlay = $(`#${id}`);
-          if (!overlay.hidden) bottom = Math.min(bottom, overlay.getBoundingClientRect().top - 12);
-        }
+        const subtitles = $('#robot-subtitles');
+        if (!subtitles.hidden) bottom = Math.min(bottom, subtitles.getBoundingClientRect().top - 12);
         const canvas = $('#original-character');
         const size = framing.update(canvas, rect.width, Math.max(1, bottom - rect.top), rendered);
         if (size) character.setDisplayScale(canvas.width / size);

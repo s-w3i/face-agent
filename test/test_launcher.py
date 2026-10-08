@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -25,7 +26,7 @@ class LauncherCheck(unittest.TestCase):
                 shutil.copy2(ROOT / name, origin / name)
             shutil.copytree(ROOT / 'dist', origin / 'dist')
             (origin / 'scripts').mkdir()
-            for name in ('serve.py', 'dotsctl.py'):
+            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py'):
                 shutil.copy2(ROOT / 'scripts' / name, origin / 'scripts' / name)
             subprocess.run(['git', 'init', '--quiet', str(origin)], check=True)
             subprocess.run(['git', '-C', str(origin), 'add', '.'], check=True)
@@ -69,6 +70,41 @@ class LauncherCheck(unittest.TestCase):
                     expected['appearance']['name'] = 'Saved robot'
                     (clone / 'robot-config.json').write_text(json.dumps(expected))
             self.assertFalse((clone / 'node_modules').exists())
+
+    def test_robot_launch_allows_audio_and_cleans_up_its_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            browser = root / 'browser'
+            browser.write_text(f'#!{sys.executable}\nimport json, os, sys, time\nfrom pathlib import Path\nPath(os.environ["BROWSER_ARGS"]).write_text(json.dumps(sys.argv[1:]))\ntime.sleep(float(os.environ["BROWSER_SECONDS"]))\n')
+            browser.chmod(0o700)
+            for interrupt in (False, True):
+                with self.subTest(interrupt=interrupt), socket.socket() as reservation:
+                    reservation.bind(('127.0.0.1', 0)); port = reservation.getsockname()[1]
+                arguments = root / f'args-{interrupt}.json'
+                env = {**os.environ, 'PORT': str(port), 'HOST': '127.0.0.1', 'DOTS_CONFIG': str(ROOT / 'robot-config.default.json'),
+                       'OPENAI_API_KEY': '', 'XDG_CONFIG_HOME': str(root / 'private'), 'DOTS_BROWSER': str(browser),
+                       'DOTS_BROWSER_PROFILE': str(root / 'robot profile'), 'BROWSER_ARGS': str(arguments),
+                       'BROWSER_SECONDS': '30' if interrupt else '1'}
+                with (root / 'robot.log').open('w+') as log:
+                    process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/launch_robot.py')], env=env, stdout=log, stderr=log)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not arguments.exists():
+                            if process.poll() is not None or time.monotonic() > deadline:
+                                log.seek(0); self.fail(log.read())
+                            time.sleep(.05)
+                        args = json.loads(arguments.read_text())
+                        self.assertIn('--autoplay-policy=no-user-gesture-required', args)
+                        self.assertIn(f'--app=http://127.0.0.1:{port}/robot.html', args)
+                        self.assertIn(f'--user-data-dir={root / "robot profile"}', args)
+                        if interrupt:
+                            process.send_signal(signal.SIGTERM)
+                        self.assertEqual(process.wait(timeout=10), 0)
+                        with socket.socket() as probe:
+                            self.assertNotEqual(probe.connect_ex(('127.0.0.1', port)), 0)
+                    finally:
+                        if process.poll() is None:
+                            process.terminate(); process.wait(timeout=10)
 
 
 if __name__ == '__main__':

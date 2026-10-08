@@ -42,7 +42,7 @@ test('speech measures actual audio, ends cleanly, and cancels delayed decoding',
   let started = 0, ended = 0;
   try {
     const clip = new Blob(['test clip']);
-    await assert.rejects(player.play(clip, () => {}, () => {}), /Enable voice/);
+    await assert.rejects(player.play(clip, () => {}, () => {}), /Browser audio is blocked/);
     await player.enable();
     await player.play(clip, () => started++, () => ended++, 'Hello, robot.');
     assert.equal(subtitle, 'Hello, robot.');

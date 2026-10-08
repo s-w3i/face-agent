@@ -25,7 +25,7 @@ export class SpeechPlayer {
     this.stop();
     const generation = this.generation;
     this.context ||= new AudioContext();
-    if (this.context.state !== 'running') throw new Error('Enable voice on the robot display to allow sound.');
+    if (this.context.state !== 'running') throw new Error('Browser audio is blocked. Use ./run.sh --robot for automatic voice.');
     const buffer = await this.context.decodeAudioData(await blob.arrayBuffer());
     if (generation !== this.generation) return;
     const source = this.context.createBufferSource();
@@ -43,7 +43,7 @@ export class SpeechPlayer {
   async stream(response, onStart, onEnd, onTiming = () => {}, text = '') {
     this.stop(); const generation = this.generation;
     this.context ||= new AudioContext();
-    if (this.context.state !== 'running') throw new Error('Enable voice on the robot display to allow sound.');
+    if (this.context.state !== 'running') throw new Error('Browser audio is blocked. Use ./run.sh --robot for automatic voice.');
     const reader = response.body.getReader(); this.reader = reader; this.streaming = true;
     this.analyser = this.context.createAnalyser(); this.analyser.fftSize = 512;
     this.samples = new Float32Array(512); this.analyser.connect(this.context.destination);
