@@ -17,7 +17,8 @@ export async function startBakedDisplay(config) {
   document.querySelector('#app').innerHTML = `<div class="baked-viewport" id="native-viewport"><canvas id="original-character" role="img" aria-label="Pre-rendered dots character"></canvas></div>
     <p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>
     <div class="baked-loading" id="baked-loading" role="status">Loading saved animation pack…</div>
-    <div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="toast" class="toast" role="status"></div>`;
+    <div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="device-key-open">API key</button><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="toast" class="toast" role="status"></div>
+    <dialog id="device-key-dialog" class="key-dialog" aria-labelledby="device-key-title"><form id="device-key-form"><h2 id="device-key-title">Set up this device’s API key</h2><p>Each device needs its own OpenAI API key setup. The key stays in a private file on this device and is excluded from Git, character configuration and animation packs.</p><label class="field-label" for="device-key-input">OpenAI API key</label><input id="device-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p id="device-key-error" role="alert"></p><div class="speech-buttons"><button id="device-key-submit" class="outline-button" type="submit">Save API key</button><button id="device-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
   const $ = selector => document.querySelector(selector);
   const manifest = await api('prerender');
   if (!manifest || !config) {
@@ -32,6 +33,18 @@ export async function startBakedDisplay(config) {
   let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer;
   const speech = new SpeechPlayer(text => { $('#robot-subtitles').textContent = text; $('#robot-subtitles').hidden = !text; drawn = ''; });
   const toast = message => { $('#toast').textContent = message; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 6000); };
+  function openKeySetup() { $('#device-key-input').value = ''; $('#device-key-error').textContent = ''; $('#device-key-dialog').showModal(); }
+  $('#device-key-open').addEventListener('click', openKeySetup);
+  $('#device-key-later').addEventListener('click', () => $('#device-key-dialog').close());
+  $('#device-key-dialog').addEventListener('close', () => { $('#device-key-input').value = ''; });
+  $('#device-key-form').addEventListener('submit', async event => {
+    event.preventDefault(); $('#device-key-submit').disabled = true; $('#device-key-error').textContent = '';
+    const apiKey = $('#device-key-input').value.trim(); $('#device-key-input').value = '';
+    try {
+      await api('key', { apiKey }); $('#device-key-dialog').close(); toast('API key saved privately on this device.');
+    } catch (error) { $('#device-key-error').textContent = error.message; }
+    finally { $('#device-key-submit').disabled = false; }
+  });
   function status() { $('#robot-connection').textContent = matchingBake(config, manifest) ? 'Pre-rendered · Connected' : 'Pre-rendered · Re-bake updated look in Studio'; }
   function stopSpeech() { request++; pendingSpeech = null; speechFetch?.abort(); speechFetch = null; speech.stop(); }
   async function play(id, keepSpeech = false) {
@@ -121,10 +134,12 @@ export async function startBakedDisplay(config) {
   }
   const fullscreen = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(error => toast(error.message));
   $('#robot-fullscreen').addEventListener('click', fullscreen); canvas.addEventListener('dblclick', fullscreen);
-  document.addEventListener('keydown', event => { if (event.key.toLowerCase() === 'f') fullscreen(); if (speech.context?.state !== 'running') resumeVoice(); });
+  document.addEventListener('keydown', event => { if (event.key.toLowerCase() === 'f' && !event.target.closest('input,dialog')) fullscreen(); if (speech.context?.state !== 'running') resumeVoice(); });
   document.addEventListener('click', () => { if (speech.context?.state !== 'running') resumeVoice(); });
   document.addEventListener('fullscreenchange', () => { $('#robot-fullscreen').textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Enter fullscreen'; });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { lastFrame = performance.now(); idle.reset(); if (speech.context?.state !== 'running') resumeVoice(); } });
   addEventListener('pagehide', () => { events.close(); stopSpeech(); speech.dispose(); renderer.dispose(); }, { once: true });
   status(); resumeVoice(); requestAnimationFrame(frame);
+  const voice = await api('voice'); $('#device-key-open').disabled = voice.source === 'environment';
+  if (!voice.configured) openKeySetup();
 }

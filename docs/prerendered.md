@@ -64,4 +64,9 @@ old pack folders can be removed after displays using them have stopped.
 
 The pack contains character configuration and image assets only. It contains
 neither the OpenAI API key nor recorded speech. The key remains in its existing
-private file outside the repository.
+private file outside the repository. A fresh device prompts for its own key in
+the robot display (or the studio). Saving it on one device does not configure
+another device. The default location is `~/.config/mimo-dots/openai-api-key`,
+with file permissions `0600` and a `0700` parent directory. `XDG_CONFIG_HOME`
+can select another device-local configuration directory; `OPENAI_API_KEY` is
+an optional server environment override and is never exported.

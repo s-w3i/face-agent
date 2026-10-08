@@ -77,6 +77,15 @@ class RobotServiceCheck(unittest.TestCase):
                 self.assertEqual(key_file.parent.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(list(key_file.parent.iterdir()), [key_file])
                 self.assertTrue(api('voice')['configured'])
+                # Another device can use the same character config without inheriting credentials.
+                other = RobotServer(('127.0.0.1', 0), config_file=server.config_file, static_root=web,
+                                    key_file=root / 'other-device' / 'openai-api-key')
+                try:
+                    self.assertEqual(other.api_key(), '')
+                    other.save_key('sk-other-device-' + 'y' * 40)
+                    self.assertNotEqual(other.api_key(), server.api_key())
+                    self.assertEqual(server.api_key(), dummy_key)
+                finally: other.server_close()
                 for route in ('voice', 'config', 'status'):
                     self.assertNotIn(dummy_key, json.dumps(api(route)))
                 bad = dict(config, apiKey=dummy_key)
