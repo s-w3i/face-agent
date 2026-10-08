@@ -1,0 +1,4 @@
+-r requirements.txt
+# ROS message bindings need NumPy; rclpy/turtlesim come from the ROS installation.
+numpy>=1.21,<2
+mcp>=2,<3

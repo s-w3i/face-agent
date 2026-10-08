@@ -24,8 +24,8 @@ if [ ! -x .venv/bin/python ] || ! .venv/bin/python -m pip --version >/dev/null 2
     exit 1
   fi
 fi
-if ! .venv/bin/python -c 'from importlib.metadata import version; assert version("websockets").split(".", 1)[0] == "16"; from websockets.sync.client import connect' >/dev/null 2>&1; then
-  printf '%s\n' 'Installing the voice dependency (first launch needs internet)…'
+if ! .venv/bin/python -c 'from importlib.metadata import version; assert version("websockets").split(".", 1)[0] == "16"; from websockets.sync.client import connect; from agents import Agent, Runner' >/dev/null 2>&1; then
+  printf '%s\n' 'Installing the voice and chatbot dependencies (first launch needs internet)…'
   .venv/bin/python -m pip install -r requirements.txt
 fi
 

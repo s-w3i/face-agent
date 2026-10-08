@@ -14,9 +14,57 @@ The library exposes every animation action in the copied 0.11.0 binding: all nin
 
 Sleeping calls the native **Paused** activity (closed eyes and sleep marks). Ready includes cursor-following gaze. The inspected binding has no voice-specific commands. The studio now adds **Listening** (attentive stretch, forward lean, acknowledgment nods) and **Speaking** (syllable stretch, taper and contour ripples) directly to the original character's vertex shader. Body, fitted face parts, fur, and shadow geometry share the deformation; the copied runtime files are unchanged. This is a local renderer integration, not a published OpenAI SDK.
 
-Select Listening or Speaking to enable **Body motion time**, **Pause body motion**, and **Motion strength**. Scrubbing freezes the added deformation at an exact time; the original Ready idle/blinks continue underneath. Speaking defaults to a five-second demo phrase. **Speech drive → Fixed speech level** allows comparison from silence (0%, neutral body) to full level (100%). Reduced motion makes the added pose static and gentler. OpenAI speech playback now supplies the actual audio amplitude to `voiceMotionPose()` in `src/native-voice.js`. The demo/fixed controls remain available for silent animation tests. Chatbot input and microphone/STT access are not connected yet.
+Select Listening or Speaking to enable **Body motion time**, **Pause body motion**, and **Motion strength**. Scrubbing freezes the added deformation at an exact time; the original Ready idle/blinks continue underneath. Speaking defaults to a five-second demo phrase. **Speech drive → Fixed speech level** allows comparison from silence (0%, neutral body) to full level (100%). Reduced motion makes the added pose static and gentler. OpenAI speech playback now supplies the actual audio amplitude to `voiceMotionPose()` in `src/native-voice.js`. The demo/fixed controls remain available for silent animation tests. Terminal chatbot input is available through scripts/chat.py; microphone/STT access is not connected yet.
 
 The extension is verified against the copied 0.11.0 renderer. It patches only this canvas's shader compilation and reads the body's bounds from its existing uniform upload. It adds no new render pass, graphics library, or per-frame mesh rebuild. Because this is an internal renderer layout, an app update requires rechecking the shader and uniform layout before importing its resources.
+
+## Terminal chatbot (OpenAI Agents SDK)
+
+Start `./run.sh` or `./run.sh --robot`, then in another terminal run:
+
+```bash
+.venv/bin/python scripts/chat.py
+```
+
+The chatbot starts asleep and sends `sleeping` to the connected display. At `you>`, submit `Hi {name}` using the current Character name from settings (for example, `Hi Shiro`). The greeting is case-insensitive and may include a command, such as `Hi Shiro, what time is it?`. Input without the wake greeting is silently ignored while asleep, with no model or speech request. Once awake, type ordinary messages. Thirty seconds without a submitted line after spoken playback finishes sends the robot back to sleep; wake it again with the greeting. The countdown starts on the connected display’s playback acknowledgment, rather than when speech is queued. You can submit another command while it is speaking. In text-only mode, or with no connected display, the countdown starts after the printed reply. Terminal input counts when you press Enter. Standalone thanks or farewells (including “thankyou”) get a natural closing reply, then sleep immediately after speech completes. If the same message contains another request, the chatbot handles it and stays awake. Conversation history survives sleep, until `/reset` or exit; `/quit` exits even while asleep. The [OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/quickstart?lang=python) runs the chatbot with tools to list and play supported animations. Open the robot display to load those animations. The character shows Thinking while answering and returns to Idle unless the agent chose an animation. Chat works even with the display/service offline.
+
+The chatbot uses `OPENAI_API_KEY` or the private key saved through studio Voice settings. Internet and API billing are required. History stays in process memory and is sent to OpenAI each turn; SDK trace uploads are disabled. The reasoning backend defaults to `gpt-6-luna`. Use `--model MODEL_ID` or `OPENAI_CHAT_MODEL` to override it. `--url` or `DOTS_URL` selects the display service.
+
+Replies print in the terminal and speak by default through the existing speech service, saved voice, subtitles, and body motion. Use `--no-speak` for text-only replies. Speech needs the local service and a display with audio enabled. Input remains text only; later, transcription can feed `Chatbot.reply()` with the same history and tools.
+
+Offline check: `.venv/bin/python -m unittest discover -s test -p test_chat.py`.
+
+The chatbot reads its name from `appearance.name` in the live service's settings on every turn (falling back to `DOTS_CONFIG` or `robot-config.json` if offline). Change **Character name** in the studio and the next turn uses it. Its date/time tool reads the computer clock, defaulting to `Asia/Kuala_Lumpur`; set `DOTS_TIMEZONE` to another IANA timezone if needed. Keep the computer clock synchronized for accurate answers.
+
+OpenAI's hosted web-search tool is enabled with live internet access, using the same API key. The bot can search current facts and weather, with conversational replies; source sections and links are removed before display and speech. Weather prioritizes the city you specify or have established in the conversation. Otherwise, the current_location tool estimates the robot computer’s city through https://ipapi.co/json/ before asking. This sends a request to ipapi.co (which sees the public IP); only city, region, and country are returned to the model, not the IP itself. IP location can be inaccurate, especially with VPNs, and locates the robot computer’s connection rather than GPS. If lookup fails it asks for a city. Set DOTS_CITY="Kajang, Malaysia" to use a fixed city without contacting the location provider. Search adds API usage charges. Try “What is your name?”, “What date and time is it?”, “Search today's technology news”, or “What is the weather in Kuala Lumpur today?”.
+
+## Turtlesim MCP control
+
+The chatbot can connect to `scripts/turtlesim_mcp.py`, a local stdio MCP server using native `rclpy` communication. Movement publishes `geometry_msgs/Twist` on `/turtle1/cmd_vel`, reads `turtlesim/Pose` from `/turtle1/pose`, and runs the `turtlesim/RotateAbsolute` action on `/turtle1/rotate_absolute` for heading commands. It never shells out to `ros2 topic pub` or `ros2 action send_goal`. Turtlesim has no native go-to-position action; room navigation uses a 20 Hz pose-feedback controller over its velocity topic.
+
+With ROS 2 Humble and turtlesim installed, source ROS in the terminal that runs the chatbot, then install the optional dependencies once:
+
+```bash
+source /opt/ros/humble/setup.bash
+.venv/bin/python -m pip install -r requirements-turtlesim.txt
+.venv/bin/python scripts/chat.py --turtlesim
+```
+
+Launch your turtlesim separately and keep its `ROS_DOMAIN_ID`, ROS middleware, and discovery settings consistent with the chatbot. The chatbot starts and closes the MCP server automatically. Startup commands above only launch software; robot commands flow through MCP and ROS APIs. Python must match your ROS installation (Humble on this machine uses Python 3.10). Speech still uses the face display service.
+
+Wake with `Hi Shiro` (or your saved character name), then ask “Go to the kitchen”, “Where is the turtle?”, “Stop the turtle”, or “Turn to face north”. The MCP tools are `list_destinations`, `go_to_room`, `robot_status`, `stop_robot`, `rotate_robot`, `move_straight`, and `turn_robot`. Movement tools queue their request without moving the turtle. The chatbot generates and speaks its departure announcement first, waits for the display’s successful playback acknowledgment, then releases the queued motion through a runtime-only MCP tool (hidden from the model). If speech fails, is interrupted, has no connected display, or is not confirmed within 120 seconds, motion is cancelled. In explicit --no-speak mode, the printed announcement releases motion immediately. It then monitors live MCP status to generate a spoken arrival or failure report automatically, once per motion. The report waits until any current spoken reply finishes; input remains available while moving. Completion reports cannot invoke movement tools. Stop before sending a different destination while it is moving. “Go straight” moves one simulation unit; “go straight two meters” moves two units along the current heading. Turtlesim has no real meter scale, so this interface maps a requested meter to one simulation unit. Negative distance in move_straight moves backwards. “Turn left” or “turn right” defaults to ninety degrees; explicit relative turns support one through 180 degrees. Targets beyond the safe canvas boundary are rejected. Sleep does not cancel an active navigation task; stopping or exiting the MCP server does.
+
+Fixed points are in `turtlesim-waypoints.json`:
+
+| Room | x | y |
+| --- | --- | --- |
+| living room | 2.0 | 2.0 |
+| bedroom | 8.5 | 8.5 |
+| kitchen | 8.5 | 2.0 |
+
+Edit these coordinates before restarting the chatbot; `TURTLESIM_WAYPOINTS` selects another JSON file. Coordinates must lie between 0.5 and 10.5. Navigation stops within 0.12 units, limits velocity, fails after 60 seconds, and stops publishing motion if pose feedback becomes older than one second. This is a straight-line turtlesim controller; there is no obstacle map or real-world navigation stack.
+
+Run the live integration check with `.venv/bin/python -m unittest discover -s test -p test_turtlesim_mcp.py`. It launches its own headless simulator in a separate ROS domain, exercises MCP room navigation, the rotation action, stopping, and lost-pose handling, then cleans up. It does not require an OpenAI request.
 
 ## Robot display and local configuration
 
@@ -146,7 +194,7 @@ During development, run the Python service on port 5174 alongside Vite on 5173. 
 
 The procedural browser renderer uses Three.js; the original mode uses the imported native renderer. OpenAI speech uses Python `websockets` on the server. Vite is the development/build tool. `src/character.js` contains the renderer and procedural model. `src/motion.js` defines expressive body poses; `src/deformation.js` applies them to the body, face, and fur on the GPU. `src/fur.js` builds short instanced fibers and a tiny felt texture. `src/model.js` owns validated appearance settings and the animation scheduler. `src/main.js` connects the controls. Tests cover interruption, idle scheduling, sleep/wake, pause/speed, the complete tour, import validation, preset compatibility, distinct status silhouettes, stable deformations, smooth transitions, and timeline seeking.
 
-For the procedural studio, future voice/chat integration can call `director.play('listening')`, `director.play('thinking')`, `director.play('speaking')`, and `director.play('idle')` at the appropriate interaction boundaries. The original mode's added motion accepts a speech level through `voiceMotionPose()`; its UI currently supplies the demo or fixed level. The original robot view now uses the OpenAI voice and server-only credentials described above. No chatbot or microphone permission is wired up yet.
+For the procedural studio, future voice/chat integration can call `director.play('listening')`, `director.play('thinking')`, `director.play('speaking')`, and `director.play('idle')` at the appropriate interaction boundaries. The original mode's added motion accepts a speech level through `voiceMotionPose()`; its UI currently supplies the demo or fixed level. The original robot view now uses the OpenAI voice and server-only credentials described above. The terminal chatbot now drives this display through the local service; microphone input is not wired up yet.
 
 The procedural renderer's soft contact shadow is a tiny generated texture; that renderer has no dynamic shadow maps, downloaded models, large textures, or post-processing passes. Its flocked surface combines a 256px texture with short fiber ribbons in instanced draws; lightweight mode uses half the fiber density. The coat moves with the body without CPU hair simulation. Speaking reshapes the contour in synthetic syllable phrases. Sleeping settles into a low, wide shape; listening bends forward; thinking curves and sways. Hats retain their form while following the deformed body. Lightweight is a starting profile to benchmark on the intended Pi, not a hardware performance guarantee.
 

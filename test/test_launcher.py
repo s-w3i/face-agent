@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import unittest
@@ -35,6 +36,9 @@ class LauncherCheck(unittest.TestCase):
             subprocess.run(['git', 'clone', '--quiet', str(origin), str(clone)], check=True)
             # Reuse installed test dependencies offline; the launcher still selects its own venv.
             subprocess.run([sys.executable, '-m', 'venv', '--system-site-packages', str(clone / '.venv')], check=True, stdout=subprocess.DEVNULL)
+            # Include the current test environment's SDK in this offline clone.
+            site_packages = next((clone / '.venv' / 'lib').glob('python*/site-packages'))
+            (site_packages / 'test-dependencies.pth').write_text(sysconfig.get_path('purelib') + '\n')
             expected = json.loads((clone / 'robot-config.default.json').read_text())
             self.assertFalse((clone / 'robot-config.json').exists())
             with socket.socket() as reservation:
