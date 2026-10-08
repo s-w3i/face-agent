@@ -70,3 +70,48 @@ another device. The default location is `~/.config/mimo-dots/openai-api-key`,
 with file permissions `0600` and a `0700` parent directory. `XDG_CONFIG_HOME`
 can select another device-local configuration directory; `OPENAI_API_KEY` is
 an optional server environment override and is never exported.
+
+## Live eye tracking with the baked body
+
+Shiro's bundled pack includes eye positions for each body frame. The lightweight
+player moves the original eye pair using small Canvas 2D image patches, easing
+the surrounding fur back to fixed edges. The body, crown, blinks, highlights and
+audio-driven speaking poses still come from the saved WebP sheets. No camera
+capture or person detector is included yet.
+
+**Human eye tracking** is on by default while awake. A critically damped filter
+smooths target changes, with a small dead zone for camera jitter. **Gaze response**
+in the studio adjusts its response time; changing it does not require a bake.
+When no person is detected, or updates stop for one second, the eyes ease back to
+the original pixels and animations. Sleeping always uses the original closed
+eyes; a current target is picked up again after waking. Automatic idle look
+gestures are skipped while tracking a person, while other body gestures continue.
+
+Open **Test gaze** in the robot display. Move Target X/Y, or enable **Follow
+pointer**, to simulate a continuous camera target. Test `idle`, `listening`,
+`speaking`, `wave`, `drag`, and `sleeping` using the buttons. **No person · original
+eyes** stops the simulated target. Close the panel to leave the display clear.
+Simulation continues until you turn it off or close the page.
+
+A future camera tracker should send the person's face center at 10–30 Hz:
+
+```sh
+curl -X POST http://127.0.0.1:5174/api/gaze \
+  -H 'Content-Type: application/json' \
+  -d '{"detected":true,"x":0.25,"y":0.4}'
+```
+
+Coordinates are normalized: `(0,0)` is the display's upper left and `(1,1)` its
+lower right. Mirror the camera X coordinate before sending if your camera view
+requires it. Send `{"detected":false}` when the person disappears. Gaze events are
+separate from animation commands, so target updates do not restart movement or
+interrupt speech. `GET /api/gaze` includes the latest target and its `ageMs`.
+Terminal commands `gaze 0.25 0.4` and `gaze off` are useful for short checks; a
+single target expires after one second.
+
+For an older pack, click **Prepare eye tracking** in the studio. This only adds
+eye positions to `manifest.json`; it does not re-render or change the body images.
+New bakes include the positions automatically. The current eye detector supports
+Shiro's pink body and unobstructed dark capsule eyes. Other colors, obscured eyes,
+unsupported frames, and the eight other characters' signature previews retain
+their original eyes. Verify a customized look in Test gaze after preparing it.

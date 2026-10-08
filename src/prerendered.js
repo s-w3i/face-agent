@@ -1,3 +1,5 @@
+import { drawGaze } from './gaze.js';
+
 export function bakedFrame(clip, seconds, fps, level = 0) {
   if (clip.id === 'speaking') return Math.round(Math.max(0, Math.min(1, level)) * (clip.count - 1));
   const frame = Math.floor(Math.max(0, seconds) * fps);
@@ -44,7 +46,7 @@ export class BakedRenderer {
     if (clip.id === 'speaking') await Promise.all(clip.sheets.map((_, i) => this.sheet(clip, i).ready));
     if (this.error) throw this.error;
   }
-  draw(clip, frame) {
+  draw(clip, frame, gaze = [0, 0]) {
     const { columns, size } = this.manifest, perSheet = columns * columns;
     const sheetIndex = Math.floor(frame / perSheet), entry = this.sheet(clip, sheetIndex);
     const nextIndex = sheetIndex + 1 < clip.sheets.length ? sheetIndex + 1 : Math.floor((clip.loopStart || 0) / perSheet);
@@ -53,6 +55,7 @@ export class BakedRenderer {
     const slot = frame % perSheet;
     this.context.clearRect(0, 0, size, size);
     this.context.drawImage(entry.image, (slot % columns) * size, Math.floor(slot / columns) * size, size, size, 0, 0, size, size);
+    drawGaze(this.context, entry.image, (slot % columns) * size, Math.floor(slot / columns) * size, clip.eyes?.[frame], gaze, size);
     return true;
   }
   dispose() { this.disposed = true; for (const entry of this.cache.values()) entry.image?.close(); this.cache.clear(); }

@@ -36,7 +36,7 @@ ${actionGroup('Added voice motions', VOICE_ACTIONS)}
 <label class="field-label spaced" for="native-quality">Rendering</label><select class="full-select" id="native-quality" disabled><option value="1">Compact · 30 fps target</option><option value="2">Balanced · 60 fps target</option></select>
 <label class="toggle-row"><span><strong>Reduced motion</strong><small>Use the native quiet-motion setting</small></span><input id="native-reduced" type="checkbox" role="switch" disabled><span class="switch"></span></label>
 <label class="field-label" for="robot-background">Robot display background</label><select class="full-select" id="robot-background" disabled><option value="light">Light</option><option value="dark">Dark</option></select>
-<section class="bake-settings" aria-label="Pre-rendered playback"><h3>Raspberry Pi playback</h3><label class="field-label" for="robot-playback">Robot renderer</label><select class="full-select" id="robot-playback" disabled><option value="live">Live 3D · editable</option><option value="prerendered">Pre-rendered · lightweight</option></select><p class="settings-note">Bake this look on your computer: transparent 512 px frames, all original actions, listening, and 21 speaking poses driven by live audio. Keep this page visible while baking.</p><div class="speech-buttons"><button id="robot-bake" class="outline-button" disabled>Bake saved character</button><button id="robot-bake-cancel" class="text-button" hidden>Cancel</button></div><p id="robot-bake-status" class="settings-note" role="status">Checking saved animation pack…</p><a id="robot-bake-preview" class="text-button" href="./robot.html?renderer=prerendered" target="_blank" rel="noopener" hidden>Test pre-rendered display ↗</a><p class="settings-note">Saved in <code>public/prerendered/</code>. Copy this folder and <code>robot-config.json</code> to your Pi. Re-bake after changing the look, motion strength, reduced motion or background.</p></section>
+<section class="bake-settings" aria-label="Pre-rendered playback"><h3>Raspberry Pi playback</h3><label class="field-label" for="robot-playback">Robot renderer</label><select class="full-select" id="robot-playback" disabled><option value="live">Live 3D · editable</option><option value="prerendered">Pre-rendered · lightweight</option></select><p class="settings-note">Bake this look on your computer: transparent 512 px frames, all original actions, listening, and 21 speaking poses driven by live audio. Keep this page visible while baking.</p><div class="speech-buttons"><button id="robot-bake" class="outline-button" disabled>Bake saved character</button><button id="robot-bake-cancel" class="text-button" hidden>Cancel</button></div><button id="robot-gaze-prepare" class="outline-button" disabled>Prepare eye tracking</button><p id="robot-bake-status" class="settings-note" role="status">Checking saved animation pack…</p><a id="robot-bake-preview" class="text-button" href="./robot.html?renderer=prerendered" target="_blank" rel="noopener" hidden>Test pre-rendered display ↗</a><label class="toggle-row"><span><strong>Human eye tracking</strong><small>Active while awake when a person target is received</small></span><input id="robot-eye-tracking" type="checkbox" role="switch" checked disabled><span class="switch"></span></label><label class="field-label" for="robot-gaze-response">Gaze response <output id="robot-gaze-response-label">140 ms</output></label><input id="robot-gaze-response" type="range" min="60" max="400" step="10" value="140" disabled><p class="settings-note">No person: original eyes. Sleeping keeps the closed-eye animation. Use Test gaze in the robot display before connecting a camera. Prepare eye tracking adds eye positions to existing body frames.</p><p class="settings-note">Saved in <code>public/prerendered/</code>. Copy this folder and <code>robot-config.json</code> to your Pi. Re-bake after changing the look, motion strength, reduced motion or background.</p></section>
 <div class="robot-file-note"><strong>One local configuration</strong><code id="robot-config-path">robot-config.json</code><small>Appearance and settings save automatically. The robot display follows this file.</small></div>
 <details class="robot-terminal"><summary>Animation terminal</summary><p>Open the robot display, then enter a state. Try <code>sleeping</code>, <code>speaking 0.8</code>, <code>idle</code>, <code>wave</code>, or <code>say Hello!</code> for speech.</p><form id="robot-command"><label class="field-label" for="robot-command-input">Animation state or speech</label><div><input id="robot-command-input" autocomplete="off" spellcheck="false" list="robot-states" placeholder="say Hi, I am your robot" disabled><button type="submit" disabled>Send</button></div></form><datalist id="robot-states"></datalist><pre id="robot-command-log" aria-live="polite">dots&gt; ready</pre><p>OS terminal: <code>python3 scripts/dotsctl.py</code></p></details>
 <div class="render-stats"><div><span>Frame rate</span><strong id="native-fps">—</strong></div><div><span>Triangles</span><strong id="native-triangles">—</strong></div><div><span>Renderer version</span><strong id="native-version">—</strong></div></div>
@@ -84,7 +84,8 @@ async function api(path, value, method = 'POST') {
 function settingsSnapshot() {
   return { quality, reducedMotion: $('#native-reduced').checked, autoIdle: $('#native-auto').checked,
     idleInterval: Number($('#native-interval').value), motionStrength: Number($('#voice-strength').value),
-    speechSource: $('#voice-source').value, speechLevel: Number($('#voice-level').value), background: $('#robot-background').value, ttsVoice: $('#tts-voice').value || 'marin', playback: $('#robot-playback').value };
+    speechSource: $('#voice-source').value, speechLevel: Number($('#voice-level').value), background: $('#robot-background').value, ttsVoice: $('#tts-voice').value || 'marin', playback: $('#robot-playback').value,
+    eyeTracking: $('#robot-eye-tracking').checked, gazeResponse: Number($('#robot-gaze-response').value) };
 }
 function configSnapshot() {
   return { version: 1, renderer: 'original-dots', resourceRevision: bundle.resourceRevision,
@@ -100,6 +101,8 @@ function applySettings(settings) {
   $('#voice-level-label').textContent = `${Math.round(settings.speechLevel * 100)}%`;
   $('#robot-background').value = settings.background;
   $('#robot-playback').value = settings.playback || 'live';
+  $('#robot-eye-tracking').checked = settings.eyeTracking !== false; $('#robot-gaze-response').value = settings.gazeResponse || 140;
+  $('#robot-gaze-response-label').textContent = `${settings.gazeResponse || 140} ms`;
   const selectedVoice = settings.ttsVoice || 'marin';
   const supportedVoice = voiceInfo.voices.includes(selectedVoice);
   $('#tts-voice').value = supportedVoice ? selectedVoice : 'marin';
@@ -204,8 +207,25 @@ function syncBakeStatus() {
   if (robotView || bakeController) return;
   $('#robot-bake-preview').hidden = !bakedManifest;
   $('#robot-playback option[value="prerendered"]').disabled = !bakedManifest;
+  $('#robot-gaze-prepare').disabled = !bakedManifest;
   $('#robot-bake-status').textContent = !bakedManifest ? 'No baked library yet. Bake your saved character here.' :
-    matchingBake(configSnapshot(), bakedManifest) ? `Saved library · ${bakedManifest.clips.length} animations · 512 px / 16 fps` : 'Saved library needs a new bake to match these settings.';
+    matchingBake(configSnapshot(), bakedManifest) ? `Saved library · ${bakedManifest.clips.length} animations · 512 px / 16 fps${bakedManifest.gazeVersion ? ' · eye tracking ready' : ' · prepare eye tracking to add gaze'}` : 'Saved library needs a new bake to match these settings.';
+}
+async function prepareEyeTracking() {
+  if (bakeController || !bakedManifest) return;
+  const controller = bakeController = new AbortController();
+  const controls = [...document.querySelectorAll('button, select, input')].filter(control => control.id !== 'robot-bake-cancel');
+  const disabled = controls.map(control => control.disabled); controls.forEach(control => { control.disabled = true; });
+  $('#robot-bake-cancel').hidden = false; $('#robot-bake-cancel').disabled = false; character.setActive(false);
+  try {
+    const { prepareGaze } = await import('./bake-dots.js');
+    bakedManifest = await prepareGaze(await api('prerender'), controller.signal, message => { $('#robot-bake-status').textContent = `Preparing eyes · ${message}`; });
+    toast('Eye tracking prepared. Body frames and original eyes are preserved.');
+  } catch (error) { toast(error.name === 'AbortError' ? 'Eye preparation cancelled.' : error.message); }
+  finally {
+    bakeController = null; controls.forEach((control, i) => { control.disabled = disabled[i]; });
+    $('#robot-bake-cancel').hidden = true; character?.setActive(true); syncBakeStatus();
+  }
 }
 async function bakeSavedCharacter() {
   if (bakeController) return;
@@ -547,10 +567,12 @@ async function start() {
     if (!keyConfigured) openKeySetup();
     $('#robot-save').addEventListener('click', () => { requestSave(); saveAfter = 0; });
     $('#robot-bake').addEventListener('click', () => bakeSavedCharacter().catch(error => toast(error.message)));
+    $('#robot-gaze-prepare').addEventListener('click', () => prepareEyeTracking().catch(error => toast(error.message)));
     $('#robot-bake-cancel').addEventListener('click', () => bakeController?.abort());
-    for (const id of ['native-quality', 'native-reduced', 'native-auto', 'native-interval', 'voice-strength', 'voice-source', 'voice-level', 'robot-background', 'robot-playback']) {
-      $(`#${id}`).addEventListener(['native-interval', 'voice-strength', 'voice-level'].includes(id) ? 'input' : 'change', requestSave);
+    for (const id of ['native-quality', 'native-reduced', 'native-auto', 'native-interval', 'voice-strength', 'voice-source', 'voice-level', 'robot-background', 'robot-playback', 'robot-eye-tracking', 'robot-gaze-response']) {
+      $(`#${id}`).addEventListener(['native-interval', 'voice-strength', 'voice-level', 'robot-gaze-response'].includes(id) ? 'input' : 'change', requestSave);
     }
+    $('#robot-gaze-response').addEventListener('input', event => { $('#robot-gaze-response-label').textContent = `${event.target.value} ms`; });
     $('#robot-background').addEventListener('change', () => { document.body.dataset.robotBackground = $('#robot-background').value; });
     $('#robot-command').addEventListener('submit', async event => {
       event.preventDefault();

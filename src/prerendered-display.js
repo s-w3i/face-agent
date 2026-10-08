@@ -3,6 +3,8 @@ import { BakedRenderer, bakedFrame, matchingBake } from './prerendered.js';
 import { IdleMovements } from './native-actions.js';
 import { fittedLayout } from './native-framing.js';
 import { SpeechPlayer } from './speech.js';
+import { SmoothGaze } from './gaze.js';
+import { gazeControls } from './gaze-controls.js';
 
 async function api(path, value) {
   const response = await fetch(`/api/${path}`, value === undefined ? { cache: 'no-store' } : {
@@ -30,9 +32,10 @@ export async function startBakedDisplay(config) {
   const clips = new Map(manifest.clips.map(clip => [clip.id, clip]));
   const idle = new IdleMovements(); idle.reset(config.settings.idleInterval);
   let active, elapsed = 0, started = 0, commandLevel = null, smoothedLevel = 0, lastFrame = 0, drawn = '';
-  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer;
+  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision;
   const speech = new SpeechPlayer(text => { $('#robot-subtitles').textContent = text; $('#robot-subtitles').hidden = !text; drawn = ''; });
   const toast = message => { $('#toast').textContent = message; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 6000); };
+  const gaze = new SmoothGaze(), controls = gazeControls(api, toast);
   function openKeySetup() { $('#device-key-input').value = ''; $('#device-key-error').textContent = ''; $('#device-key-dialog').showModal(); }
   $('#device-key-open').addEventListener('click', openKeySetup);
   $('#device-key-later').addEventListener('click', () => $('#device-key-dialog').close());
@@ -91,7 +94,12 @@ export async function startBakedDisplay(config) {
     if (config.settings.playback !== 'prerendered' && new URLSearchParams(location.search).get('renderer') !== 'prerendered') { location.reload(); return; }
     document.body.dataset.robotBackground = config.settings.background; idle.reset(config.settings.idleInterval); status(); drawn = '';
   });
-  events.addEventListener('prerender', event => { const id = JSON.parse(event.data).id; if (id && id !== manifest.id) location.reload(); });
+  events.addEventListener('prerender', event => {
+    const pack = JSON.parse(event.data);
+    if (pack.id && (pack.id !== manifest.id || (pack.gazeVersion || 0) !== (manifest.gazeVersion || 0) || (packRevision !== undefined && packRevision !== pack.revision))) location.reload();
+    packRevision = pack.revision;
+  });
+  events.addEventListener('gaze', event => { gaze.receive(JSON.parse(event.data), performance.now()); });
   events.addEventListener('command', async event => {
     const command = JSON.parse(event.data);
     if (command.generation === generation && command.sequence <= lastCommand) return;
@@ -116,13 +124,16 @@ export async function startBakedDisplay(config) {
       if (active.id !== 'speaking' && active.loopStart === null && elapsed >= active.count / manifest.fps) play('idle').catch(error => toast(error.message));
       const random = idle.tick(dt, { idle: active.id === 'idle', enabled: config.settings.autoIdle,
         reduced: config.settings.reducedMotion, signatureAvailable: clips.has('signature') });
-      if (random) play(random).catch(error => toast(error.message));
+      if (random && !(gaze.tracking && random.startsWith('look-'))) play(random).catch(error => toast(error.message));
       const level = speech.level() ?? commandLevel ?? (config.settings.speechSource === 'level' ? config.settings.speechLevel : Math.max(0, Math.sin(elapsed * 9) * .65 + Math.sin(elapsed * 3) * .25));
       smoothedLevel += (level - smoothedLevel) * (1 - Math.exp(-15 * dt));
-      const index = bakedFrame(active, elapsed, manifest.fps, smoothedLevel), key = `${active.id}:${index}`;
-      if (key !== drawn && renderer.draw(active, index)) {
+      const eyeGaze = gaze.step(dt, now, active.id !== 'sleeping', config.settings.eyeTracking !== false, config.settings.gazeResponse || 140);
+      const index = bakedFrame(active, elapsed, manifest.fps, smoothedLevel), key = `${active.id}:${index}:${eyeGaze.map(v => v.toFixed(4))}`;
+      if (key !== drawn && renderer.draw(active, index, active.id === 'sleeping' ? [0, 0] : eyeGaze)) {
         drawn = key; canvas.dataset.frame = index;
       }
+      canvas.dataset.gazeX = eyeGaze[0].toFixed(4); canvas.dataset.gazeY = eyeGaze[1].toFixed(4); canvas.dataset.tracking = String(gaze.tracking);
+      controls.update(gaze, active.id, !!active.eyes?.[index]?.length, config.settings.eyeTracking !== false);
       if (renderer.error) { toast(renderer.error.message); renderer.error = null; }
       const rect = $('#native-viewport').getBoundingClientRect();
       const subtitles = $('#robot-subtitles');
@@ -138,7 +149,7 @@ export async function startBakedDisplay(config) {
   document.addEventListener('click', () => { if (speech.context?.state !== 'running') resumeVoice(); });
   document.addEventListener('fullscreenchange', () => { $('#robot-fullscreen').textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Enter fullscreen'; });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { lastFrame = performance.now(); idle.reset(); if (speech.context?.state !== 'running') resumeVoice(); } });
-  addEventListener('pagehide', () => { events.close(); stopSpeech(); speech.dispose(); renderer.dispose(); }, { once: true });
+  addEventListener('pagehide', () => { events.close(); stopSpeech(); speech.dispose(); renderer.dispose(); controls.dispose(); }, { once: true });
   status(); resumeVoice(); requestAnimationFrame(frame);
   const voice = await api('voice'); $('#device-key-open').disabled = voice.source === 'environment';
   if (!voice.configured) openKeySetup();

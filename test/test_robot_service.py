@@ -251,6 +251,7 @@ class RobotServiceCheck(unittest.TestCase):
                             return json.loads(stream.readline().decode().removeprefix('data: '))
                 self.assertEqual(event('config'), config)
                 self.assertEqual(event('command')['state'], 'idle')
+                self.assertEqual(event('gaze')['sequence'], 0)
                 execute(base, 'sleeping')
                 self.assertEqual(event('command')['state'], 'sleeping')
                 execute(base, 'signature:blue_beret')
@@ -262,6 +263,14 @@ class RobotServiceCheck(unittest.TestCase):
                 command = api('status')['command']
                 api('ack', dict(sequence=command['sequence'], state='speaking', error=''))
                 self.assertEqual(api('status')['acknowledgment']['state'], 'speaking')
+                target = api('gaze', dict(detected=True, x=.2, y=.8))
+                self.assertEqual(event('gaze')['x'], .2)
+                self.assertEqual(target['y'], .8)
+                self.assertEqual(api('status')['command'], command)
+                self.assertEqual(api('status')['acknowledgment']['state'], 'speaking')
+                for bad in (dict(detected=True, x=-1, y=.5), dict(detected=True, x=True, y=.5), dict(detected='yes'), dict(detected=True, x=.5, y=float('nan'))):
+                    with self.assertRaises(HTTPError): api('gaze', bad)
+                api('gaze', dict(detected=False)); self.assertFalse(event('gaze')['detected'])
                 with self.assertRaises(HTTPError): api('command', dict(state='speaking', level=2))
                 with self.assertRaises(HTTPError): api('command', dict(state='sleeping', level=.5))
                 with self.assertRaises(HTTPError): api('command', dict(state='unknown'))

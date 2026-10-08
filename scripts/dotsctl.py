@@ -29,7 +29,7 @@ def execute(base, text):
         return False
     if words[0] in ('help', 'states', 'list'):
         status = request(base, 'status')
-        print('Commands: states, status, quit, say [text]. Animation: sleeping, thinking, speaking [0..1], idle, wave, …')
+        print('Commands: states, status, quit, say [text], gaze X Y, gaze off. Animation: sleeping, thinking, speaking [0..1], idle, wave, …')
         for action in status['actions']:
             print(f"  {action['id']:<30} {action['label']}")
         if not status['actions']:
@@ -37,6 +37,11 @@ def execute(base, text):
         return
     if words[0] == 'status':
         print(json.dumps(request(base, 'status'), indent=2)); return
+    if words[0].lower() == 'gaze':
+        if words[1:] in (['off'], ['lost']): result = request(base, 'gaze', dict(detected=False))
+        elif len(words) == 3: result = request(base, 'gaze', dict(detected=True, x=float(words[1]), y=float(words[2])))
+        else: raise ValueError('Use gaze X Y (0..1) or gaze off. Stream targets to keep tracking alive.')
+        print('→ gaze target received' if result['detected'] else '→ no person; original eyes'); return
     if words[0].lower() == 'say':
         result = request(base, 'say', dict(stream=True, **(dict(text=' '.join(words[1:])) if len(words) > 1 else {})))
         print('→ speech sent to robot display' if result['displays'] else '→ speech queued; open robot.html')

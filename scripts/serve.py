@@ -89,8 +89,10 @@ def validate_config(value, pending=False):
         raise ValueError('Choose an available OpenAI voice.')
     if settings.get('playback', 'live') not in ('live', 'prerendered'):
         raise ValueError('Choose live or pre-rendered playback.')
+    if type(settings.get('eyeTracking', True)) is not bool or type(settings.get('gazeResponse', 140)) is not int or not 60 <= settings.get('gazeResponse', 140) <= 400:
+        raise ValueError('Eye tracking needs a boolean and response time of 60–400 ms.')
     # Only these fields can reach the public configuration/event stream.
-    if set(value) - {'version', 'renderer', 'resourceRevision', 'appearance', 'settings'} or set(settings) - {'autoIdle', 'reducedMotion', 'idleInterval', 'motionStrength', 'speechLevel', 'quality', 'speechSource', 'background', 'ttsVoice', 'playback'} or (look and set(look) - {'name', 'presetId', 'signatureAvailable', 'state'}):
+    if set(value) - {'version', 'renderer', 'resourceRevision', 'appearance', 'settings'} or set(settings) - {'autoIdle', 'reducedMotion', 'idleInterval', 'motionStrength', 'speechLevel', 'quality', 'speechSource', 'background', 'ttsVoice', 'playback', 'eyeTracking', 'gazeResponse'} or (look and set(look) - {'name', 'presetId', 'signatureAvailable', 'state'}):
         raise ValueError('Unknown configuration fields. API keys belong in the private key setup.')
     return value
 
@@ -134,10 +136,14 @@ class RobotServer(ThreadingHTTPServer):
         self.generation = uuid.uuid4().hex
         self.command = dict(generation=self.generation, sequence=0, state='idle', level=None)
         self.actions = []; self.ack = None; self.displays = 0
+        self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
         super().__init__(address, Handler)
 
     def config(self):
         return validate_config(json.loads(self.config_file.read_text()), pending=True)
+
+    def gaze_value(self):
+        return dict(self.gaze, ageMs=round((time.monotonic() - self.gaze_at) * 1000))
 
     def api_key(self):
         key = os.environ.get('OPENAI_API_KEY', '').strip()
@@ -333,8 +339,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.headers.get_content_type() != 'application/json':
             raise ValueError('Send application/json to the local service.')
         size = int(self.headers.get('Content-Length', '0'))
-        if not 0 < size <= 100000:
-            raise ValueError('Choose a JSON payload smaller than 100 KB.')
+        limit = 1_000_000 if re.fullmatch(r'/api/prerender/[a-f0-9]{32}(/gaze)?', urlparse(self.path).path) else 100000
+        if not 0 < size <= limit:
+            raise ValueError(f'Choose a JSON payload smaller than {limit // 1000} KB.')
         return json.loads(self.rfile.read(size))
 
     def do_GET(self):
@@ -343,6 +350,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/prerender':
                 manifest = self.server.render_packs.root / 'manifest.json'
                 self.reply(json.loads(manifest.read_text()) if manifest.exists() else None); return
+            if path == '/api/gaze':
+                with self.server.changed: self.reply(self.server.gaze_value())
+                return
             if path == '/api/voice':
                 self.local_voice()
                 self.reply(dict(configured=bool(self.server.api_key()), source='environment' if os.environ.get('OPENAI_API_KEY', '').strip() else 'private file', voices=VOICES, model=SPEECH_MODEL)); return
@@ -361,7 +371,7 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
                                     displays=self.server.displays, command=self.server.command,
-                                    acknowledgment=self.server.ack, actions=self.server.actions))
+                                    acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value()))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -388,9 +398,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self.server.render_packs.upload(*upload.groups(), self.rfile.read(size))
                 self.reply(dict(saved=True)); return
             value = self.body()
+            if path == '/api/gaze':
+                if not isinstance(value, dict) or type(value.get('detected')) is not bool or set(value) - {'detected', 'x', 'y'}:
+                    raise ValueError('Send detected and normalized x/y coordinates for gaze.')
+                if value['detected'] and any(type(value.get(k)) not in (int, float) or not math.isfinite(value[k]) or not 0 <= value[k] <= 1 for k in ('x', 'y')):
+                    raise ValueError('Gaze x and y must be between 0 and 1.')
+                with self.server.changed:
+                    self.server.gaze = dict(sequence=self.server.gaze['sequence'] + 1, detected=value['detected'], x=value.get('x', .5) if value['detected'] else .5, y=value.get('y', .5) if value['detected'] else .5)
+                    self.server.gaze_at = time.monotonic(); self.server.changed.notify_all(); self.reply(self.server.gaze_value())
+                return
             if path == '/api/prerender':
                 self.local_voice()
                 self.reply(dict(id=self.server.render_packs.begin())); return
+            gaze_pack = re.fullmatch(r'/api/prerender/([a-f0-9]{32})/gaze', path)
+            if gaze_pack:
+                self.local_voice(); self.server.render_packs.add_gaze(gaze_pack[1], value)
+                with self.server.changed: self.server.changed.notify_all()
+                self.reply(dict(saved=True)); return
             commit = re.fullmatch(r'/api/prerender/([a-f0-9]{32})(/cancel)?', path)
             if commit:
                 self.local_voice()
@@ -471,7 +495,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1; seen_pack = None
+        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -486,12 +510,16 @@ class Handler(SimpleHTTPRequestHandler):
                 manifest = self.server.render_packs.root / 'manifest.json'
                 pack_stamp = manifest.stat().st_mtime_ns if manifest.exists() else 0
                 if pack_stamp != seen_pack:
-                    self.event('prerender', dict(id=json.loads(manifest.read_text())['id'] if pack_stamp else None))
+                    pack = json.loads(manifest.read_text()) if pack_stamp else {}
+                    self.event('prerender', dict(id=pack.get('id'), gazeVersion=pack.get('gazeVersion'), revision=pack_stamp))
                     seen_pack = pack_stamp
                 with self.server.changed:
                     command = self.server.command.copy()
+                    gaze = self.server.gaze_value()
                 if command['sequence'] != seen_command:
                     self.event('command', command); seen_command = command['sequence']
+                if gaze['sequence'] != seen_gaze:
+                    self.event('gaze', gaze); seen_gaze = gaze['sequence']
                 self.wfile.write(b': alive\n\n'); self.wfile.flush()
                 with self.server.changed:
                     self.server.changed.wait(timeout=1)

@@ -33,6 +33,14 @@ class RenderPackCheck(unittest.TestCase):
             self.assertFalse((Path(directory) / 'manifest.json').exists())
             store.publish(identifier, manifest, validate_config)
             self.assertEqual(json.loads((Path(directory) / 'manifest.json').read_text()), manifest)
+            anchors = {c['id']: [[] for _ in range(c['count'])] for c in clips}
+            anchors['idle'] = [[[100, 100, 120, 140], [140, 100, 160, 140]]]
+            bad = copy.deepcopy(anchors); bad['idle'][0][0][0] = -1
+            with self.assertRaises(ValueError): store.add_gaze(identifier, bad)
+            store.add_gaze(identifier, anchors)
+            saved = json.loads((Path(directory) / 'manifest.json').read_text())
+            self.assertEqual(saved['clips'][0]['eyes'], anchors['idle'])
+            self.assertEqual(saved['gazeVersion'], 1)
             cancelled = store.begin(); store.cancel(cancelled)
             self.assertFalse((Path(directory) / cancelled).exists())
             self.assertTrue((Path(directory) / identifier / 'idle-0.webp').exists())
