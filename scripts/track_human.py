@@ -125,7 +125,7 @@ def decode(message, compressed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', default=os.environ.get('DOTS_URL', 'http://127.0.0.1:' + os.environ.get('PORT', '5173')))
-    parser.add_argument('--topic', default='/head_camera/color/image_raw/compressed')
+    parser.add_argument('--topic', help='Color topic; defaults to head_camera color, compressed unless --raw.')
     parser.add_argument('--raw', action='store_true', help='Subscribe to sensor_msgs/Image instead of CompressedImage.')
     parser.add_argument('--mirror', action='store_true', help='Reverse horizontal gaze for your camera mounting.')
     parser.add_argument('--threshold', type=float, default=.55, help='SFace cosine match threshold; validate on your robot (default: .55).')
@@ -134,6 +134,7 @@ def main():
     parser.add_argument('--duration', type=float, default=0, help='Stop after this many seconds; zero runs until Ctrl+C.')
     parser.add_argument('--stats', action='store_true', help='Print throughput and model call counts every five seconds.')
     args = parser.parse_args()
+    args.topic = args.topic or '/head_camera/color/image_raw' + ('' if args.raw else '/compressed')
     if urlparse(args.url).hostname not in ('localhost', '127.0.0.1', '::1'):
         parser.error('--url must be the robot service on this device (localhost).')
     if not math.isfinite(args.threshold) or not .363 <= args.threshold <= .95:
