@@ -23,6 +23,12 @@ from agents.mcp import MCPServerStdio
 from dotsctl import request
 from launch_robot import stop
 from voice_input import VoiceInput
+from voice_errors import RealtimeUnavailable
+from ros_wake import RosWake, WakeRequest
+from ros_status import RosStatus
+from robot_states import INPUT_STATES
+
+IDLE_SECONDS = 5.0
 
 
 @contextmanager
@@ -106,6 +112,7 @@ class Chatbot:
         self.history = []
         self.animated = False
         self.sleep_requested = False
+        self.status_managed = False
 
         @function_tool
         def end_conversation() -> str:
@@ -219,7 +226,8 @@ class Chatbot:
             raise ValueError('Enter between 1 and 12000 characters.')
         self.animated = False
         self.sleep_requested = False
-        self.show_state('thinking')
+        if not self.status_managed:
+            self.show_state('thinking')
         succeeded = False
         try:
             agent = self.agent.clone(tools=[], mcp_servers=[]) if motion_update else self.agent
@@ -228,7 +236,7 @@ class Chatbot:
             succeeded = True
             return spoken_reply(str(result.final_output))
         finally:
-            if not succeeded or not self.animated:
+            if not self.status_managed and (not succeeded or not self.animated):
                 self.show_state('idle')
 
 
@@ -268,7 +276,10 @@ def read_terminal(timeout=None, *, speech=None, url=None, notices=None, shutdown
             if not pending and timeout is not None:
                 deadline = time.monotonic() + timeout
         remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
-        if select.select([sys.stdin], [], [], .25 if pending or notices is not None else remaining)[0]:
+        poll = .25 if pending or notices is not None else remaining
+        if remaining is not None and poll is not None:
+            poll = min(poll, remaining)
+        if select.select([sys.stdin], [], [], poll)[0]:
             return input().strip()
         if not pending and notices is not None:
             try:
@@ -279,6 +290,25 @@ def read_terminal(timeout=None, *, speech=None, url=None, notices=None, shutdown
         if not pending:
             print()
             raise TimeoutError
+
+
+def closing_message(text, name='Kuro', *, agent_requested=False):
+    """Recognize complete farewells; further requests override the agent's sleep tool."""
+    normalized = re.sub(r"[^\w\s]", ' ', text.casefold())
+    normalized = ' '.join(normalized.split())
+    if name:
+        normalized = re.sub(r'\b' + re.escape(name.casefold()) + r'\b', '', normalized)
+        normalized = ' '.join(normalized.split())
+    closing = r'(?:goodbye|good bye|bye(?: bye)?|thank you|thankyou|thanks)'
+    courtesy = r'(?:so much|very much|a lot|again|for (?:your help|helping|that|everything|the (?:help|answer|information)|answering(?: my question)?)|for now|see you(?: later)?|have a (?:nice|good) day|that(?: s| is) all(?: for now)?)'
+    if re.fullmatch(r'(?:(?:okay|ok|alright|great) )?' + closing + r'(?: ' + courtesy + r')*(?: (?:and )?' + closing + r')*', normalized):
+        return True
+    # The agent can recognize natural courtesy wording or a transcribed name variant.
+    # A concrete question or command still prevents sleep, even if the tool was called.
+    if not agent_requested or not re.search(r'\b' + closing + r'\b', normalized):
+        return False
+    requests = r'\b(?:but|however|also|please|can|could|would|will|what|when|where|why|how|who|which|tell|show|explain|calculate|search|find|give|continue|start|stop|move|go|turn|open|close|play|repeat|set|change|check|need|want)\b'
+    return not re.search(requests, normalized)
 
 
 def wake_trigger(text, name):
@@ -359,9 +389,14 @@ async def main():
     parser.add_argument('--turtlesim', action='store_true', help='Connect the local ROS 2 turtlesim MCP server.')
     parser.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                         help='Start human eye tracking quietly (default); --no-track disables it.')
+    parser.add_argument('--robot-status', action=argparse.BooleanOptionalAction, default=True,
+                        help='Follow /robot/status and use /robot/set_status (default). Disable only for legacy local wake mode.')
+    parser.add_argument('--ros-wake', action=argparse.BooleanOptionalAction, default=True,
+                        help='Legacy mode only: expose /kuro/wake when --no-robot-status is selected.')
     parser.add_argument('--mode', choices=['words', 'voice'], default='words', help='Typed words (default) or ReSpeaker microphone input.')
-    parser.add_argument('--stt-model', choices=['gpt-live-transcribe', 'gpt-transcribe'], default='gpt-live-transcribe')
-    parser.add_argument('--language', help='Optional speech language hint, e.g. en, ms, zh.')
+    parser.add_argument('--stt-model', default='gpt-live-transcribe', choices=['gpt-live-transcribe'], help='Awake transcription through the OpenAI Realtime API.')
+    parser.add_argument('--wake-model', default='small', help='Local Whisper model/directory for the Hi {name} wake phrase.')
+    parser.add_argument('--language', default='en', help='Speech language code, or auto for language detection.')
     parser.add_argument('--mic-forward-deg', type=float, default=0, help='Native DOA of camera centre; this robot uses 0 degrees.')
     parser.add_argument('--mic-clockwise', action=argparse.BooleanOptionalAction, default=False,
                         help='Angles increase to camera right; default increases to camera left.')
@@ -395,50 +430,292 @@ async def main():
                                 'TURTLESIM_REQUIRE_ANNOUNCEMENT': '1'}},
                 client_session_timeout_seconds=15,
             ))
+        status = None
         try:
+            status = await stack.enter_async_context(RosStatus()) if args.robot_status else None
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
-                args.mic_forward_deg, args.mic_clockwise)) if args.mode == 'voice' else None
-            return await chat_loop(args, server, voice)
+                args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None)) if args.mode == 'voice' else None
+            if status:
+                return await status_chat_loop(args, status, server, voice)
+            wake = await stack.enter_async_context(RosWake()) if args.ros_wake else None
+            return await chat_loop(args, server, voice, wake)
         except (RuntimeError, OSError, ValueError) as error:
+            if status and status.current:
+                try:
+                    await status.set('ERROR', expected_revision=status.current.revision)
+                except (RuntimeError, OSError, TimeoutError):
+                    pass
             print(str(error), file=sys.stderr)
             return 1
 
 
-async def chat_loop(args, server=None, voice=None):
+async def status_chat_loop(args, status, server=None, voice=None):
+    """The global topic owns input permission; external changes interrupt a turn."""
+    bot = Chatbot(args.url, args.model)
+    bot.status_managed = True
+    if server:
+        bot.agent.mcp_servers = [server]
+    motions = queue.Queue()
+    shutdown = threading.Event()
+    operation = None
+    changed = asyncio.Event()
+    # The initial retained sample was already consumed by RosStatus.__aenter__.
+    while not status.events.empty():
+        status.events.get_nowait()
+
+    async def watch_status():
+        nonlocal operation
+        while True:
+            event = await status.events.get()
+            if event is None or event.source != status.source:
+                changed.set()
+                if operation and not operation.done():
+                    operation.cancel()
+
+    async def watch_voice():
+        while True:
+            target = await voice.activity.get()
+            current = status.current
+            if current and current.status in INPUT_STATES:
+                await status.set(target, expected_revision=current.revision)
+
+    async def set_state(target):
+        current = status.current
+        if current is None or changed.is_set():
+            raise asyncio.CancelledError
+        if not await status.set(target, expected_revision=current.revision):
+            changed.set()
+            raise asyncio.CancelledError
+        if changed.is_set():
+            raise asyncio.CancelledError
+
+    async def microphone_action(action):
+        # Finish capture/mode handshakes even if another ROS node interrupts.
+        task = asyncio.create_task(action)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def gate(paused):
+        await microphone_action(voice.hold(paused))
+
+    async def wait_display(revision):
+        # ROS subscribers can receive a change in either order. Wait for the web
+        # subscriber before attaching audio to that exact SPEAKING revision.
+        async with asyncio.timeout(5):
+            while True:
+                value = await asyncio.to_thread(request, args.url, 'status')
+                state = value.get('robotStatus') or {}
+                if state.get('revision') == revision:
+                    return
+                if state.get('revision', 0) > revision:
+                    changed.set()
+                    raise asyncio.CancelledError
+                await asyncio.sleep(.02)
+
+    async def terminal_read(timeout):
+        stopped = threading.Event()
+        try:
+            return await asyncio.to_thread(read_terminal, timeout, notices=motions, shutdown=stopped)
+        finally:
+            stopped.set()
+
+    async def turn(text, motion_update=False):
+        if voice:
+            await gate(True)
+        await set_state('THINKING')
+        answer = await bot.reply(text, motion_update=motion_update)
+        closing = not motion_update and closing_message(text, robot_name(args.url),
+                                                        agent_requested=bot.sleep_requested is True)
+        print('robot> ' + answer, flush=True)
+        speech = None
+        if args.speak:
+            await set_state('SPEAKING')
+            await wait_display(status.current.revision)
+            speech = await asyncio.to_thread(request, args.url, 'say', dict(text=spoken_reply(answer), stream=True, statusRevision=status.current.revision))
+        if server and not motion_update:
+            await start_after_announcement(server, speech, args.url, args.speak)
+        if args.speak and speech and not await wait_for_speech(speech, args.url):
+            raise RuntimeError('Speech playback failed or was interrupted.')
+        await set_state('SLEEPING' if closing else 'IDLE')
+
+    async def run_turn(text, motion_update):
+        try:
+            await turn(text, motion_update)
+        except TimeoutError as error:
+            raise RuntimeError('Robot reply, status update or playback timed out.') from error
+
+    watcher = asyncio.create_task(watch_status())
+    voice_watcher = asyncio.create_task(watch_voice()) if voice else None
+    motion_watcher = asyncio.create_task(watch_motion(server, motions)) if server else None
+    print('Robot chatbot · follows /robot/status. IDLE monitors voice; LISTENING accepts commands; SLEEPING waits for Hi Kuro. /quit exits.', flush=True)
+    try:
+        while True:
+            changed.clear()
+            current = status.current
+            if current is None:
+                raise RuntimeError('ROS status connection lost; voice input stopped.')
+            accepting = current.status in INPUT_STATES
+            try:
+                if voice:
+                    operation = asyncio.create_task(microphone_action(voice.follow_status(current.status)))
+                    await operation
+                if not accepting:
+                    # Voice.read keeps /quit usable even while microphone capture is paused.
+                    operation = asyncio.create_task(voice.read(None) if voice else terminal_read(None))
+                elif voice:
+                    operation = asyncio.create_task(voice.read(IDLE_SECONDS, notices=motions))
+                else:
+                    operation = asyncio.create_task(terminal_read(IDLE_SECONDS))
+                text = await operation
+                operation = None
+                if text == '/quit':
+                    break
+                if text == '/reset':
+                    bot.history.clear()
+                    print('Conversation cleared.')
+                    continue
+                if not text or changed.is_set():
+                    continue
+                if current.status == 'SLEEPING':
+                    if not isinstance(text, str) or not wake_trigger(text, robot_name(args.url)):
+                        continue
+                    operation = asyncio.create_task(set_state('IDLE'))
+                    await operation
+                    print('Wake phrase detected; Kuro is awake.', flush=True)
+                    if voice:
+                        operation = asyncio.create_task(microphone_action(voice.follow_status('IDLE')))
+                        await operation
+                elif not accepting:
+                    continue
+                motion_update = isinstance(text, dict)
+                if motion_update:
+                    text = ('Runtime motion event (not a new user command): ' + json.dumps(text) +
+                            '. Tell the user naturally that movement finished or failed. Do not start another motion or call tools.')
+                operation = asyncio.create_task(run_turn(text, motion_update))
+                await operation
+            except asyncio.CancelledError:
+                if not changed.is_set():
+                    raise
+                # Do not publish an old turn's result after another node takes control.
+                continue
+            except TimeoutError:
+                if not changed.is_set():
+                    operation = asyncio.create_task(set_state('SLEEPING'))
+                    try:
+                        await operation
+                        print('Kuro is sleeping after 5 seconds of inactivity. Set IDLE to resume.', flush=True)
+                    except asyncio.CancelledError:
+                        if not changed.is_set():
+                            raise
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as error:
+                print('Robot error: ' + str(error), file=sys.stderr)
+                if status.current and not changed.is_set():
+                    await status.set('ERROR', expected_revision=status.current.revision)
+                if voice:
+                    await gate(True)
+            finally:
+                operation = None
+    finally:
+        shutdown.set()
+        if voice:
+            try:
+                await gate(True)
+            except (RuntimeError, OSError):
+                pass  # A failed/disconnected child already has input closed.
+        tasks = [task for task in (watcher, voice_watcher, motion_watcher) if task]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return 0
+
+
+async def chat_loop(args, server=None, voice=None, wake=None):
     bot = Chatbot(args.url, args.model)
     if server:
         bot.agent.mcp_servers = [server]
-    notices = queue.Queue() if server else None
+    notices = wake.requests if wake else queue.Queue() if server else None
     shutdown = threading.Event()
     watcher = asyncio.create_task(watch_motion(server, notices)) if server else None
-    awake = bool(voice)
+    awake = False
     conversation_closed = False
     speech_command = None
-    bot.show_state('listening' if voice else 'sleeping')
-    if not voice:
-        print(f'Robot chatbot · asleep. Say "Hi {robot_name(args.url)}" to wake. /reset clears history; /quit exits.')
+    bot.show_state('sleeping')
+    print(f'Robot chatbot · asleep. Say "Hi {robot_name(args.url)}" to wake. /reset clears history; /quit exits.')
+    async def finish_turn(sleep):
+        nonlocal awake, conversation_closed, speech_command
+        if sleep:
+            conversation_closed = True
+            if args.speak and not voice:
+                await wait_for_speech(speech_command, args.url)
+            awake = False; speech_command = None
+            bot.show_state('sleeping')
+            if voice:
+                await voice.set_awake(False)
+        if voice:
+            await voice.hold(False)
+            if awake:
+                bot.show_state('listening')
+
+    async def wake_up():
+        nonlocal awake, conversation_closed
+        if not awake:
+            if voice:
+                await voice.hold(True)
+                await voice.set_awake(True)
+            awake = True
+            conversation_closed = False
+            bot.show_state('listening')
+
     try:
         while True:
             try:
                 if voice:
-                    text = await voice.read(30 if awake else None, notices=notices)
-                elif server:
-                    text = await asyncio.to_thread(read_terminal, 30 if awake else None,
+                    text = await voice.read(IDLE_SECONDS if awake else None, notices=notices)
+                elif server or wake:
+                    text = await asyncio.to_thread(read_terminal, IDLE_SECONDS if awake else None,
                                                    speech=speech_command, url=args.url, notices=notices, shutdown=shutdown)
                 else:
-                    text = read_terminal(30 if awake else None, speech=speech_command, url=args.url)
+                    text = read_terminal(IDLE_SECONDS if awake else None, speech=speech_command, url=args.url)
                 speech_command = None
+            except RealtimeUnavailable as error:
+                print(str(error), file=sys.stderr)
+                await finish_turn(True)
+                print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
+                continue
             except TimeoutError:
-                awake = False
                 speech_command = None
-                bot.show_state('sleeping')
+                await finish_turn(True)
+                print('Kuro is asleep after 5 seconds of inactivity.', flush=True)
                 continue
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
+            if isinstance(text, WakeRequest):
+                if time.monotonic() >= text.expires:
+                    await wake.complete(text, False, 'Wake request expired.')
+                    continue
+                try:
+                    await wake_up()
+                    if voice:
+                        await voice.hold(False)
+                except RealtimeUnavailable as error:
+                    await finish_turn(True)
+                    await wake.complete(text, False, str(error))
+                    continue
+                except Exception:
+                    await wake.complete(text, False, 'Chatbot could not wake; check its terminal and microphone log.')
+                    raise
+                await wake.complete(text, True, 'Kuro is awake and listening.')
+                continue
             motion_update = isinstance(text, dict)
             if motion_update:
-                awake = not conversation_closed
+                if not awake:
+                    continue
                 status = text
                 text = ('Runtime motion event (not a new user command): ' + json.dumps(status) +
                         '. Tell the user naturally that the movement finished or failed. '
@@ -451,30 +728,37 @@ async def chat_loop(args, server=None, voice=None):
                 continue
             if not text:
                 continue
+            woke = False
             if not awake and not motion_update:
-                if not voice and not wake_trigger(text, robot_name(args.url)):
+                if not wake_trigger(text, robot_name(args.url)):
                     continue
-                awake = True
-                conversation_closed = False
-                bot.show_state('listening')
-            if voice:
+                try:
+                    await wake_up()
+                except RealtimeUnavailable as error:
+                    print(str(error), file=sys.stderr)
+                    await finish_turn(True)
+                    print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
+                    continue
+                woke = True
+            if voice and not woke:
                 await voice.hold(True)  # Confirm microphone pause before inference or spoken playback.
+            closing_turn = not motion_update and closing_message(text, robot_name(args.url))
             try:
                 answer = await bot.reply(text, motion_update=motion_update)
             except ValueError as error:
                 print(str(error), file=sys.stderr)
                 if server:
                     await start_after_announcement(server, None, args.url)
-                if voice:
-                    await voice.hold(False)
+                await finish_turn(closing_turn)
                 continue
             except Exception:
                 print('Chat request failed. Check your API key, model access, billing, and network; then retry.', file=sys.stderr)
                 if server:
                     await start_after_announcement(server, None, args.url)
-                if voice:
-                    await voice.hold(False)
+                await finish_turn(closing_turn)
                 continue
+            closing_turn = closing_turn or (not motion_update and closing_message(
+                text, robot_name(args.url), agent_requested=bot.sleep_requested is True))
             print('robot> ' + answer)
             if args.speak:
                 try:
@@ -489,17 +773,7 @@ async def chat_loop(args, server=None, voice=None):
                     # Cancelling the command also cancels browser audio before reopening input.
                     await asyncio.to_thread(request, args.url, 'command', dict(state='idle'))
                 speech_command = None
-            if bot.sleep_requested is True or (motion_update and conversation_closed):
-                conversation_closed = True
-                if args.speak and not voice:
-                    await wait_for_speech(speech_command, args.url)
-                awake = False
-                speech_command = None
-                bot.show_state('sleeping')
-            if voice:
-                await voice.hold(False)
-                if awake:
-                    bot.show_state('listening')
+            await finish_turn(closing_turn or (motion_update and conversation_closed))
     finally:
         shutdown.set()
         if watcher:

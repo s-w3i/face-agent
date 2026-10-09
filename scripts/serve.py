@@ -15,6 +15,7 @@ import uuid
 import wave
 from urllib.parse import urlparse
 from prerender import RenderPacks
+from robot_states import ANIMATIONS, INPUT_STATES, normalize_status
 try:
     from websockets.sync.client import connect
     from websockets.exceptions import InvalidStatus, WebSocketException
@@ -134,13 +135,15 @@ class RobotServer(ThreadingHTTPServer):
         self.audio = None
         self.changed = threading.Condition()
         self.generation = uuid.uuid4().hex
-        self.command = dict(generation=self.generation, sequence=0, state='idle', level=None)
+        self.command = dict(generation=self.generation, sequence=0, state='sleeping', level=None)
+        self.robot_status = None
         self.wake_session = 0
         self.actions = []; self.ack = None; self.displays = 0
         self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
         self.input_mode = 'words'
         self.mic_forward = 0.; self.mic_clockwise = False
         self.speech_hint = None; self.speech_hint_at = 0
+        self.listening_text = dict(generation=self.generation, sequence=0, text='', final=False, utterance=0)
         super().__init__(address, Handler)
 
     def config(self):
@@ -170,8 +173,25 @@ class RobotServer(ThreadingHTTPServer):
             self.speech_hint = None
             self.gaze = dict(sequence=self.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
             self.gaze_at = time.monotonic()
+        if state in ('thinking', 'speaking', 'sleeping', 'error', 'working', 'searching'):
+            self.listening_text = dict(generation=self.generation, sequence=self.listening_text['sequence'] + 1,
+                                       text='', final=False, utterance=0)
         self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
                             state=state, **fields)
+
+    def apply_robot_status(self, value):
+        status = normalize_status(value['status'])
+        with self.changed:
+            previous = self.robot_status
+            if previous and value['revision'] and value['revision'] <= previous['revision']:
+                return
+            self.robot_status = dict(value, status=status)
+            animation = ANIMATIONS[status]
+            # A delayed SPEAKING notification must not cancel the actual audio command.
+            if self.command['state'] != animation or (self.command.get('speech') and self.command.get('statusRevision') != value['revision']):
+                self.change_command(animation, level=None)
+                self.ack = None
+            self.changed.notify_all()
 
     def api_key(self):
         key = os.environ.get('OPENAI_API_KEY', '').strip()
@@ -398,12 +418,12 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/status':
                 with self.server.changed:
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
-                                    displays=self.server.displays, command=self.server.command,
+                                    displays=self.server.displays, command=self.server.command, robotStatus=self.server.robot_status,
                                     acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value(),
                                     trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping',
                                     inputMode=self.server.input_mode, micForwardDeg=self.server.mic_forward,
                                     micClockwise=self.server.mic_clockwise, speechHint=self.server.speech_hint_value(),
-                                    speechPending=self.server.speech_pending()))
+                                    speechPending=self.server.speech_pending(), listeningText=self.server.listening_text))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -442,9 +462,26 @@ class Handler(SimpleHTTPRequestHandler):
                     self.server.input_mode = value['mode']
                     self.server.mic_forward = forward; self.server.mic_clockwise = clockwise
                     self.server.wake_session += 1; self.server.speech_hint = None
+                    self.server.listening_text = dict(generation=self.server.generation,
+                        sequence=self.server.listening_text['sequence'] + 1, text='', final=False, utterance=0)
                     self.server.gaze = dict(sequence=self.server.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
                     self.server.gaze_at = time.monotonic()
                     self.server.changed.notify_all(); self.reply(dict(mode=self.server.input_mode))
+                return
+            if path == '/api/listening-text':
+                self.local_voice()
+                if (not isinstance(value, dict) or set(value) != {'session', 'text', 'final', 'utterance'}
+                        or not isinstance(value['session'], str) or not isinstance(value['text'], str)
+                        or len(value['text']) > 12000 or type(value['final']) is not bool
+                        or type(value['utterance']) is not int or value['utterance'] < 0):
+                    raise ValueError('Supply a session, transcript text, final boolean and utterance number.')
+                with self.server.changed:
+                    if self.server.input_mode != 'voice' or value['session'] != self.server.tracking_session() or self.server.command['state'] in ('thinking', 'speaking', 'error', 'sleeping', 'working', 'searching') or (self.server.robot_status and self.server.robot_status['status'] not in INPUT_STATES) or self.server.speech_pending():
+                        self.reply(dict(error='Transcript is inactive or belongs to an old session.'), 409); return
+                    self.server.listening_text = dict(generation=self.server.generation,
+                        sequence=self.server.listening_text['sequence'] + 1,
+                        text=value['text'], final=value['final'], utterance=value['utterance'])
+                    self.server.changed.notify_all(); self.reply(dict(received=True))
                 return
             if path == '/api/speaker':
                 self.local_voice()
@@ -498,6 +535,9 @@ class Handler(SimpleHTTPRequestHandler):
                 if isinstance(value, dict) and 'text' not in value:
                     value = dict(value, text=f"Hi, I am {self.server.config()['appearance']['name']}.")
                 with self.server.changed:
+                    expected_status = value.get('statusRevision') if isinstance(value, dict) else None
+                    if expected_status is not None and (not self.server.robot_status or self.server.robot_status['revision'] != expected_status or self.server.robot_status['status'] != 'SPEAKING'):
+                        self.reply(dict(error='Speech cancelled by a newer robot status.'), 409); return
                     previous_sequence = self.server.command['sequence']
                 streaming = path == '/api/say' and isinstance(value, dict) and value.get('stream') is True
                 events = self.server.speech_events(value) if streaming else None
@@ -505,12 +545,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if path == '/api/speech':
                     self.audio_reply(audio); return
                 with self.server.changed:
-                    if self.server.command['sequence'] != previous_sequence:
+                    if self.server.command['sequence'] != previous_sequence or (expected_status is not None and self.server.robot_status['revision'] != expected_status):
                         if events: events.close()
                         self.reply(dict(error='Speech cancelled by a newer animation command.'), 409); return
                     identifier = uuid.uuid4().hex
                     self.server.audio = (identifier, audio)
-                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip())
+                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip(), statusRevision=expected_status)
                     self.server.ack = None; self.server.changed.notify_all()
                     if streaming:
                         threading.Thread(target=self.server.finish_clip, args=(audio, events, self.server.command['sequence']), daemon=True).start()
@@ -557,7 +597,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1
+        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -578,10 +618,13 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     command = self.server.command.copy()
                     gaze = self.server.gaze_value()
+                    transcript = self.server.listening_text.copy()
                 if command['sequence'] != seen_command:
                     self.event('command', command); seen_command = command['sequence']
                 if gaze['sequence'] != seen_gaze:
                     self.event('gaze', gaze); seen_gaze = gaze['sequence']
+                if transcript['sequence'] != seen_text:
+                    self.event('listening-text', transcript); seen_text = transcript['sequence']
                 self.wfile.write(b': alive\n\n'); self.wfile.flush()
                 with self.server.changed:
                     self.server.changed.wait(timeout=1)
@@ -600,9 +643,13 @@ if __name__ == '__main__':
     print(f'Dots studio: http://{server.server_address[0]}:{server.server_port}/original-dots.html', flush=True)
     print(f'Robot display: http://{server.server_address[0]}:{server.server_port}/robot.html', flush=True)
     print(f'Configuration: {server.config_file}', flush=True)
+    from ros_status import DisplayStatus
+    status_bridge = DisplayStatus(server) if os.environ.get('DOTS_ROBOT_STATUS', '1') != '0' and (Path('/opt/ros') / os.environ.get('ROS_DISTRO', 'jazzy') / 'setup.bash').exists() else None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if status_bridge:
+            status_bridge.close()
         server.server_close()

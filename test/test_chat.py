@@ -16,7 +16,9 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from chat import Chatbot, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement, start_tracking
+from chat import Chatbot, chat_loop, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement, start_tracking, closing_message
+from ros_wake import WakeRequest
+from voice_errors import RealtimeUnavailable
 from agents import WebSearchTool
 from agents.tool_context import ToolContext
 
@@ -26,6 +28,16 @@ class ChatCheck(unittest.TestCase):
         tracking = patch('chat.start_tracking')
         self.tracking = tracking.start()
         self.addCleanup(tracking.stop)
+        status = patch('chat.RosStatus')
+        status_factory = status.start()
+        status_factory.return_value.__aenter__ = AsyncMock(return_value=None)
+        status_factory.return_value.__aexit__ = AsyncMock()
+        self.addCleanup(status.stop)
+        ros_wake = patch('chat.RosWake')
+        factory = ros_wake.start()
+        factory.return_value.__aenter__ = AsyncMock(return_value=None)
+        factory.return_value.__aexit__ = AsyncMock()
+        self.addCleanup(ros_wake.stop)
 
     def test_tracking_starts_for_selected_service_and_can_be_disabled(self):
         for flags in ([], ['--no-track']):
@@ -38,33 +50,77 @@ class ChatCheck(unittest.TestCase):
                 self.tracking.assert_called_once_with('http://127.0.0.1:5174')
                 self.tracking.return_value.__exit__.assert_called_once()
 
-    def test_voice_uses_same_agent_without_wake_word_and_pauses_until_playback_ends(self):
+    def test_voice_local_wake_realtime_commands_and_closing_policy(self):
         async def check():
             events = []
             voice = Mock()
-            voice.read = AsyncMock(side_effect=['What is your name?', '/quit'])
+            voice.read = AsyncMock(side_effect=['Ignored', 'Hi Kuro', 'Thank you, tell me the time', TimeoutError(), 'Ignored asleep', 'Hi Kuro', 'Another question', 'Goodbye Kuro', 'Ignored again', '/quit'])
             voice.hold = AsyncMock(side_effect=lambda held: events.append('pause' if held else 'resume'))
-            bot = Mock(sleep_requested=False)
-            bot.reply = AsyncMock(side_effect=lambda *args, **kwargs: events.append('infer') or 'I am Shiro.')
+            voice.set_awake = AsyncMock(side_effect=lambda awake: events.append('realtime' if awake else 'local'))
+            bot = Mock(sleep_requested=True)
+            bot.reply = AsyncMock(side_effect=lambda *args, **kwargs: events.append('infer') or 'Hello.')
             async def ended(*args):
                 events.append('playback ended'); return True
-            def api(*args):
-                events.append('say'); return dict(generation='session', sequence=1, displays=1)
             with patch('sys.argv', ['chat.py', '--mode', 'voice']), patch('chat.load_key'), \
-                    patch('chat.VoiceInput') as factory, patch('chat.Chatbot', return_value=bot), \
-                    patch('chat.request', side_effect=api), patch('chat.wait_for_speech', side_effect=ended):
+                    patch('chat.robot_name', return_value='Kuro'), patch('chat.VoiceInput') as factory, \
+                    patch('chat.Chatbot', return_value=bot), patch('chat.request', return_value=dict(generation='session', sequence=1, displays=1)), \
+                    patch('chat.wait_for_speech', side_effect=ended):
                 factory.return_value.__aenter__ = AsyncMock(return_value=voice)
                 factory.return_value.__aexit__ = AsyncMock()
                 self.assertEqual(await main(), 0)
-                bot.reply.assert_awaited_once_with('What is your name?', motion_update=False)
-                self.assertEqual(events, ['pause', 'infer', 'say', 'playback ended', 'resume'])
-                self.assertEqual(bot.show_state.call_args_list[0].args, ('listening',))
+                self.assertEqual([call.args[0] for call in bot.reply.call_args_list], ['Hi Kuro', 'Thank you, tell me the time', 'Hi Kuro', 'Another question', 'Goodbye Kuro'])
+                self.assertEqual([call.args[0] for call in voice.set_awake.call_args_list], [True, False, True, False])
+                self.assertEqual(events[:5], ['pause', 'realtime', 'infer', 'playback ended', 'resume'])
+                self.assertEqual(events[-5:], ['pause', 'infer', 'playback ended', 'local', 'resume'])
+                self.assertEqual(bot.show_state.call_args_list[0].args, ('sleeping',))
+                self.assertEqual([call.args[0] for call in voice.read.call_args_list], [None, None, 5, 5, None, None, 5, 5, None, None])
+        asyncio.run(check())
+
+    def test_agent_closing_intent_handles_transcribed_names_and_courtesy(self):
+        for text in ('Thank you Curo.', 'Goodbye Koro.', 'Thank you, Shiro.', 'That was helpful, thank you Kuro.'):
+            self.assertTrue(closing_message(text, agent_requested=True), text)
+        for text in ('Goodbye Kuro, move forward', 'Thank you Kuro. Can you tell me the time?', 'What does goodbye mean?', 'Thank you Kuro, I need another answer'):
+            self.assertFalse(closing_message(text, agent_requested=True), text)
+        self.assertFalse(closing_message('A new request', agent_requested=True))
+
+    def test_named_farewells_sleep_even_when_agent_reply_fails(self):
+        async def check(failure):
+            voice = Mock(read=AsyncMock(side_effect=['Hi Kuro', 'goodbye kuro', 'ignored', 'Hi Kuro', 'thankyou kuro', 'ignored', '/quit']),
+                         hold=AsyncMock(), set_awake=AsyncMock())
+            bot = Mock(sleep_requested=False, reply=AsyncMock(side_effect=['Hi!', failure, 'Hi!', failure]))
+            with patch('sys.argv', ['chat.py', '--mode', 'voice', '--no-speak']), patch('chat.load_key'), \
+                    patch('chat.robot_name', return_value='Kuro'), patch('chat.VoiceInput') as factory, \
+                    patch('chat.Chatbot', return_value=bot), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                factory.return_value.__aenter__ = AsyncMock(return_value=voice)
+                factory.return_value.__aexit__ = AsyncMock()
+                self.assertEqual(await main(), 0)
+            self.assertEqual([call.args[0] for call in bot.reply.call_args_list], ['Hi Kuro', 'goodbye kuro', 'Hi Kuro', 'thankyou kuro'])
+            self.assertEqual([call.args[0] for call in voice.set_awake.call_args_list], [True, False, True, False])
+            self.assertEqual([call.args[0] for call in bot.show_state.call_args_list].count('sleeping'), 3)
+        for failure in ('Goodbye!', ValueError('Reply unavailable'), RuntimeError('Network unavailable')):
+            with self.subTest(failure=type(failure).__name__):
+                asyncio.run(check(failure))
+
+    def test_realtime_startup_and_mid_conversation_failures_return_to_local_sleep(self):
+        async def check():
+            voice = Mock(read=AsyncMock(side_effect=['Hi Kuro', 'ignored', 'Hi Kuro', RealtimeUnavailable('Connection lost'), 'ignored', 'Hi Kuro', 'Goodbye Kuro', '/quit']),
+                         hold=AsyncMock(), set_awake=AsyncMock(side_effect=[RealtimeUnavailable('Connection timed out'), None, None, None, None, None]))
+            bot = Mock(sleep_requested=False, reply=AsyncMock(return_value='Hi!'))
+            with patch('sys.argv', ['chat.py', '--mode', 'voice', '--no-speak']), patch('chat.load_key'), \
+                    patch('chat.robot_name', return_value='Kuro'), patch('chat.VoiceInput') as factory, \
+                    patch('chat.Chatbot', return_value=bot), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                factory.return_value.__aenter__ = AsyncMock(return_value=voice)
+                factory.return_value.__aexit__ = AsyncMock()
+                self.assertEqual(await main(), 0)
+            self.assertEqual([call.args[0] for call in voice.set_awake.call_args_list], [True,False,True,False,True,False])
+            self.assertEqual([call.args[0] for call in bot.reply.call_args_list], ['Hi Kuro', 'Hi Kuro', 'Goodbye Kuro'])
+            self.assertEqual([call.args[0] for call in bot.show_state.call_args_list].count('sleeping'), 4)
         asyncio.run(check())
 
     def test_voice_cancels_unconfirmed_playback_before_resuming_input(self):
         async def check():
             events = []
-            voice = Mock(read=AsyncMock(side_effect=['Hello', '/quit']),
+            voice = Mock(read=AsyncMock(side_effect=['Hi Kuro', '/quit']), set_awake=AsyncMock(),
                          hold=AsyncMock(side_effect=lambda held: events.append('pause' if held else 'resume')))
             bot = Mock(sleep_requested=False, reply=AsyncMock(return_value='Hi'))
             def api(url, path, value):
@@ -72,7 +128,7 @@ class ChatCheck(unittest.TestCase):
                 return dict(generation='session', sequence=1, displays=1)
             with patch('sys.argv', ['chat.py', '--mode', 'voice']), patch('chat.load_key'), \
                     patch('chat.VoiceInput') as factory, patch('chat.Chatbot', return_value=bot), \
-                    patch('chat.request', side_effect=api), patch('chat.wait_for_speech', AsyncMock(return_value=False)):
+                    patch('chat.request', side_effect=api), patch('chat.robot_name', return_value='Kuro'), patch('chat.wait_for_speech', AsyncMock(return_value=False)):
                 factory.return_value.__aenter__ = AsyncMock(return_value=voice)
                 factory.return_value.__aexit__ = AsyncMock()
                 self.assertEqual(await main(), 0)
@@ -153,18 +209,40 @@ class ChatCheck(unittest.TestCase):
         with patch('chat.request', return_value=statuses[0]), patch('chat.select.select', return_value=([sys.stdin], [], [])), patch('builtins.input', return_value='new question'):
             self.assertEqual(read_terminal(30, speech=speech, url='http://localhost:5173'), 'new question')
 
-    def test_sleep_wake_timeout_and_renamed_trigger(self):
-        self.assertTrue(wake_trigger('Hi, Shiro! What time is it?', 'Shiro'))
-        self.assertTrue(wake_trigger('hi SHIRO', 'Shiro'))
-        self.assertFalse(wake_trigger('Hi Shiroko', 'Shiro'))
-        self.assertFalse(wake_trigger('What time is it?', 'Shiro'))
-        inputs = ['ignored', 'Hi Shiro', 'question', TimeoutError(), 'ignored again', 'Hi Mimo', '/quit']
-        with patch('sys.argv', ['chat.py', '--no-speak']), patch('chat.load_key'), patch('chat.robot_name', side_effect=['Shiro', 'Shiro', 'Shiro', 'Mimo', 'Mimo']), patch('chat.read_terminal', side_effect=inputs) as terminal, patch('chat.Chatbot') as bot:
+    def test_sleep_wake_three_second_inactivity_and_closing_message(self):
+        self.assertTrue(wake_trigger('Hi, Kuro! What time is it?', 'Kuro'))
+        self.assertTrue(wake_trigger('hi KURO', 'Kuro'))
+        self.assertFalse(wake_trigger('Hi Kuroko', 'Kuro'))
+        for text in ('Thank you!', 'goodbye Kuro', 'Thanks for your help', 'Thankyou', 'Bye bye', 'Goodbye and thank you', 'Thank you, that’s all for now', 'Thank you for answering my question'):
+            self.assertTrue(closing_message(text), text)
+        for text in ('Thank you, now tell me the time', 'Goodbye, but first move forward', 'What does goodbye mean?', 'thanks for the weather; what about tomorrow?'):
+            self.assertFalse(closing_message(text), text)
+            self.assertFalse(closing_message(text, agent_requested=True), text)
+        inputs = ['ignored', 'Hi Kuro', 'question', TimeoutError(), 'ignored asleep', 'Hi Kuro', 'Goodbye', 'ignored again', 'Hi Kuro', '/quit']
+        with patch('sys.argv', ['chat.py', '--no-speak']), patch('chat.load_key'), patch('chat.robot_name', return_value='Kuro'), patch('chat.read_terminal', side_effect=inputs) as terminal, patch('chat.Chatbot') as bot:
             bot.return_value.reply = AsyncMock(return_value='Hello')
             self.assertEqual(asyncio.run(main()), 0)
-            self.assertEqual([call.args[0] for call in bot.return_value.reply.call_args_list], ['Hi Shiro', 'question', 'Hi Mimo'])
-            self.assertEqual([call.args[0] for call in bot.return_value.show_state.call_args_list], ['sleeping', 'listening', 'sleeping', 'listening'])
-            self.assertEqual([call.args[0] for call in terminal.call_args_list], [None, None, 30, 30, None, None, 30])
+            self.assertEqual([call.args[0] for call in bot.return_value.reply.call_args_list], ['Hi Kuro', 'question', 'Hi Kuro', 'Goodbye', 'Hi Kuro'])
+            self.assertEqual([call.args[0] for call in bot.return_value.show_state.call_args_list], ['sleeping', 'listening', 'sleeping', 'listening', 'sleeping', 'listening'])
+            self.assertEqual([call.args[0] for call in terminal.call_args_list], [None, None, 5, 5, None, None, 5, None, None, 5])
+
+    def test_service_wake_without_greeting_and_failure_acknowledgment(self):
+        async def check(failure):
+            first = WakeRequest(1, time.monotonic() + 120)
+            again = WakeRequest(2, time.monotonic() + 120)
+            voice = Mock(read=AsyncMock(side_effect=[first, again, 'What time is it?', TimeoutError(), 'ignored asleep', '/quit']),
+                         hold=AsyncMock(), set_awake=AsyncMock(side_effect=[failure, None, None, None] if failure else None))
+            wake = SimpleNamespace(requests=queue.Queue(), complete=AsyncMock())
+            bot = Mock(sleep_requested=False, reply=AsyncMock(return_value='It is noon.'))
+            with patch('chat.Chatbot', return_value=bot), patch('chat.robot_name', return_value='Kuro'):
+                await chat_loop(SimpleNamespace(url='http://localhost', model=None, speak=False), voice=voice, wake=wake)
+            self.assertEqual([call.args[1] for call in wake.complete.call_args_list], [not bool(failure), True])
+            self.assertEqual([call.args[0] for call in bot.reply.call_args_list], ['What time is it?'])
+            self.assertEqual([call.args[0] for call in voice.set_awake.call_args_list], [True, False, True, False] if failure else [True, False])
+            self.assertEqual(voice.read.call_args_list[-1].args[0], None)
+        for failure in (None, RealtimeUnavailable('Network unavailable')):
+            with self.subTest(failure=failure):
+                asyncio.run(check(failure))
 
     def test_location_lookup_and_failures(self):
         with patch.dict(os.environ, {'DOTS_CITY': ''}):

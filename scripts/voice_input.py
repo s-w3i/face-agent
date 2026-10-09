@@ -10,6 +10,7 @@ import sys
 import time
 
 from dotsctl import request
+from voice_errors import RealtimeUnavailable
 
 
 class MicrophoneDisconnected(RuntimeError):
@@ -17,17 +18,22 @@ class MicrophoneDisconnected(RuntimeError):
 
 
 class VoiceInput:
-    def __init__(self, url, model='gpt-live-transcribe', language=None, forward=0, clockwise=False):
+    def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False):
         self.url = url; self.model = model; self.language = language
         self.forward = forward; self.clockwise = clockwise
+        self.wake_model = wake_model; self.awake = status_driven
+        self.status_driven = status_driven
+        self.activity = asyncio.Queue()
         self.process = self.log = None
         self.reader = self.guard = None
-        self.ready = None; self.failed = None; self.closing = False
+        self.ready = None; self.failed = None; self.closing = False; self.replacing = False
         self.inputs = asyncio.Queue(maxsize=8)
         self.controls = {}; self.sequence = 0; self.control_lock = asyncio.Lock()
         self.restart_lock = asyncio.Lock()
-        self.held = False; self.paused = True; self.accepting = False
+        self.held = status_driven; self.paused = True; self.accepting = False
         self.hint = None; self.partials = {}; self.terminal_open = True
+        self.utterance_active = False
+        self.turn_complete = False
 
     async def api(self, path, value=None):
         return await asyncio.to_thread(request, self.url, path, value, timeout=1)
@@ -36,16 +42,21 @@ class VoiceInput:
         log_path = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent/microphone-chat.log'
         try:
             await self.api('input-mode', dict(mode='voice', micForwardDeg=self.forward, micClockwise=self.clockwise))
+            if not self.status_driven:
+                await self.api('command', dict(state='sleeping'))
+            else:
+                global_status = (await self.api('status')).get('robotStatus') or {}
+                self.awake = global_status.get('status') != 'SLEEPING'
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log = log_path.open('a')
-            print('Voice mode · calibrating background; stay silent until ready.', flush=True)
+            print('Voice mode · connecting Realtime; waiting for ReSpeaker.' if self.awake else 'Voice mode · loading local Whisper; waiting for ReSpeaker.', flush=True)
             try:
                 await self.start_microphone()
             except MicrophoneDisconnected:
                 await self.ensure_microphone()
             await self.sync_playback()
             self.guard = asyncio.create_task(self.watch_playback())
-            print('Voice mode ready. Speak normally; /reset clears history and /quit exits.', flush=True)
+            print('Voice mode ready · follows /robot/status; sleeping wake detection stays local.' if self.status_driven else 'Voice mode ready · local wake detection. /reset clears history; /quit exits.', flush=True)
             return self
         except BaseException:
             await self.close()
@@ -58,8 +69,15 @@ class VoiceInput:
         root = Path(__file__).resolve().parents[1]
         self.ready = asyncio.get_running_loop().create_future()
         self.failed = None; self.paused = True; self.accepting = False; self.sequence = 0
+        self.utterance_active = False; self.turn_complete = False
         self.controls.clear()
-        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin', '--stt-model', self.model]
+        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin', '--stt-model', self.model if self.awake else self.wake_model]
+        if self.status_driven and self.awake:
+            command += ['--single-utterance']
+        if not self.awake:
+            config = await self.api('config')
+            name = config.get('appearance', {}).get('name', 'Kuro')
+            command += ['--stt-prompt', f'The robot is named {name}.']
         if self.language:
             command += ['--language', self.language]
         self.process = await asyncio.create_subprocess_exec(*command, cwd=root,
@@ -85,7 +103,7 @@ class VoiceInput:
                 return False
             if not isinstance(self.failed, MicrophoneDisconnected):
                 raise self.failed
-            print('Microphone USB connection lost. Reconnecting and recalibrating; stay silent.', file=sys.stderr, flush=True)
+            print('Microphone USB connection lost. Reconnecting ReSpeaker.', file=sys.stderr, flush=True)
             self.accepting = False; self.hint = None; self.partials.clear()
             while not self.inputs.empty():
                 self.inputs.get_nowait()
@@ -100,7 +118,7 @@ class VoiceInput:
                 if (await self.api('status'))['inputMode'] != 'voice':
                     raise ValueError('Another chat selected words mode during microphone recovery.')
                 await self.api('input-mode', dict(mode='voice', micForwardDeg=self.forward, micClockwise=self.clockwise))
-                print('Microphone reconnected and calibrated.', file=sys.stderr, flush=True)
+                print('Microphone reconnected.', file=sys.stderr, flush=True)
                 return True
             self.failed = RuntimeError('ReSpeaker is still unavailable after five retries. Check its USB cable or hub, then restart voice chat.')
             raise self.failed
@@ -119,37 +137,61 @@ class VoiceInput:
                 if status == 'microphone_control':
                     future = self.controls.pop(event['sequence'], None)
                     if future and not future.done():
+                        # Accept frames following the resume ACK in this same IPC
+                        # batch; waiting for control() to resume can lose the trigger.
+                        self.paused = event['paused']
+                        self.accepting = not self.paused and not self.held
                         future.set_result(event['paused'])
                 elif status == 'listening':
                     if not self.ready.done():
                         self.ready.set_result(None)
+                elif status == 'transcription_retry':
+                    print(f"Realtime connection attempt {event['attempt']}/{event['attempts']} failed ({event['reason']}); retrying.", file=sys.stderr, flush=True)
                 elif status == 'transcription_incomplete':
                     incomplete = RuntimeError('Microphone transcription failed; local audio remains in test-output/.')
                     self.accepting = False
                 elif status == 'microphone_error':
+                    if event.get('category') == 'realtime_unavailable':
+                        raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'))
                     if event.get('reconnectable') is True:
                         raise MicrophoneDisconnected('ReSpeaker USB connection lost.')
                     raise incomplete or RuntimeError('Microphone failed. Check ~/.cache/face-agent/microphone-chat.log.')
                 elif self.accepting:
                     if status == 'utterance_started':
+                        self.utterance_active = True
+                        if self.awake:
+                            self.activity.put_nowait('LISTENING')
+                        self.partials.clear()
+                        await self.publish_text('', utterance=event.get('utterance_id'))
                         self.direction(event.get('doa_deg'), event.get('utterance_id'))
-                    elif event.get('speech_candidate_track_id') is not None:
+                    elif status == 'speech_direction':
                         self.direction(event.get('native_doa_deg'), event.get('utterance_id'))
-                    elif status == 'transcript_partial' and sys.stdout.isatty():
+                    elif status == 'transcript_partial':
                         ident = event['item_id']
                         self.partials[ident] = self.partials.get(ident, '') + event['delta']
-                        print('\r\x1b[2Kyou> ' + self.partials[ident].strip(), end='', flush=True)
+                        await self.publish_text(self.partials[ident], utterance=event.get('utterance_id'))
+                        if self.awake and sys.stdout.isatty():
+                            print('\r\x1b[2Kyou> ' + self.partials[ident].strip(), end='', flush=True)
                     elif status == 'transcript_final':
+                        self.utterance_active = False
                         self.partials.pop(event['item_id'], None)
                         text = event['text'].strip()
-                        if text and len(text) <= 12000:
+                        if len(text) <= 12000 and (text or self.status_driven and self.awake):
+                            await self.publish_text(text, final=True, utterance=event.get('utterance_id'))
                             self.inputs.put_nowait(event)
-            if not self.closing:
+                        if event.get('paused_after'):
+                            self.turn_complete = True
+                            self.paused = True; self.accepting = False
+                    elif status == 'utterance_discarded':
+                        self.utterance_active = False
+                        if self.awake:
+                            self.activity.put_nowait('IDLE')
+            if not self.closing and not self.replacing:
                 raise incomplete or RuntimeError('Microphone stopped. Check ~/.cache/face-agent/microphone-chat.log.')
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.failed = error; self.accepting = False
+            self.failed = error; self.accepting = False; self.utterance_active = False
             if not self.ready.done():
                 self.ready.set_exception(error)
             for future in self.controls.values():
@@ -161,11 +203,13 @@ class VoiceInput:
             while True:
                 await self.ensure_microphone()
                 if not paused and self.paused:
-                    # Playback may have started while a replacement mic calibrated.
+                    # Playback may have started while a replacement mic loaded.
                     status = await self.api('status')
                     if status['inputMode'] != 'voice':
                         raise ValueError('Another chat selected words mode.')
-                    paused = self.held or status['speechPending']
+                    paused = self.held or status['speechPending'] or self.status_blocked(status)
+                if paused:
+                    self.utterance_active = False
                 if paused == self.paused:
                     self.accepting = not paused
                     return
@@ -202,16 +246,83 @@ class VoiceInput:
             while not self.inputs.empty():
                 self.inputs.get_nowait()
             self.partials.clear(); self.hint = None
+            self.utterance_active = False
+            await self.publish_text('')
         else:
             await self.sync_playback()
 
-    async def publish_hint(self, status):
-        if not self.hint or time.monotonic() - self.hint[1] > 1 or status['speechPending']:
+    async def set_awake(self, awake):
+        """Switch STT with capture closed; sleeping audio stays local."""
+        if self.awake == awake:
             return
-        if not status['awake']:
-            await self.api('command', dict(state='listening'))
+        guard = self.guard
+        if guard:
+            guard.cancel()
+            await asyncio.gather(guard, return_exceptions=True)
+        held = self.held
+        previous = self.awake
+        try:
+            if not isinstance(self.failed, RealtimeUnavailable):
+                await self.control(True)
+            self.accepting = False
+            if awake:
+                print('Connecting to Realtime transcription…', flush=True)
+            async with self.restart_lock:
+                self.held = True; self.replacing = True
+                await self.stop_microphone()
+                self.awake = awake
+                self.hint = None; self.partials.clear()
+                while not self.inputs.empty():
+                    self.inputs.get_nowait()
+                try:
+                    await self.start_microphone()
+                except RealtimeUnavailable:
+                    # Restore local wake detection if remote startup fails.
+                    await self.stop_microphone()
+                    self.awake = previous
+                    await self.start_microphone()
+                    raise
+            if awake:
+                print('Realtime transcription ready.', flush=True)
+            self.held = held
+            await self.sync_playback()
+        finally:
+            self.held = held; self.replacing = False
+            if guard:
+                self.guard = asyncio.create_task(self.watch_playback())
+
+    async def publish_text(self, text, final=False, utterance=0):
+        if not self.awake:
+            return  # Wake recognition is local and must never appear on the display.
+        try:
             status = await self.api('status')
+            await self.api('listening-text', dict(session=status['trackingSession'],
+                text=text[:12000], final=final, utterance=utterance or 0))
+        except (OSError, ValueError):
+            pass
+
+    async def publish_hint(self, status):
+        if not self.awake or not status['awake'] or not self.hint or time.monotonic() - self.hint[1] > 1 or status['speechPending']:
+            return
         await self.api('speaker', dict(session=status['trackingSession'], doaDeg=self.hint[0], utterance=self.hint[2]))
+
+    def status_blocked(self, status):
+        if not self.status_driven:
+            return False
+        global_status = status.get('robotStatus')
+        if not global_status or self.turn_complete:
+            return True
+        state = global_status['status']
+        return not (self.awake and state in ('IDLE', 'LISTENING') or not self.awake and state == 'SLEEPING')
+
+    async def follow_status(self, state):
+        """Choose local wake detection or command STT with capture closed."""
+        target = False if state == 'SLEEPING' else True if state in ('IDLE', 'LISTENING') else self.awake
+        if self.awake != target:
+            await self.hold(True)
+            await self.set_awake(target)
+        self.turn_complete = False
+        await self.hold(state not in ('IDLE', 'LISTENING', 'SLEEPING'))
 
     async def sync_playback(self):
         try:
@@ -220,7 +331,7 @@ class VoiceInput:
                 raise ValueError('Restart the updated robot service before using voice mode.')
             if status.get('inputMode') != 'voice':
                 raise ValueError('Another chat selected words mode; restart voice chat to use the microphone.')
-            await self.control(self.held or status['speechPending'])
+            await self.control(self.held or status['speechPending'] or self.status_blocked(status))
             if self.accepting:
                 await self.publish_hint(status)
         except (OSError, ValueError):
@@ -261,8 +372,8 @@ class VoiceInput:
                         self.terminal_open = False
                     elif line.strip() in ('/quit', '/reset'):
                         return line.strip()
-            if self.accepting:
-                if notices is not None:
+            if self.accepting or not self.inputs.empty():
+                if notices is not None and self.accepting:
                     try:
                         return notices.get_nowait()
                     except queue.Empty:
@@ -282,9 +393,12 @@ class VoiceInput:
                     if sys.stdout.isatty():
                         print('\r\x1b[2K', end='')
                     text = event['text'].strip()
-                    print('you> ' + text, flush=True)
+                    if self.awake:
+                        print('you> ' + text, flush=True)
                     return text
-            elif timeout is not None:
+            if timeout is not None and (not self.accepting or self.utterance_active):
+                # Recording, its two-second endpoint and ASR are all activity.
+                # Start counting idle time only once input is actually available.
                 deadline = time.monotonic() + timeout
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError

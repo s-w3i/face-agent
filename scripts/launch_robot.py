@@ -14,8 +14,17 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def browser_profile(browser):
+    if 'DOTS_BROWSER_PROFILE' in os.environ:
+        return os.environ['DOTS_BROWSER_PROFILE']
+    # Snap Chromium cannot write arbitrary hidden directories in the user's home.
+    if browser in ('/snap/bin/chromium', '/var/lib/snapd/snap/bin/chromium'):
+        return str(Path.home() / 'snap/chromium/common/face-agent-chromium')
+    return str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'face-agent-chromium')
+
+
 def stop(process):
-    if process is None:
+    if process is None or process.poll() is not None:
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -40,7 +49,7 @@ def main():
     with socket.socket() as probe:
         if probe.connect_ex((local_host, port)) == 0:
             raise SystemExit(f'Port {port} is already in use. Stop that instance or choose another PORT.')
-    profile = os.environ.get('DOTS_BROWSER_PROFILE', str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'face-agent-chromium'))
+    profile = browser_profile(browser)
     service = window = None
     def interrupted(signum, frame):
         raise KeyboardInterrupt
@@ -71,8 +80,10 @@ def main():
         print(str(error), file=sys.stderr)
         return 1
     finally:
-        stop(window)
-        stop(service)
+        try:
+            stop(window)
+        finally:
+            stop(service)
 
 
 if __name__ == '__main__':

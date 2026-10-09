@@ -12,10 +12,24 @@ import sysconfig
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from urllib.error import URLError
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class BrowserProfileCheck(unittest.TestCase):
+    def test_snap_profile_is_writable_and_explicit_override_is_preserved(self):
+        spec = importlib.util.spec_from_file_location('launch_robot', ROOT / 'scripts/launch_robot.py')
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        with patch.dict(os.environ, {'XDG_CONFIG_HOME': '/tmp/custom-config'}, clear=True):
+            for browser in ('/snap/bin/chromium', '/var/lib/snapd/snap/bin/chromium'):
+                self.assertEqual(launcher.browser_profile(browser), str(Path.home() / 'snap/chromium/common/face-agent-chromium'))
+            self.assertEqual(launcher.browser_profile('/usr/bin/chromium'), '/tmp/custom-config/face-agent-chromium')
+            os.environ['DOTS_BROWSER_PROFILE'] = '/tmp/robot profile'
+            self.assertEqual(launcher.browser_profile('/snap/bin/chromium'), '/tmp/robot profile')
 
 
 @unittest.skipUnless(shutil.which('git') and importlib.util.find_spec('websockets'), 'Install Git and requirements.txt to run this check.')
@@ -27,7 +41,7 @@ class LauncherCheck(unittest.TestCase):
                 shutil.copy2(ROOT / name, origin / name)
             shutil.copytree(ROOT / 'dist', origin / 'dist')
             (origin / 'scripts').mkdir()
-            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py', 'prerender.py'):
+            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py', 'prerender.py', 'robot_states.py', 'ros_status.py'):
                 shutil.copy2(ROOT / 'scripts' / name, origin / 'scripts' / name)
             subprocess.run(['git', 'init', '--quiet', str(origin)], check=True)
             subprocess.run(['git', '-C', str(origin), 'add', '.'], check=True)
@@ -45,7 +59,7 @@ class LauncherCheck(unittest.TestCase):
                 reservation.bind(('127.0.0.1', 0)); port = reservation.getsockname()[1]
             base = f'http://127.0.0.1:{port}'
             env = {**os.environ, 'PORT': str(port), 'HOST': '127.0.0.1', 'OPENAI_API_KEY': '',
-                   'XDG_CONFIG_HOME': str(root / 'private'), 'PATH': '/usr/bin:/bin', 'PIP_NO_INDEX': '1'}
+                   'XDG_CONFIG_HOME': str(root / 'private'), 'DOTS_ROBOT_STATUS': '0', 'PATH': '/usr/bin:/bin', 'PIP_NO_INDEX': '1'}
             env.pop('DOTS_CONFIG', None)
             for launch in range(2):
                 with (root / 'launch.log').open('w+') as log:

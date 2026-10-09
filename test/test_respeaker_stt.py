@@ -1,161 +1,63 @@
-import asyncio
-import base64
-import json
+"""Local STT has no API key/socket dependency and uses the completed WAV."""
 from pathlib import Path
+from types import SimpleNamespace
 import sys
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
-
-import numpy as np
-import soxr
-
+import wave
+from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from respeaker_stt import Transcriber, session_config
+from respeaker_stt import Transcriber
+from faster_whisper.audio import decode_audio
 
 
-class Socket:
-    def __init__(self):
-        self.sent = []
-        self.incoming = asyncio.Queue()
-        self.closed = False
+class TranscriberTest(unittest.TestCase):
+    def test_installed_audio_decoder_reads_a_real_recording_format(self):
+        # Detect PyAV/Faster Whisper incompatibility without downloading a model.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'microphone.wav'
+            with wave.open(str(path), 'wb') as wav:
+                wav.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+                wav.writeframes(bytes(16000 * 2))
+            audio = decode_audio(str(path), sampling_rate=16000)
+            self.assertEqual(audio.shape, (16000,))
+            self.assertEqual(float(abs(audio).max()), 0)
 
-    async def send(self, message):
-        self.sent.append(json.loads(message))
+    def test_local_cpu_int8_and_completed_transcript(self):
+        with patch('respeaker_stt.WhisperModel') as model:
+            transcriber = Transcriber()
+            model.assert_called_once_with('small', device='cpu', compute_type='int8',
+                                          cpu_threads=4, num_workers=1)
+            # Faster Whisper returns a lazy generator; consume it before emitting final text.
+            model.return_value.transcribe.return_value = (
+                iter([SimpleNamespace(text=' one, two '), SimpleNamespace(text='nine.')]), Mock())
+            result = transcriber.transcribe(Path('recorded.wav'))
+            self.assertEqual(result['text'], 'one, two nine.')
+            model.return_value.transcribe.assert_called_once_with('recorded.wav', beam_size=5,
+                                                                 language='en', vad_filter=False)
 
-    def __aiter__(self):
-        return self
+    def test_wake_name_hint_is_only_local(self):
+        with patch('respeaker_stt.WhisperModel') as model:
+            transcriber = Transcriber(prompt='The robot is named Kuro.')
+            model.return_value.transcribe.return_value = (iter([SimpleNamespace(text='Hi Kuro.')]), Mock())
+            self.assertEqual(transcriber.transcribe('wake.wav')['text'], 'Hi Kuro.')
+            self.assertEqual(model.return_value.transcribe.call_args.kwargs['initial_prompt'], 'The robot is named Kuro.')
 
-    async def __anext__(self):
-        return await self.recv()
+    def test_language_detection_and_empty_transcript(self):
+        with patch('respeaker_stt.WhisperModel') as model:
+            transcriber = Transcriber('base', 'auto')
+            model.return_value.transcribe.return_value = (iter([]), Mock())
+            self.assertEqual(transcriber.transcribe('silence.wav')['text'], '')
+            self.assertIsNone(model.return_value.transcribe.call_args.kwargs['language'])
 
-    async def recv(self):
-        return json.dumps(await self.incoming.get())
+    def test_model_and_decode_errors_propagate_to_microphone_owner(self):
+        with patch('respeaker_stt.WhisperModel', side_effect=RuntimeError('Model missing')):
+            with self.assertRaises(RuntimeError): Transcriber()
+        with patch('respeaker_stt.WhisperModel') as model:
+            transcriber = Transcriber()
+            model.return_value.transcribe.side_effect = RuntimeError('Corrupt WAV')
+            with self.assertRaises(RuntimeError): transcriber.transcribe('bad.wav')
 
-    async def close(self):
-        self.closed = True
 
-
-class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
-    async def event(self, socket, kind, item_id, **fields):
-        socket.incoming.put_nowait({'type': kind, 'item_id': item_id, **fields})
-        await asyncio.sleep(0)
-
-    async def test_startup_retries_transport_timeout_then_configures_session(self):
-        socket = Socket()
-        socket.incoming.put_nowait({'type': 'session.created'})
-        socket.incoming.put_nowait({'type': 'session.updated'})
-        with patch('respeaker_stt.connect', AsyncMock(side_effect=[TimeoutError(), socket])) as connect, \
-                patch('respeaker_stt.load_key', return_value='test-key'), \
-                patch('respeaker_stt.asyncio.sleep', AsyncMock()), patch('respeaker_stt.emit') as emit:
-            transcriber = await Transcriber.open()
-            self.assertEqual(connect.call_count, 2)
-            self.assertEqual(socket.sent[0], session_config('gpt-live-transcribe', 'low', None))
-            self.assertEqual(emit.call_args_list[0].args[0]['status'], 'transcription_connect_retry')
-            await transcriber.close()
-
-    async def test_stream_keeps_opening_and_flushes_resampling_tail(self):
-        socket = Socket()
-        transcriber = Transcriber(socket)
-        opening = np.full(6400, 1000, dtype='<i2')
-        speech = np.full(1897, 2000, dtype='<i2')
-        try:
-            with patch('respeaker_stt.emit'):
-                transcriber.begin(7)
-                transcriber.append(opening.tobytes())
-                for chunk in np.array_split(speech, 20):
-                    transcriber.append(chunk.tobytes())
-                transcriber.commit('/tmp/first.wav')
-                await transcriber.queue.join()
-                sent = np.frombuffer(b''.join(base64.b64decode(e['audio']) for e in socket.sent
-                                             if e['type'] == 'input_audio_buffer.append'), dtype='<i2')
-                expected = soxr.resample(np.concatenate((opening, speech)), 16000, 24000)
-                self.assertEqual(len(sent), len(expected))
-                # Integer conversion dithers independently in the two resamplers.
-                np.testing.assert_allclose(sent, expected, atol=2)
-                self.assertEqual(socket.sent[-1]['type'], 'input_audio_buffer.commit')
-                await self.event(socket, 'conversation.item.input_audio_transcription.completed',
-                                 'one', transcript='My name is John')
-                await transcriber.close()
-                self.assertTrue(socket.closed)
-        finally:
-            transcriber.sender.cancel()
-            transcriber.receiver.cancel()
-            await asyncio.gather(transcriber.sender, transcriber.receiver, return_exceptions=True)
-
-    async def test_partial_before_commit_and_out_of_order_final_association(self):
-        socket = Socket()
-        transcriber = Transcriber(socket)
-        try:
-            with patch('respeaker_stt.emit') as emit:
-                transcriber.begin(11, 359, 1)
-                transcriber.append(bytes(12800))
-                await transcriber.queue.join()
-                await self.event(socket, 'conversation.item.input_audio_transcription.delta', 'one', delta='My ')
-                self.assertIsNone(transcriber.items['one']['wav'])
-                transcriber.commit('/tmp/one.wav', 359)
-                transcriber.begin(22, 30, 2)
-                transcriber.append(bytes(12800))
-                transcriber.commit('/tmp/two.wav', 30)
-                await transcriber.queue.join()
-                await self.event(socket, 'input_audio_buffer.committed', 'one')
-                await self.event(socket, 'input_audio_buffer.committed', 'two')
-                await self.event(socket, 'conversation.item.input_audio_transcription.completed', 'two', transcript='Second')
-                await self.event(socket, 'conversation.item.input_audio_transcription.completed', 'one', transcript='First')
-                events = [call.args[0] for call in emit.call_args_list]
-                self.assertEqual(events[0]['status'], 'transcript_partial')
-                self.assertEqual([(e['track_id'], e['wav'], e['text']) for e in events[1:]],
-                                 [(22, '/tmp/two.wav', 'Second'), (11, '/tmp/one.wav', 'First')])
-                self.assertEqual([(e['doa_deg'], e['utterance_id']) for e in events[1:]], [(30, 2), (359, 1)])
-                self.assertFalse(transcriber.turns)
-                await transcriber.close()
-        finally:
-            transcriber.sender.cancel()
-            transcriber.receiver.cancel()
-            await asyncio.gather(transcriber.sender, transcriber.receiver, return_exceptions=True)
-
-    async def test_failure_stops_upload_without_exposing_server_error_text(self):
-        socket = Socket()
-        transcriber = Transcriber(socket)
-        socket.incoming.put_nowait({'type': 'error', 'error': {'code': 'rate_limit_exceeded',
-                                                             'message': 'Sensitive request data'}})
-        with self.assertRaisesRegex(RuntimeError, 'rate_limit_exceeded'):
-            await transcriber.receiver
-        with self.assertRaisesRegex(RuntimeError, 'local audio was retained'):
-            transcriber.append(bytes(1280))
-        with patch('respeaker_stt.emit') as emit:
-            await transcriber.close()
-            self.assertEqual(emit.call_args.args[0]['status'], 'transcription_incomplete')
-        self.assertTrue(socket.closed)
-
-    async def test_playback_pause_discards_pending_transcripts_and_resumes_fresh_turn(self):
-        socket = Socket()
-        transcriber = Transcriber(socket)
-        try:
-            with patch('respeaker_stt.emit') as emit:
-                transcriber.begin(1, 20)
-                transcriber.append(bytes(12800))
-                transcriber.discard()
-                await transcriber.queue.join()
-                await self.event(socket, 'input_audio_buffer.committed', 'old')
-                await self.event(socket, 'conversation.item.input_audio_transcription.delta', 'old', delta='Robot echo')
-                await self.event(socket, 'conversation.item.input_audio_transcription.completed', 'old', transcript='Robot echo')
-                emit.assert_not_called()
-                transcriber.begin(2, 30)
-                transcriber.append(bytes(12800))
-                transcriber.commit('/tmp/user.wav', 31)
-                await transcriber.queue.join()
-                await self.event(socket, 'conversation.item.input_audio_transcription.completed', 'new', transcript='My name is John')
-                self.assertEqual(emit.call_args.args[0]['text'], 'My name is John')
-                self.assertEqual(emit.call_args.args[0]['doa_deg'], 31)
-                await transcriber.close()
-        finally:
-            transcriber.sender.cancel()
-            transcriber.receiver.cancel()
-            await asyncio.gather(transcriber.sender, transcriber.receiver, return_exceptions=True)
-
-    def test_configuration_uses_client_endpointing_and_language_hints(self):
-        config = session_config('gpt-live-transcribe', 'low', 'en')['session']['audio']['input']
-        self.assertEqual(config['format'], {'type': 'audio/pcm', 'rate': 24000})
-        self.assertIsNone(config['turn_detection'])
-        self.assertEqual(config['transcription'], {'model': 'gpt-live-transcribe', 'delay': 'low', 'languages': ['en']})
-        self.assertNotIn('delay', session_config('gpt-transcribe', 'low', None)['session']['audio']['input']['transcription'])
+if __name__ == '__main__':
+    unittest.main()

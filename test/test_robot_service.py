@@ -250,7 +250,7 @@ class RobotServiceCheck(unittest.TestCase):
                         if line == 'event: ' + kind:
                             return json.loads(stream.readline().decode().removeprefix('data: '))
                 self.assertEqual(event('config'), config)
-                self.assertEqual(event('command')['state'], 'idle')
+                self.assertEqual(event('command')['state'], 'sleeping')
                 self.assertEqual(event('gaze')['sequence'], 0)
                 execute(base, 'sleeping')
                 self.assertEqual(event('command')['state'], 'sleeping')

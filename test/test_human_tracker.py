@@ -243,6 +243,8 @@ class HumanTrackerCheck(unittest.TestCase):
                 self.fail('Timed out waiting for robot link.')
             try:
                 api(url, 'actions', [dict(id=state, label=state) for state in ('idle', 'sleeping', 'speaking', 'listening', 'wave')])
+                self.assertFalse(api(url, 'status')['awake'])
+                api(url, 'command', dict(state='listening'))
                 original = api(url, 'status')['trackingSession']
                 for state in ('listening', 'speaking', 'wave'):
                     api(url, 'command', dict(state=state))
