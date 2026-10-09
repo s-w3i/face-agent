@@ -1,6 +1,6 @@
 # Face agent · Kuro
 
-Kuro is a robot companion with a browser face, ReSpeaker voice input, OpenAI conversation and speech, and ROS 2 control. An Orbbec camera can track the person speaking and move the eyes. The Raspberry Pi can play a pre-rendered character while keeping speech and eye tracking live.
+Kuro is a robot companion with a browser face, ReSpeaker voice input, OpenAI conversation and speech, and ROS 2 control. An Orbbec camera can track the person speaking, move the eyes, and provide visual grounding when a question needs it. The Raspberry Pi can play a pre-rendered character while keeping speech and eye tracking live.
 
 This guide describes the `pi5` branch on Ubuntu 24.04 with ROS 2 Jazzy. The built web app and an example animation pack are included; Node.js is only needed when changing the frontend.
 
@@ -115,6 +115,37 @@ To start asleep, run the manager **before** the display or chatbot in another te
 ```
 
 That option only sets the initial state of a new manager. Use the service below to change an existing manager.
+
+### Ask questions that need vision
+
+Vision is enabled by default in both voice and typed chat. Start the ROS camera, then speak naturally:
+
+- “Hi Kuro, is my outfit suitable for a casual lunch out?”
+- “What am I holding?”
+- “What is this?” while showing an object.
+- “Can you read what this says?”
+
+The agent decides from the request and conversation whether it needs a camera image. No separate vision mode or trigger is needed. Ordinary greetings, general knowledge, and questions about pasted code/errors do not require camera capture. Visual reasoning stays in THINKING with microphone capture paused, and the answer uses the normal voice/subtitles.
+
+Kuro requests a fresh color frame from `/head_camera/color/image_raw/compressed`, then reasons over the actual image with the conversation model. Small objects can get one focused second look; each turn allows at most two captures. If the view is unclear or the camera is unavailable, Kuro should say so and ask for a clearer view. Hold objects near enough to see their shape/details; step back to show your full outfit. A single camera view cannot reveal parts outside the frame or reliably identify which person you mean in a crowd.
+
+Only requested snapshots are sent to OpenAI, using the existing API key. The camera helper holds images in memory, limits them to 1280 pixels on the longest side, and rejects frames older than one second. Images are not saved to disk or retained in the next turn's conversation history; text observations/replies remain available for follow-up. This is on-demand image input, not continuous video upload. Visual requests add image API usage. Eye tracking itself continues to process images locally.
+
+Use `--no-vision` to disable image access, or set `DOTS_VISION=0` in the startup settings. `--no-track` disables eye tracking independently and leaves vision available. For another ROS color topic:
+
+```bash
+.venv/bin/python scripts/chat.py --mode voice \
+  --camera-topic /head_camera/color/image_raw/compressed
+```
+
+`DOTS_CAMERA_TOPIC` supplies the same setting, including through `~/.config/face-agent/startup.env`. Vision needs the system `python3-pil` package, installed by `scripts/setup_respeaker.sh`. For a local capture check without sending an image to OpenAI:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 scripts/camera_snapshot.py --check
+```
+
+This prints timestamp, size, and freshness only. Use a vision-capable model if overriding `--model`; the default `gpt-6-luna` accepts image input. See the [OpenAI image input guide](https://developers.openai.com/api/docs/guides/images-vision) for API behavior.
 
 ### Stop and restart
 
@@ -264,7 +295,7 @@ source /opt/ros/jazzy/setup.bash
 
 This creates a separate tracking environment and downloads its local face models on first use. For standalone tracking diagnostics with the display and camera running, use `./track.sh --stats`. The chatbot normally manages the tracker for you.
 
-Voice mode combines face detections with ReSpeaker direction-of-arrival hints to select a speaker, then keeps a visual identity lock. Typed mode acquires a person near the camera center. Tracking is active while awake; missing targets ease the eyes back to the original animation. Camera images are processed locally.
+Voice mode combines face detections with ReSpeaker direction-of-arrival hints to select a speaker, then keeps a visual identity lock. Typed mode acquires a person near the camera center. Tracking is active while awake; missing targets ease the eyes back to the original animation. Tracking images are processed locally; the separate on-demand vision tool sends snapshots to OpenAI only for visual requests.
 
 The pre-rendered body **does not need full 3D rendering for live gaze**. The included pack has eye positions; the player moves small eye patches over the baked body. Customized looks with obscured eyes may need verification in **Test gaze**. For another microphone mounting, use `--mic-forward-deg ANGLE` and `--mic-clockwise` as appropriate. This robot uses native 0° at camera center, increasing toward camera left.
 
@@ -357,6 +388,7 @@ Movement starts after the departure announcement finishes successfully. Failed o
 | `Microphone failed` | Read `~/.cache/face-agent/microphone-chat.log`; check USB permissions, device connection, and default audio source. Stop other microphone tests before chat. |
 | ROS interface import failure | Source Jazzy, run `bash scripts/setup_robot_status.sh`, and source `ros2/install/local_setup.bash` again. |
 | Camera disconnects or no eyes moving | Run only one camera launcher; try `camera.sh`, then `./track.sh --check`. Confirm the compressed image and camera-info topics exist. |
+| Kuro cannot see an object or outfit | Run `camera_snapshot.py --check` with ROS sourced. Confirm the color topic and `python3-pil`; move the object closer or step back to show the outfit. Vision messages appear in `stack-agent.log`. |
 | Display is slow | Use pre-rendered playback; bake customized looks on a stronger computer. |
 | Port 5173 is already in use | Stop the old launcher or choose another port, and point chat/tracking at that service. |
 
@@ -404,8 +436,12 @@ Focused Python checks:
 .venv/bin/python -m unittest discover -s test -p test_voice_input.py
 .venv/bin/python -m unittest discover -s test -p 'test_respeaker*.py'
 .venv/bin/python -m unittest discover -s test -p test_robot_service.py
+.venv/bin/python -m unittest discover -s test -p test_camera_vision.py
 # Requires built ROS interfaces and ROS 2 Jazzy:
 .venv/bin/python -m unittest discover -s test -p test_global_status.py
+# ROS/Pillow snapshot tests use the system interpreter, in an isolated ROS domain:
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 -m unittest discover -s test -p test_camera_snapshot.py
 ```
 
 Bundled runtime notices are in [public/local-dots/THIRD_PARTY_NOTICES.txt](public/local-dots/THIRD_PARTY_NOTICES.txt). Font licenses are in [public/fonts/](public/fonts/).
