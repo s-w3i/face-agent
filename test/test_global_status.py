@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from ros_status import RosStatus, DisplayStatus
 from serve import RobotServer
-from chat import status_chat_loop
+from chat import recover_voice, status_chat_loop
+from voice_errors import RealtimeUnavailable
 from dotsctl import request
 from voice_input import VoiceInput
 
@@ -68,6 +69,21 @@ class GlobalStatusCheck(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(late.current.revision, self.remote.current.revision)
         await self.agent.close()
         self.assertTrue(await self.remote.set('ERROR'))  # Authority survives chatbot exit.
+
+    async def test_recovery_publishes_error_until_worker_ready_then_resumes_idle(self):
+        attempts = 0
+        async def restart(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            await until(lambda: self.remote.current.status == 'ERROR')
+            self.assertTrue(kwargs['awake'])
+            if attempts == 1:
+                raise RealtimeUnavailable('Temporary network failure')
+        voice = Mock(restart=AsyncMock(side_effect=restart))
+        with patch('chat.VOICE_RETRY_DELAYS', (0,)):
+            self.assertTrue(await recover_voice(self.agent, voice, RealtimeUnavailable('Queue full')))
+        await until(lambda: self.remote.current.status == 'IDLE')
+        self.assertEqual(attempts, 2)
 
     async def test_display_without_agent_and_stale_speech(self):
         config = Path(self.cache.name) / 'robot.json'

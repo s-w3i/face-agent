@@ -66,6 +66,21 @@ class RealtimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connect.await_count, 1)
         self.assertTrue(socket.closed)
         self.assertNotIn('private-key', str(error.exception))
+        self.assertFalse(error.exception.retryable)
+
+    async def test_queue_overflow_is_recoverable_and_never_silently_drops_audio(self):
+        socket = Socket(); transcriber = RealtimeTranscriber(socket, lambda event: None)
+        try:
+            # Do not yield to the sender: reproduce the bounded queue filling.
+            transcriber.begin(1)
+            for _ in range(255):
+                transcriber.append(bytes(320 * 2))
+            with self.assertRaisesRegex(RealtimeUnavailable, 'interrupted utterance') as error:
+                transcriber.append(bytes(320 * 2))
+            self.assertTrue(error.exception.retryable)
+            self.assertEqual(transcriber.queue.qsize(), 256)
+        finally:
+            await transcriber.close()
 
     async def test_cancel_during_configuration_closes_socket_without_retry(self):
         socket = Socket()

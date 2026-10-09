@@ -299,7 +299,7 @@ def main():
     except Exception as error:
         event = dict(status='microphone_error', reconnectable=isinstance(error, DeviceUnavailable) or isinstance(error, USBError) and error.errno == 19)
         if isinstance(error, RealtimeUnavailable):
-            event.update(category='realtime_unavailable', message=str(error))
+            event.update(category='realtime_unavailable', message=str(error), retryable=error.retryable)
         emit(event)
         print('ReSpeaker error: ' + str(error), file=sys.stderr)
         return 1

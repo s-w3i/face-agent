@@ -22,7 +22,7 @@ from agents import Agent, Runner, WebSearchTool, ToolOutputImage, ToolOutputText
 from agents.mcp import MCPServerStdio
 from dotsctl import request
 from launch_robot import stop
-from voice_input import VoiceInput
+from voice_input import VoiceInput, MicrophoneDisconnected
 from voice_errors import RealtimeUnavailable
 from ros_wake import RosWake, WakeRequest
 from ros_status import RosStatus
@@ -31,6 +31,7 @@ from camera_vision import CameraFeed, capture_camera, VisionUnavailable, without
 from camera_snapshot import DEFAULT_TOPIC
 
 IDLE_SECONDS = 5.0
+VOICE_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
 
 @contextmanager
@@ -514,6 +515,48 @@ async def main():
             return 1
 
 
+async def recover_voice(status, voice, error):
+    """Reconnect only while we still own the exact ERROR revision we published."""
+    current = status.current
+    if current is None or current.status not in (*INPUT_STATES, 'SLEEPING'):
+        return False
+    target = 'SLEEPING' if current.status == 'SLEEPING' else 'IDLE'
+    if not await status.set('ERROR', expected_revision=current.revision):
+        return False
+    failed = status.current
+    if failed is None or failed.status != 'ERROR' or failed.source != status.source:
+        return False
+
+    def owns_error():
+        return status.current == failed
+
+    if not error.retryable:
+        print('Voice recovery stopped: correct the API key or configuration, then set IDLE to retry.', file=sys.stderr, flush=True)
+        return False
+    attempt = 0
+    while owns_error():
+        delay = VOICE_RETRY_DELAYS[min(attempt, len(VOICE_RETRY_DELAYS) - 1)]
+        attempt += 1
+        print(f'Voice recovery attempt {attempt} in {delay}s; microphone input is paused.', file=sys.stderr, flush=True)
+        await asyncio.sleep(delay)
+        if not owns_error():
+            return False
+        try:
+            await voice.restart(awake=target != 'SLEEPING')
+        except (RealtimeUnavailable, MicrophoneDisconnected) as retry_error:
+            print('Voice recovery: ' + str(retry_error), file=sys.stderr, flush=True)
+            if isinstance(retry_error, RealtimeUnavailable) and not retry_error.retryable:
+                return False
+            continue
+        if not owns_error():
+            return False
+        if await status.set(target, expected_revision=failed.revision):
+            print(f'Voice input recovered; {target}. Please repeat the interrupted request.', flush=True)
+            return True
+        return False
+    return False
+
+
 async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed=None):
     """The global topic owns input permission; external changes interrupt a turn."""
     bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed)
@@ -523,6 +566,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
     motions = queue.Queue()
     shutdown = threading.Event()
     operation = None
+    voice_restart_needed = False
     changed = asyncio.Event()
     # The initial retained sample was already consumed by RosStatus.__aenter__.
     while not status.events.empty():
@@ -625,6 +669,14 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
             accepting = current.status in INPUT_STATES
             try:
                 if voice:
+                    if voice_restart_needed:
+                        if current.status not in (*INPUT_STATES, 'SLEEPING'):
+                            operation = asyncio.create_task(changed.wait())
+                            await operation
+                            continue
+                        operation = asyncio.create_task(voice.restart(awake=current.status != 'SLEEPING'))
+                        await operation
+                        voice_restart_needed = False
                     operation = asyncio.create_task(microphone_action(voice.follow_status(current.status)))
                     await operation
                 if not accepting:
@@ -677,6 +729,22 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                             raise
             except (EOFError, KeyboardInterrupt):
                 break
+            except RealtimeUnavailable as error:
+                print('Robot voice error: ' + str(error), file=sys.stderr, flush=True)
+                try:
+                    if voice and not changed.is_set():
+                        voice_restart_needed = True
+                        operation = asyncio.create_task(recover_voice(status, voice, error))
+                        recovered = await operation
+                        voice_restart_needed = not recovered
+                        if not recovered and not changed.is_set():
+                            # A permanent or externally owned ERROR stays paused;
+                            # wait for a new ROS command rather than spin on failure.
+                            operation = asyncio.create_task(changed.wait())
+                            await operation
+                except asyncio.CancelledError:
+                    if not changed.is_set():
+                        raise
             except Exception as error:
                 print('Robot error: ' + str(error), file=sys.stderr)
                 if status.current and not changed.is_set():

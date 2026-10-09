@@ -123,6 +123,31 @@ class VoiceInput:
             self.failed = RuntimeError('ReSpeaker is still unavailable after five retries. Check its USB cable or hub, then restart voice chat.')
             raise self.failed
 
+    async def restart(self, *, awake):
+        """Replace a failed worker with input held closed until global status resumes."""
+        self.held = True; self.accepting = False
+        guard = self.guard
+        if guard:
+            guard.cancel()
+            await asyncio.gather(guard, return_exceptions=True)
+        async with self.restart_lock:
+            self.replacing = True
+            try:
+                await self.stop_microphone()
+                self.awake = awake
+                self.hint = None; self.partials.clear()
+                for events in (self.inputs, self.activity):
+                    while not events.empty():
+                        events.get_nowait()
+                await self.publish_text('')
+                await self.start_microphone()
+            except BaseException:
+                await self.stop_microphone()
+                raise
+            finally:
+                self.replacing = False
+        self.guard = asyncio.create_task(self.watch_playback())
+
     def direction(self, value, utterance=0):
         self.hint = None
         if type(value) in (int, float) and math.isfinite(value) and 0 <= value < 360:
@@ -152,7 +177,8 @@ class VoiceInput:
                     self.accepting = False
                 elif status == 'microphone_error':
                     if event.get('category') == 'realtime_unavailable':
-                        raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'))
+                        raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'),
+                                                  retryable=event.get('retryable', True) is True)
                     if event.get('reconnectable') is True:
                         raise MicrophoneDisconnected('ReSpeaker USB connection lost.')
                     raise incomplete or RuntimeError('Microphone failed. Check ~/.cache/face-agent/microphone-chat.log.')
@@ -187,7 +213,8 @@ class VoiceInput:
                         if self.awake:
                             self.activity.put_nowait('IDLE')
             if not self.closing and not self.replacing:
-                raise incomplete or RuntimeError('Microphone stopped. Check ~/.cache/face-agent/microphone-chat.log.')
+                raise incomplete or (RealtimeUnavailable('Microphone worker stopped; restarting voice input.')
+                                     if self.awake else MicrophoneDisconnected('Local wake microphone worker stopped.'))
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -224,7 +251,9 @@ class VoiceInput:
                     try:
                         acknowledged = await asyncio.wait_for(future, 5)
                     except asyncio.TimeoutError:
-                        raise RuntimeError('Microphone did not confirm its playback gate; voice input stopped.') from None
+                        error = RealtimeUnavailable('Microphone playback gate timed out; restarting voice input.')
+                        self.failed = error
+                        raise error from None
                     if acknowledged != paused:
                         raise RuntimeError('Microphone did not confirm its playback gate.')
                     self.paused = paused; self.accepting = not paused

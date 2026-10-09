@@ -428,6 +428,53 @@ for line in sys.stdin:
                 self.assertFalse(voice.paused)
             self.assertTrue(all(process.returncode is not None for process in processes))
 
+    async def test_realtime_worker_restart_clears_old_input_and_waits_for_global_idle(self):
+        child = Path(self.directory.name) / 'recovering_microphone.py'
+        marker = Path(self.directory.name) / 'worker-started'
+        child.write_text('''import json,sys
+from pathlib import Path
+marker=Path(sys.argv[1]); first=not marker.exists(); marker.touch()
+def emit(**value): print(json.dumps(value), flush=True)
+emit(status='listening')
+for line in sys.stdin:
+    control=json.loads(line); emit(status='microphone_control', **control)
+    if not control['paused']:
+        if first:
+            emit(status='microphone_error', category='realtime_unavailable', retryable=True, message='Audio queue full')
+            break
+        emit(status='transcript_final', item_id='new', text='A fresh request', utterance_id=1, paused_after=True)
+''')
+        original = asyncio.create_subprocess_exec
+        async def spawn(*command, **options):
+            return await original(sys.executable, str(child), str(marker), **options)
+        self.server.apply_robot_status(dict(status='IDLE', revision=1, source='test'))
+        with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
+                patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
+                patch('serve.Handler.log_message'), redirect_stdout(io.StringIO()):
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                old = voice.process
+                await voice.follow_status('IDLE')
+                with self.assertRaisesRegex(RealtimeUnavailable, 'queue full'):
+                    await voice.read(2)
+                voice.partials['old'] = 'Interrupted words'
+                voice.activity.put_nowait('LISTENING')
+                voice.inputs.put_nowait(dict(text='Old command'))
+                self.server.apply_robot_status(dict(status='ERROR', revision=2, source='test'))
+                await voice.restart(awake=True)
+                self.assertIsNotNone(old.returncode)
+                self.assertNotEqual(old.pid, voice.process.pid)
+                self.assertIsNone(voice.failed)
+                self.assertTrue(voice.held and voice.paused)
+                self.assertFalse(voice.accepting)
+                self.assertFalse(voice.partials)
+                self.assertTrue(voice.inputs.empty() and voice.activity.empty())
+                self.server.apply_robot_status(dict(status='IDLE', revision=3, source='test'))
+                await voice.follow_status('IDLE')
+                self.assertEqual(await voice.read(2), 'A fresh request')
+                new = voice.process
+            self.assertIsNotNone(new.returncode)
+
     async def test_usb_retry_limit_and_fatal_errors_do_not_loop_forever(self):
         from unittest.mock import AsyncMock
         voice = VoiceInput(self.url)

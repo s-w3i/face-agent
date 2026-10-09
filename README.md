@@ -108,6 +108,8 @@ Kuro sleeps after **5 seconds of inactivity** while command input is available. 
 
 Conversation input appears centered above the character; smaller reply subtitles appear below. Input text clears on entering THINKING or any other non-input state. Awake commands use GPT Realtime transcription; wake detection stays local.
 
+Temporary Realtime disconnections, transcription timeouts, audio queue overflow, an unexpected voice worker exit, or a stalled playback gate automatically restart the microphone/transcription worker. The agent shows ERROR with input paused while reconnecting, then returns to IDLE only after the replacement worker is ready. Retries wait 1, 2, 4, 8, 15, then 30 seconds between attempts, continuing at 30 seconds while unavailable. Conversation history stays intact; repeat the interrupted utterance, which is never automatically replayed. Recovery stops if another ROS node changes the status, including publishing its own ERROR. Rejected credentials, quota, or configuration need correction; after fixing them, set IDLE to retry. Other unrelated errors remain visible as ERROR.
+
 To start asleep, run the manager **before** the display or chatbot in another terminal:
 
 ```bash
@@ -438,6 +440,7 @@ Focused Python checks:
 ```bash
 .venv/bin/python -m unittest discover -s test -p test_chat.py
 .venv/bin/python -m unittest discover -s test -p test_voice_input.py
+.venv/bin/python -m unittest discover -s test -p test_voice_recovery.py
 .venv/bin/python -m unittest discover -s test -p 'test_respeaker*.py'
 .venv/bin/python -m unittest discover -s test -p test_robot_service.py
 .venv/bin/python -m unittest discover -s test -p test_camera_vision.py

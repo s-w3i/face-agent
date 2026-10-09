@@ -64,7 +64,7 @@ class RealtimeTranscriber:
                 status = getattr(getattr(error, 'response', None), 'status_code', None)
                 reason = f'HTTP {status}' if type(status) is int else type(error).__name__
                 if not retryable:
-                    raise RealtimeUnavailable(f'Realtime transcription connection rejected ({reason}). Check the API key and model access.') from None
+                    raise RealtimeUnavailable(f'Realtime transcription connection rejected ({reason}). Check the API key and model access.', retryable=False) from None
                 if attempt == len(families):
                     raise RealtimeUnavailable(f'Realtime transcription unavailable after {attempt} connection attempts ({reason}). Check the network and try waking Kuro again.') from None
                 emit(dict(status='transcription_retry', attempt=attempt, attempts=len(families), reason=reason))
@@ -83,7 +83,9 @@ class RealtimeTranscriber:
                 while True:
                     event = json.loads(await socket.recv())
                     if event.get('type') == 'error':
-                        raise RealtimeUnavailable('Realtime transcription configuration rejected: ' + event['error'].get('code', 'unknown'))
+                        code = event['error'].get('code', 'unknown')
+                        raise RealtimeUnavailable('Realtime transcription configuration rejected: ' + code,
+                                                  retryable=code in ('server_error', 'rate_limit_exceeded'))
                     if event.get('type') in ('session.updated', 'transcription_session.updated'):
                         return cls(socket, emit)
         except BaseException:
@@ -105,11 +107,14 @@ class RealtimeTranscriber:
     def enqueue(self, kind, value=None):
         for task in (self.sender, self.receiver):
             if task.done():
+                if not task.cancelled() and isinstance(task.exception(), RealtimeUnavailable):
+                    raise task.exception()
                 raise RealtimeUnavailable('Realtime transcription connection stopped. Try waking Kuro again.') from None
         try:
             self.queue.put_nowait((kind, value))
         except asyncio.QueueFull:
-            raise RuntimeError('Realtime transcription cannot keep up; stopping without dropping audio.') from None
+            raise RealtimeUnavailable('Realtime transcription cannot keep up; restarting the connection. '
+                                      'The interrupted utterance must be repeated.') from None
 
     def begin(self, utterance_id):
         if self.turn is not None:
@@ -153,7 +158,10 @@ class RealtimeTranscriber:
             event = json.loads(message)
             kind = event.get('type')
             if kind == 'error':
-                raise RealtimeUnavailable('Realtime transcription failed: ' + event.get('error', {}).get('code', 'unknown'))
+                code = event.get('error', {}).get('code', 'unknown')
+                raise RealtimeUnavailable('Realtime transcription failed: ' + code,
+                                          retryable=code not in ('invalid_api_key', 'insufficient_quota',
+                                                                'model_not_found', 'permission_denied', 'invalid_request_error'))
             if kind not in ('input_audio_buffer.committed', 'conversation.item.input_audio_transcription.delta',
                             'conversation.item.input_audio_transcription.completed', 'conversation.item.input_audio_transcription.failed'):
                 continue
