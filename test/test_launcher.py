@@ -108,6 +108,10 @@ class LauncherCheck(unittest.TestCase):
                        'OPENAI_API_KEY': '', 'XDG_CONFIG_HOME': str(root / 'private'), 'DOTS_BROWSER': str(browser),
                        'DOTS_BROWSER_PROFILE': str(root / 'robot profile'), 'BROWSER_ARGS': str(arguments),
                        'BROWSER_SECONDS': '30' if interrupt else '1'}
+                if interrupt:
+                    env['DOTS_FULLSCREEN'] = '0'
+                else:
+                    env.pop('DOTS_FULLSCREEN', None)
                 with (root / 'robot.log').open('w+') as log:
                     process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/launch_robot.py')], env=env, stdout=log, stderr=log)
                     try:
@@ -118,6 +122,7 @@ class LauncherCheck(unittest.TestCase):
                             time.sleep(.05)
                         args = json.loads(arguments.read_text())
                         self.assertIn('--autoplay-policy=no-user-gesture-required', args)
+                        self.assertEqual('--start-fullscreen' in args, not interrupt)
                         self.assertIn(f'--app=http://127.0.0.1:{port}/robot.html', args)
                         self.assertIn(f'--user-data-dir={root / "robot profile"}', args)
                         if interrupt:

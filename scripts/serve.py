@@ -342,6 +342,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
         super().end_headers()
 
+    def log_request(self, code='-', size='-'):
+        if os.environ.get('DOTS_ACCESS_LOG', '1') != '0':
+            super().log_request(code, size)
+
     def reply(self, value, status=200):
         data = json.dumps(value, allow_nan=False).encode()
         self.send_response(status); self.send_header('Content-Type', 'application/json')

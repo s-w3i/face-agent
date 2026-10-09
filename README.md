@@ -64,7 +64,7 @@ source /opt/ros/jazzy/setup.bash
 DOTS_RENDERER=prerendered ./run.sh --robot
 ```
 
-This opens a dedicated Chromium window with automatic audio playback. The pre-rendered mode uses the bundled animation pack. Use `./run.sh --robot` to follow the renderer selected in the saved configuration.
+This opens a fullscreen Chromium window with automatic audio playback. The pre-rendered mode uses the bundled animation pack. Use `./run.sh --robot` to follow the renderer selected in the saved configuration. Set `DOTS_FULLSCREEN=0` for a normal window.
 
 **Terminal 2 — camera, if tracking is wanted:**
 
@@ -121,6 +121,54 @@ That option only sets the initial state of a new manager. Use the service below 
 Use `/quit` or **Ctrl+C** in the chatbot terminal to stop voice input and its owned tracker. Close the robot window or press **Ctrl+C** in its launcher terminal. Stop the camera with **Ctrl+C** in its terminal.
 
 The shared status manager survives display/chat exits. If started explicitly with `./robot-status.sh`, stop it in that terminal with **Ctrl+C**. Otherwise, restarting the display/chat reuses it; set IDLE through the service to resume an existing sleeping or busy session.
+
+## Start the full stack automatically at boot
+
+After completing the one-time setup above, install desktop startup **as your normal user, without sudo**:
+
+```bash
+cd ~/face-agent
+python3 scripts/install_startup.py
+scripts/desktop_start.sh
+```
+
+This installs the `face-agent.service` user service and a desktop autostart entry. It launches the ROS status manager, camera, fullscreen face display, and voice chatbot with eye tracking. The chatbot waits until the display and ROS status are ready. Failed components restart automatically; closing the face window while the service is running opens it again.
+
+A fresh manager starts in SLEEPING, waiting for “Hi Kuro” or a ROS status command. An existing status manager keeps its state. The startup camera profile is `camera-rgbd.sh`, providing color, depth, and an XYZ point cloud. To run the same stack manually in the foreground, use `./start-stack.sh`; **Ctrl+C** stops its components. Stop any separately launched display/camera/chat first.
+
+The display requires a logged-in desktop. Enable **Automatic Login** for your account in Ubuntu **Settings → System → Users** to launch after power-on without signing in. On this Pi's GDM desktop, the alternative helper is:
+
+```bash
+scripts/enable_autologin.sh
+```
+
+Run the helper as your desktop user, without sudo. It uses Ubuntu AccountsService and may show an administrator authentication dialog. The change applies on the next boot without restarting the current session. Automatic login opens the desktop without a password after power-on.
+
+Startup settings are in `~/.config/face-agent/startup.env`:
+
+```bash
+DOTS_RENDERER=prerendered
+DOTS_FULLSCREEN=1
+DOTS_CAMERA_PROFILE=rgbd  # Use color for the lower-bandwidth camera.sh profile.
+DOTS_INITIAL_STATUS=SLEEPING
+# PORT=5173
+# ROS_DOMAIN_ID=0
+```
+
+Edit the file, then restart the service. The installer preserves existing startup settings. An API key supplied only in the installer's environment is saved to the application's private key file so it is available after reboot; it is never placed in the service or desktop entry.
+
+```bash
+systemctl --user restart face-agent.service
+systemctl --user status face-agent.service
+journalctl --user -u face-agent.service -f
+
+# Stop the stack for manual testing:
+systemctl --user stop face-agent.service
+# Disable startup and stop the stack; keep settings and API key:
+python3 scripts/install_startup.py --remove
+```
+
+Component logs are `~/.cache/face-agent/stack-{status,camera,display,agent}.log`. Routine HTTP access logs are off in stack mode; set `DOTS_ACCESS_LOG=1` in the startup settings to enable them. Re-run the installer if you move the repository. Startup does not install missing ROS or microphone dependencies; complete setup first.
 
 ## ROS 2 robot status
 
