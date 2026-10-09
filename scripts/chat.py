@@ -27,7 +27,7 @@ from voice_errors import RealtimeUnavailable
 from ros_wake import RosWake, WakeRequest
 from ros_status import RosStatus
 from robot_states import INPUT_STATES
-from camera_vision import capture_camera, VisionUnavailable, without_camera_images
+from camera_vision import CameraFeed, capture_camera, VisionUnavailable, without_camera_images
 from camera_snapshot import DEFAULT_TOPIC
 
 IDLE_SECONDS = 5.0
@@ -109,7 +109,7 @@ def robot_name(url):
 
 
 class Chatbot:
-    def __init__(self, url, model=None, *, vision=True, camera_topic=None):
+    def __init__(self, url, model=None, *, vision=True, camera_topic=None, camera_feed=None):
         self.url = url
         self.history = []
         self.animated = False
@@ -126,13 +126,15 @@ class Chatbot:
                 return 'Two camera attempts have already been made this turn. Use the available evidence or ask the user for a clearer view.'
             self.vision_calls += 1
             print('Vision · looking at the camera.', flush=True)
+            started = time.monotonic()
             try:
-                frame = await capture_camera(camera_topic or DEFAULT_TOPIC, crop=crop)
+                frame = await capture_camera(camera_topic or DEFAULT_TOPIC, crop=crop, feed=camera_feed)
             except VisionUnavailable as error:
                 print('Vision · camera unavailable: ' + str(error), flush=True)
                 return ('No visual evidence was obtained. ' + str(error) +
                         ' Tell the user briefly you cannot see the scene right now; do not guess what is visible.')
-            print(f'Vision · fresh frame ready ({frame["width"]} × {frame["height"]}).', flush=True)
+            print(f'Vision · fresh frame ready ({frame["width"]} × {frame["height"]}; '
+                  f'{time.monotonic() - started:.2f}s).', flush=True)
             return [ToolOutputText(text=json.dumps(dict(
                 observation='Fresh robot camera image for this turn; use the actual pixels to answer.',
                 question=question, captured_at=frame['captured_at'], age_seconds=round(frame['age_seconds'], 3),
@@ -478,6 +480,7 @@ async def main():
         except (ValueError, OSError):
             pass  # Typed chat remains available with the display service offline.
     async with AsyncExitStack() as stack:
+        camera_feed = await stack.enter_async_context(CameraFeed(args.camera_topic)) if args.vision else None
         if args.track:
             stack.enter_context(start_tracking(args.url))
         server = None
@@ -498,9 +501,9 @@ async def main():
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
                 args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None)) if args.mode == 'voice' else None
             if status:
-                return await status_chat_loop(args, status, server, voice)
+                return await status_chat_loop(args, status, server, voice, camera_feed=camera_feed)
             wake = await stack.enter_async_context(RosWake()) if args.ros_wake else None
-            return await chat_loop(args, server, voice, wake)
+            return await chat_loop(args, server, voice, wake, camera_feed=camera_feed)
         except (RuntimeError, OSError, ValueError) as error:
             if status and status.current:
                 try:
@@ -511,9 +514,9 @@ async def main():
             return 1
 
 
-async def status_chat_loop(args, status, server=None, voice=None):
+async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed=None):
     """The global topic owns input permission; external changes interrupt a turn."""
-    bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None))
+    bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed)
     bot.status_managed = True
     if server:
         bot.agent.mcp_servers = [server]
@@ -696,8 +699,8 @@ async def status_chat_loop(args, status, server=None, voice=None):
     return 0
 
 
-async def chat_loop(args, server=None, voice=None, wake=None):
-    bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None))
+async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=None):
+    bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed)
     if server:
         bot.agent.mcp_servers = [server]
     notices = wake.requests if wake else queue.Queue() if server else None

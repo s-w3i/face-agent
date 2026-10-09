@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from agents.items import ItemHelpers
 from agents.tool_context import ToolContext
 from openai.types.responses import ResponseFunctionToolCall
-from camera_vision import capture_camera, VisionUnavailable, without_camera_images
+from camera_vision import CameraFeed, capture_camera, VisionUnavailable, without_camera_images
 from chat import Chatbot
 
 
@@ -25,6 +25,24 @@ def frame():
 
 
 class VisionCheck(unittest.IsolatedAsyncioTestCase):
+    async def test_persistent_helper_excludes_credentials_and_rejects_stale_response(self):
+        value = frame()
+        value['captured_unix'] -= 10
+        process = Mock(returncode=None, pid=12345, wait=AsyncMock(return_value=0),
+                       stdin=Mock(drain=AsyncMock()),
+                       stdout=Mock(readline=AsyncMock(side_effect=[b'{"ready":true}\n', json.dumps(value).encode() + b'\n'])))
+        with patch('camera_vision.Path.exists', return_value=True), \
+                patch.dict(os.environ, {'OPENAI_API_KEY': 'private-key'}), \
+                patch('camera_vision.asyncio.create_subprocess_exec', new_callable=AsyncMock, return_value=process) as start, \
+                patch('camera_vision.os.killpg'):
+            async with CameraFeed('/test/color/compressed') as feed:
+                with self.assertRaisesRegex(VisionUnavailable, 'expired'):
+                    await feed.capture()
+            self.assertNotIn('OPENAI_API_KEY', start.call_args.kwargs['env'])
+            self.assertIn('--serve', start.call_args.args)
+            self.assertIn('/test/color/compressed', start.call_args.args)
+            process.wait.assert_awaited_once()
+
     async def test_ros_helper_does_not_receive_credentials_and_stale_frames_fail(self):
         for stale in (False, True):
             value = frame()
@@ -59,7 +77,8 @@ class VisionCheck(unittest.IsolatedAsyncioTestCase):
             process.wait.assert_awaited_once()
 
     async def test_tool_returns_real_sdk_image_content_and_bounds_attempts(self):
-        bot = Chatbot('http://localhost:5173')
+        feed = Mock()
+        bot = Chatbot('http://localhost:5173', camera_feed=feed)
         tool = next(tool for tool in bot.agent.tools if getattr(tool, 'name', '') == 'look_at_camera')
         arguments = json.dumps(dict(question='What object is being held?'))
         context = ToolContext(context=None, tool_name=tool.name, tool_call_id='camera-call', tool_arguments=arguments)
@@ -73,6 +92,7 @@ class VisionCheck(unittest.IsolatedAsyncioTestCase):
             zoom = json.dumps(dict(question='Inspect the object more closely.', crop=[.2, .2, .8, .8]))
             await tool.on_invoke_tool(context, zoom)
             self.assertEqual(capture.call_args.kwargs['crop'], [.2, .2, .8, .8])
+            self.assertIs(capture.call_args.kwargs['feed'], feed)
             limited = await tool.on_invoke_tool(context, arguments)
             self.assertIn('Two camera attempts', limited)
             self.assertEqual(capture.await_count, 2)

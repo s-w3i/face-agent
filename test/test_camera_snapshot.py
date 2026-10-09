@@ -1,5 +1,6 @@
 """Run with ROS sourced and /usr/bin/python3 (uses the system Pillow/ROS packages)."""
 from io import BytesIO
+import asyncio
 import importlib.util
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from camera_snapshot import capture, frame_age, prepare_image, validate_crop
+from camera_vision import CameraFeed, VisionUnavailable
 try:
     from PIL import Image
 except ImportError:
@@ -100,6 +102,91 @@ class RosCameraCheck(unittest.TestCase):
 
     def test_stale_publisher_never_supplies_visual_evidence(self):
         self.check_capture(True)
+
+
+@unittest.skipUnless(Image is not None and importlib.util.find_spec('rclpy'), 'Source ROS and run with /usr/bin/python3 and python3-pil.')
+class PersistentRosCameraCheck(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import rclpy
+        from rclpy.context import Context
+        from sensor_msgs.msg import CompressedImage
+        self.environment = patch.dict(os.environ, {'ROS_DOMAIN_ID': '96'})
+        self.environment.start()
+        self.context = Context()
+        rclpy.init(context=self.context)
+        self.node = rclpy.create_node('persistent_snapshot_test_camera', context=self.context)
+        self.topic = '/persistent_snapshot_test/color/compressed'
+        publisher = self.node.create_publisher(CompressedImage, self.topic, 1)
+        self.stopped = threading.Event()
+        self.publishing, self.stale = True, False
+        data = picture()
+
+        def publish():
+            while not self.stopped.is_set():
+                if self.publishing:
+                    message = CompressedImage()
+                    stamp = time.time() - (10 if self.stale else 0)
+                    message.header.stamp.sec = int(stamp)
+                    message.header.stamp.nanosec = int((stamp % 1) * 1_000_000_000)
+                    message.format = 'bgr8; jpeg compressed bgr8'
+                    message.data = data
+                    publisher.publish(message)
+                self.stopped.wait(.05)
+
+        self.thread = threading.Thread(target=publish)
+        self.thread.start()
+
+    async def asyncTearDown(self):
+        self.stopped.set()
+        self.thread.join(timeout=2)
+        self.node.destroy_node()
+        self.context.shutdown()
+        self.environment.stop()
+
+    async def test_warm_feed_reuses_process_crops_and_recovers_after_child_exit(self):
+        async with CameraFeed(self.topic) as feed:
+            process = feed.process
+            value = await feed.capture()
+            self.assertEqual((value['width'], value['height']), (160, 90))
+            cropped = await feed.capture([0, 0, .5, 1])
+            self.assertEqual((cropped['width'], cropped['height']), (80, 90))
+            self.assertIs(feed.process, process)
+            process.kill()
+            await process.wait()
+            recovered = await feed.capture()
+            self.assertLess(recovered['age_seconds'], 1)
+            self.assertNotEqual(feed.process.pid, process.pid)
+            owned = feed.process
+        self.assertIsNotNone(owned.returncode)
+
+    async def test_stale_stream_fails_but_same_helper_recovers_on_fresh_frames(self):
+        self.stale = True
+        async with CameraFeed(self.topic) as feed:
+            process = feed.process
+            with self.assertRaisesRegex(VisionUnavailable, 'No fresh'):
+                await feed.capture()
+            self.stale = False
+            value = await feed.capture()
+            self.assertLess(value['age_seconds'], 1)
+            self.assertIs(feed.process, process)
+
+    async def test_cancellation_discards_inflight_response_and_next_turn_recovers(self):
+        async with CameraFeed(self.topic) as feed:
+            await feed.capture()
+            process = feed.process
+            self.publishing = False
+            await asyncio.sleep(1.2)
+            task = asyncio.create_task(feed.capture())
+            await asyncio.sleep(.1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertIsNotNone(process.returncode)
+            self.assertIsNone(feed.process)
+            self.publishing = True
+            value = await feed.capture()
+            self.assertLess(value['age_seconds'], 1)
+            self.assertNotEqual(feed.process.pid, process.pid)
 
 
 if __name__ == '__main__':

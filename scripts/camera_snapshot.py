@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 DEFAULT_TOPIC = '/head_camera/color/image_raw/compressed'
@@ -96,17 +97,105 @@ def capture(topic, timeout, crop=None):
         rclpy.shutdown()
 
 
+class LatestFrame:
+    """Retain one compressed frame; decode only when a snapshot is requested."""
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.latest = None
+
+    def receive(self, message):
+        try:
+            if 'compressedDepth' in message.format:
+                return
+            stamp, _ = frame_age(message.header.stamp, time.time())
+            if not 0 < len(message.data) <= MAX_BYTES:
+                return
+            data = bytes(message.data)
+        except ValueError:
+            return
+        with self.condition:
+            self.latest = stamp, data
+            self.condition.notify_all()
+
+    def snapshot(self, topic, timeout, crop=None):
+        validate_crop(crop)
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                if self.latest is not None:
+                    stamp, data = self.latest
+                    age = time.time() - stamp
+                    if -.25 <= age <= MAX_AGE:
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f'No fresh camera image on {topic} within {timeout:g} seconds. '
+                                       'Check that the ROS camera node is running.')
+                self.condition.wait(remaining)
+        data, width, height = prepare_image(data, crop)
+        age = time.time() - stamp
+        if not -.25 <= age <= MAX_AGE:
+            raise RuntimeError('The camera frame expired during image preparation. Please try again.')
+        return dict(topic=topic, captured_at=datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+                    captured_unix=stamp, age_seconds=max(0., age), width=width, height=height, crop=crop,
+                    image_url='data:image/jpeg;base64,' + base64.b64encode(data).decode('ascii'))
+
+
+def serve(topic, timeout):
+    """Private stdin/stdout snapshot protocol owned by the chatbot process."""
+    import rclpy
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage
+    rclpy.init(args=[])
+    node = rclpy.create_node(f'kuro_camera_feed_{os.getpid()}')
+    frames = LatestFrame()
+    qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                     durability=DurabilityPolicy.VOLATILE)
+    subscription = node.create_subscription(CompressedImage, topic, frames.receive, qos)
+    stopping = threading.Event()
+
+    def spin():
+        while not stopping.is_set():
+            rclpy.spin_once(node, timeout_sec=.1)
+
+    thread = threading.Thread(target=spin, daemon=True)
+    thread.start()
+    try:
+        print(json.dumps(dict(ready=True)), flush=True)
+        for line in sys.stdin:
+            try:
+                if len(line) > 4096:
+                    raise ValueError('Snapshot request exceeds the size limit.')
+                request = json.loads(line)
+                value = frames.snapshot(topic, timeout, request.get('crop'))
+            except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as error:
+                value = dict(error=str(error))
+            print(json.dumps(value), flush=True)
+    finally:
+        stopping.set()
+        thread.join(timeout=2)
+        node.destroy_subscription(subscription)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--topic', default=DEFAULT_TOPIC)
     parser.add_argument('--timeout', type=float, default=5)
     parser.add_argument('--check', action='store_true', help='Print metadata without the image; no OpenAI request.')
+    parser.add_argument('--serve', action='store_true', help='Keep a ROS subscriber alive for private stdin snapshot requests.')
     parser.add_argument('--crop', type=float, nargs=4, metavar=('LEFT', 'TOP', 'RIGHT', 'BOTTOM'),
                         help='Inspect a normalized region of the full camera frame (0–1).')
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 15:
         parser.error('--timeout must be between 0 and 15 seconds.')
+    if args.serve and (args.check or args.crop is not None):
+        parser.error('--serve accepts crop in each request; do not combine with --check or --crop.')
     try:
+        if args.serve:
+            serve(args.topic, args.timeout)
+            return 0
         validate_crop(args.crop)
         value = capture(args.topic, args.timeout, args.crop)
         if args.check:
