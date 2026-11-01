@@ -230,7 +230,7 @@ Run this check before starting tracking on a new device:
 ./track.sh --check
 ```
 
-It checks ROS imports and actually executes both CPU models, then exits. The Pi
+It checks ROS imports and actually executes both models of the selected backend (Hailo-8L or CPU), then exits; the JSON includes `backend` and `threshold`. The Pi
 output should show `platform: aarch64`. If your active `python3` does not match
 ROS, select its interpreter, for example `TRACKING_PYTHON=/usr/bin/python3`.
 Horizontal camera coordinates are mirrored by default for the front-facing robot:
@@ -305,6 +305,25 @@ is controlled by its own terminal.
 The `--stats` output shows processed fps, mean processing time, model call counts,
 and lock state. `--duration 30` runs a bounded 30-second test. Evaluate these with
 the robot display and voice running together on the actual Pi.
+
+## Hailo-8L face backend (AI HAT)
+
+With the Raspberry Pi AI HAT (Hailo-8L), face detection (SCRFD 2.5g) and identity features (ArcFace MobileFaceNet) run on the accelerator instead of the CPU. The optical flow, speaker selection, DOA fusion, identity lock and gaze logic are unchanged.
+
+- **Selection:** `--tracker-backend auto` (default) uses the Hailo-8L when available and otherwise OpenCV, logging one line why. `hailo` prefers it the same way; `opencv` always uses the CPU models. Set `DOTS_TRACKER_BACKEND` in `~/.config/face-agent/startup.env` to choose it for chat-started tracking.
+- **Requirements:**
+  - HailoRT 4.23 and its PCIe driver (apt).
+  - **`hailort.service` running**, so the tracker and other processes share the device: `systemctl status hailort.service`.
+  - The HEFs in `/usr/local/hailo/resources/models/hailo8l/` (`scrfd_2.5g.hef`, `arcface_mobilefacenet.hef`). Override them with `DOTS_HAILO_FACE_DETECTOR` / `DOTS_HAILO_FACE_RECOGNIZER`.
+  - `./track.sh` installs the matching `hailort` Python wheel from `~/hailo-debs/` (`HAILO_WHEEL_DIR`) into the tracking environment when `hailortcli` is present.
+- **Fallback:** if the binding, the service, the device or a model is unavailable, tracking starts on OpenCV. Hailo problems never stop tracking.
+- **Threshold:** ArcFace similarities differ from SFace's, so the default is per backend: `.45` for Hailo and `.55` for OpenCV.
+  - On Hailo's three sample identities, ArcFace kept same-person pairs at ≥ .937 and different people at ≤ .04 (SFace: ≥ .836 / ≤ .16).
+  - Validate `.45` on your robot with three people before relying on it.
+- **CPU:** replaying 60 s of video through the tracker:
+  - The face-model work per frame dropped from 3.6 ms to 0.3 ms.
+  - Total tracker CPU dropped about 40%, because JPEG decoding and resizing (about 4.8 ms per frame) stay on the CPU.
+  - Measure with `~/.cache/face-agent/tracking-venv/bin/python scripts/tracker_bench.py VIDEO`.
 
 ## Validation and limits
 

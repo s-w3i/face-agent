@@ -80,7 +80,57 @@ Free CPU cores for the always-on audio threads by moving face detection and iden
 - Don't make the Hailo backend a hard requirement.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-6-hailo-tracking`.
+
+**Facts re-checked on this Pi**
+- HAILO8L, firmware 4.23.0, `hailort.service` active.
+- The `hailort` 4.23.0 wheel is now installed in the tracking venv; it brings only netaddr, netifaces, future and contextlib2, and numpy 1.26.4 / OpenCV 4.11 are unchanged.
+- Both HEFs are compiled for HAILO8L:
+  - SCRFD: 640×640×3 input; per stride 8/16/32 it outputs boxes (8 ch = 2 anchors × 4), scores (2) and landmarks (20). The layer mapping matches Hailo's postprocess: boxes `conv43/50/56`, scores `conv42/49/55`, landmarks `conv44/51/57`.
+  - ArcFace: 112×112×3 input, 512 output.
+- The hailo-apps SCRFD postprocess is LGPL-licensed (the repo itself is MIT). It was read for semantics only. `scripts/hailo_faces.py` implements the public SCRFD anchor decode itself, and nothing is imported from `~/hailo-apps`.
+- `~/calibrate_face_threshold.py` / `face_calibration.npz` belong to a different ONNX embedding model, so they don't apply to this HEF.
+
+**Implementation**
+- `human_tracker.Vision` is now `OpenCVFaceBackend` (unchanged code, plus `name`/`close`). `scripts/hailo_faces.py` adds `HailoFaceBackend`: letterbox → SCRFD → decode/NMS → YuNet-format rows; 5-point similarity alignment → ArcFace → L2-normalized vector.
+- Selection: `--tracker-backend auto|hailo|opencv` / `DOTS_TRACKER_BACKEND` (default `auto`). It reaches chat-started tracking through the inherited environment, so `chat.start_tracking()` needed no change.
+- Per-backend threshold: OpenCV .55, Hailo .45.
+- `track.sh` installs the matching hailort wheel from `~/hailo-debs` (`HAILO_WHEEL_DIR`) when `hailortcli` is present.
+- `cv2.setNumThreads(--threads)` now applies to both backends. On the Hailo path, OpenCV had defaulted to 4 threads.
+- **Robustness:**
+  - At startup, a missing binding, HEF (`DOTS_HAILO_FACE_DETECTOR/RECOGNIZER`) or service → OpenCV, with one log line.
+  - Mid-session, a HailoRT error → close, wait 1.5 s, reconnect and retry once. If that fails, `HailoUnavailable` → the tracker swaps to OpenCV for the session and relocks, since features aren't comparable.
+
+**Checks**
+- [x] Full suites green: `.venv` 216 (the only errors are the cv2-only files); tracking venv `test_human_tracker` OK, `test_tracking_models` OK (1 skip), `test_hailo_faces` 12 OK. The Hailo tests need no device:
+  - decode of hand-built tensors including NMS;
+  - row-major anchor order;
+  - letterbox and region mapping;
+  - template alignment is the identity;
+  - cosine;
+  - real `detect()`/`feature()` paths with fake tensors driving a `PersonTracker` lock;
+  - fallback with one line;
+  - reconnect then success, reconnect then `HailoUnavailable`;
+  - mid-session swap.
+- Decode validated on Hailo's 9 sample face photos against YuNet: box IoU 0.81–0.96, landmarks within 1.4–5% of face width. Detection doesn't depend on RGB/BGR. ArcFace separates identities best with **RGB** input.
+- [~] CPU and FPS. `scripts/tracker_bench.py`, 60 s of `face_recognition.mp4` at 15 fps with the live JPEG decode included; detector and identity call counts identical (83/49):
+
+  | Per frame | OpenCV | Hailo |
+  | --- | --- | --- |
+  | Total tracker CPU | 8.44 ms | **5.14 ms (−39%)** |
+  | Face-model work (total minus the 4.84 ms of decode/resize/gray) | 3.60 ms | **0.30 ms (−92%)** |
+
+  Per call: full-frame detection 20 ms CPU (YuNet) vs 11.5 ms (Hailo, 21 ms wall); identity 67 ms (SFace) vs **3.7 ms** (ArcFace); region re-detection 3.3 ms vs 13 ms.
+  - **The −50% total target isn't met:** more than half of the tracker's CPU is decoding and resizing frames, which no face backend touches.
+  - Live, awake with nobody in view: about 13% of a core, the same as the BASELINE 13.7%. That load is decode-dominated, and this robot uses the RGB-D profile, which decodes 1280×720 JPEGs.
+- [ ] Identity lock across 3 people with no swaps in 5 min at .45. **Pending the owner** (needs people). On the sample photos: same person ≥ .937, different ≤ .040.
+- [~] Sharing the 8L between processes works (a concurrent benchmark ran at full speed alongside the tracker), **but HailoRT 4.23's `hailort.service` crashed (SEGV/ABRT, auto-restarted by systemd) four times today**, each time when *another* client process tore down its session.
+  - The first run crashed the tracker (uncaught `HAILO_RPC_FAILED`).
+  - After adding reconnect/fallback, the same scenario left the tracker running on Hailo (same PID).
+- [x] HAT unavailable (`DOTS_HAILO_FACE_DETECTOR=/nonexistent.hef ./track.sh --check`, since stopping `hailort.service` needs root): one line, `"backend": "opencv"`, threshold .55, tracking works.
 
 ## Open issues
-_(Fill in.)_
+- **`hailort.service` 4.23 crashes when a sharing client exits.** Check this against the next HailoRT release. Until then, phase 7 should keep a single long-lived Hailo client per process and tolerate service restarts.
+- The biggest remaining tracker CPU saving is outside the face backend: decode JPEGs at reduced resolution (`cv2.IMREAD_REDUCED_COLOR_2/4`), since the tracker works at 320 px. That has to be checked against identity accuracy, because features are taken from the full-resolution frame. Not changed (tracking logic out of scope).
+- Region re-detection is cheaper on the CPU (YuNet 3.3 ms vs SCRFD 13 ms). A hybrid (CPU for small regions) could save about 3% of a core while a person is tracked.
+- UINT8 outputs would save about 1.6 ms of CPU per detection (measured). Not done.

@@ -18,7 +18,8 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
-from human_tracker import PersonTracker, Vision
+from human_tracker import BACKEND_THRESHOLDS, PersonTracker, fall_back_to_cpu, make_backend
+from hailo_faces import HailoUnavailable
 from setup_tracking import MODEL_DIR, model_paths
 
 
@@ -146,7 +147,11 @@ def main():
     parser.add_argument('--raw', action='store_true', help='Subscribe to sensor_msgs/Image instead of CompressedImage.')
     parser.add_argument('--mirror', action=argparse.BooleanOptionalAction, default=True,
                         help='Mirror camera X for a front-facing robot (default: on); --no-mirror keeps camera X unchanged.')
-    parser.add_argument('--threshold', type=float, default=.55, help='SFace cosine match threshold; validate on your robot (default: .55).')
+    parser.add_argument('--tracker-backend', choices=['auto', 'hailo', 'opencv'],
+                        default=os.environ.get('DOTS_TRACKER_BACKEND', 'auto'),
+                        help='Face detection/identity: Hailo-8L (falls back to OpenCV if unavailable) or OpenCV on the CPU.')
+    parser.add_argument('--threshold', type=float,
+                        help='Identity cosine threshold (default: .55 for OpenCV SFace, .45 for Hailo ArcFace); validate on your robot.')
     parser.add_argument('--threads', type=int, default=1, help='OpenCV CPU threads (default: 1).')
     parser.add_argument('--check', action='store_true', help='Check ROS imports and warm both CPU models, then exit.')
     parser.add_argument('--duration', type=float, default=0, help='Stop after this many seconds; zero runs until Ctrl+C.')
@@ -155,8 +160,8 @@ def main():
     args.topic = args.topic or '/head_camera/color/image_raw' + ('' if args.raw else '/compressed')
     if urlparse(args.url).hostname not in ('localhost', '127.0.0.1', '::1'):
         parser.error('--url must be the robot service on this device (localhost).')
-    if not math.isfinite(args.threshold) or not .363 <= args.threshold <= .95:
-        parser.error('--threshold must be between .363 and .95.')
+    if args.threshold is not None and (not math.isfinite(args.threshold) or not .2 <= args.threshold <= .95):
+        parser.error('--threshold must be between .2 and .95.')
     if not 1 <= args.threads <= 4 or not math.isfinite(args.duration) or args.duration < 0:
         parser.error('Use 1–4 CPU threads and a nonnegative, finite duration.')
     try:
@@ -177,17 +182,20 @@ def main():
         if lock is None:
             print('Tracker already running for this robot service; using the existing tracker.', flush=True)
             return 0
-    vision = Vision(*paths, threads=args.threads)
+    vision = make_backend(args.tracker_backend, paths, args.threads, log=lambda line: print(line, flush=True))
+    if args.threshold is None:
+        args.threshold = BACKEND_THRESHOLDS[vision.name]
     if args.check:
         blank = np.zeros((240, 320, 3), dtype=np.uint8)
         vision.detect(blank)
         face = np.array([80, 40, 120, 150, 115, 90, 165, 90, 140, 120, 120, 155, 160, 155, 1], dtype=np.float32)
         feature = vision.feature(blank, face, 1)
         if not np.isfinite(feature).all():
-            raise ValueError('SFace returned invalid features.')
+            raise ValueError('The identity model returned invalid features.')
         print(json.dumps(dict(platform=platform.machine(), python=sys.version.split()[0], opencv=cv2.__version__,
                               threads=cv2.getNumThreads(), ros='available', models='loaded and executed', topic=args.topic,
-                              mirror=args.mirror)))
+                              mirror=args.mirror, backend=vision.name, threshold=args.threshold)))
+        vision.close()
         return 0
     frames = LatestFrame(); calibration = LatestFrame()
     link = RobotLink(args.url); tracker = PersonTracker(vision, args.threshold, args.mirror)
@@ -204,8 +212,8 @@ def main():
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
-    print(f'Shiro tracker · {args.topic} → {args.url} · one CPU thread' if args.threads == 1 else
-          f'Shiro tracker · {args.topic} → {args.url} · {args.threads} CPU threads', flush=True)
+    where = 'Hailo-8L' if vision.name == 'hailo' else ('one CPU thread' if args.threads == 1 else f'{args.threads} CPU threads')
+    print(f'Shiro tracker · {args.topic} → {args.url} · {where} · identity threshold {args.threshold:g}', flush=True)
     print('Words mode locks a person until sleep; voice mode confirms speakers using DOA hints. No camera images or identity features are saved.', flush=True)
     try:
         spin.start(); link.thread.start()
@@ -232,6 +240,11 @@ def main():
                     if time.monotonic() - value[2] > .35:
                         packet = dict(detected=False)
                     camera_error = False
+                except HailoUnavailable as error:
+                    # Tracking must never stop because of the accelerator.
+                    print(f'Hailo face backend failed ({error}); switching to OpenCV on the CPU.', flush=True)
+                    vision = fall_back_to_cpu(tracker, paths, args.threads)
+                    args.threshold = tracker.threshold
                 except (ValueError, cv2.error) as error:
                     tracker.lost()
                     if not camera_error:
@@ -258,6 +271,7 @@ def main():
         executor.shutdown(timeout_sec=2); spin.join(timeout=2); rclpy.shutdown()
         node.destroy_subscription(subscription); node.destroy_subscription(info_subscription); node.destroy_node()
         tracker.reset()
+        vision.close()
         lock.close()
         print('Tracker stopped; original eyes restored.', flush=True)
     return 0

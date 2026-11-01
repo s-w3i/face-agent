@@ -285,6 +285,8 @@ Choose **one** camera launcher:
 
 Both profiles support the current USB 2 connection. The RGB-D profile disables frame sync and colored point clouds and uses laser energy level 5, which was stable in testing on this Pi. These are requested rates; delivered FPS depends on the cable, hub, USB power, scene, and processing load. Only one process can own the camera.
 
+**AI HAT (Hailo-8L):** face detection and identity features run on the Hailo-8L when it's available (`DOTS_TRACKER_BACKEND=auto`, the default), and on the CPU with OpenCV otherwise (`DOTS_TRACKER_BACKEND=opencv`). Sharing the chip needs `hailort.service` to be active. If the accelerator or its service fails while tracking, the tracker reconnects once and then continues on the CPU for the rest of the session. See [docs/human-tracking.md](docs/human-tracking.md#hailo-8l-face-backend-ai-hat) for the identity threshold and measurements.
+
 Launch arguments can override the profile, for example:
 
 ```bash
