@@ -50,6 +50,7 @@ class VoiceInput:
         self.reader = self.guard = None
         self.ready = None; self.failed = None; self.closing = False; self.replacing = False
         self.inputs = asyncio.Queue(maxsize=8)
+        self.barge_ins = asyncio.Queue(maxsize=1)  # Wake hits while awake (phase 4 barge-in).
         self.controls = {}; self.sequence = 0; self.control_lock = asyncio.Lock()
         self.restart_lock = asyncio.Lock()
         self.held = status_driven; self.paused = True; self.accepting = False
@@ -178,7 +179,7 @@ class VoiceInput:
                 await self.stop_microphone()
                 self.awake = awake
                 self.hint = None; self.partials.clear()
-                for events in (self.inputs, self.activity):
+                for events in (self.inputs, self.activity, self.barge_ins):
                     while not events.empty():
                         events.get_nowait()
                 await self.publish_text('')
@@ -222,8 +223,11 @@ class VoiceInput:
                     incomplete = RuntimeError('Microphone transcription failed; local audio remains in test-output/.')
                     self.accepting = False
                 elif status == 'wake_detected' and event.get('mode') == 'awake':
-                    # Phase 3 logs awake hits only; phase 4 turns them into barge-in.
+                    # Passed through even while capture is paused: chat decides on barge-in
+                    # from the robot status. One pending hit is enough.
                     print(f"Wake word heard while awake (score {event.get('score', 0):.2f}).", flush=True)
+                    if not self.barge_ins.full():
+                        self.barge_ins.put_nowait(WakeWord(event.get('score'), event.get('t')))
                 elif status == 'microphone_error':
                     if event.get('category') == 'realtime_unavailable':
                         raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'),
@@ -431,8 +435,9 @@ class VoiceInput:
             async with self.restart_lock:
                 self.held = True
                 self.hint = None; self.partials.clear()
-                while not self.inputs.empty():
-                    self.inputs.get_nowait()
+                for events in (self.inputs, self.barge_ins):
+                    while not events.empty():
+                        events.get_nowait()
                 event = await self.send_control(dict(mode='awake' if awake else 'sleep'), 120)
                 error = event.get('error')
                 if error:

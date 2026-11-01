@@ -568,6 +568,9 @@ for line in sys.stdin:
         else:
             mode=control['mode']; ack['active_mode']=mode
         print(json.dumps(ack), flush=True)
+        if mode=='awake' and '--awake-hit' in args:
+            # The robot is thinking: capture is paused, but the wake word is still heard.
+            print(json.dumps(dict(status='wake_detected', score=.97, t=55.0, mode='awake', paused=True)), flush=True)
     elif 'capture' in control:
         ok=mode=='awake' and not paused
         print(json.dumps(dict(status='microphone_control', **control, accepted=ok, paused=paused)), flush=True)
@@ -642,6 +645,20 @@ class LongLivedWorkerTest(VoiceIntegrationTest):
                 await voice.set_awake(True)  # The same worker connects on the next attempt.
                 self.assertTrue(voice.awake)
         self.assertEqual(len(self.commands), 1)
+
+    async def test_awake_wake_hit_reaches_barge_in_queue_while_paused(self):
+        env, exec_patch, log, out = self.patches(self.spawn_child(extra=('--awake-hit',)))
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out:
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.hold(True)
+                await voice.set_awake(True)
+                self.assertTrue(voice.paused)
+                wake = await asyncio.wait_for(voice.barge_ins.get(), 3)
+                self.assertEqual((wake.score, wake.t), (.97, 55.0))
+                self.assertTrue(voice.inputs.empty())  # Never treated as a command or display text.
+                self.assertEqual(self.server.listening_text['text'], '')
 
     async def test_continued_wake_requests_capture_from_wake_time(self):
         model = Path(self.directory.name) / 'wake/hi_kuro.onnx'

@@ -639,6 +639,7 @@ async def serve(args, dev):
     led = realtime = transcriber = wake = recorder = controller = None
     backends = {}
     clip_count = 0
+    led_hold = 0.0  # Keep barge-in LED feedback visible briefly.
     producer = AudioProducer(AudioBus(ring_seconds=RING_SECONDS), device, RATE, FRAME_SAMPLES)
 
     async def open_realtime():
@@ -705,7 +706,7 @@ async def serve(args, dev):
                 raise producer.failed
             if wake and wake.error:
                 raise wake.error
-            if led and not state.capturing and recorder.armed.is_set():
+            if led and not state.capturing and recorder.armed.is_set() and time.monotonic() >= led_hold:
                 led.off() if state.paused else led.set_state(led.states.IDLE)
             try:
                 item = await asyncio.wait_for(handoff.get(), .05)
@@ -778,7 +779,11 @@ async def serve(args, dev):
                     if args.once:
                         break
                 else:
+                    # Even while capture is paused (THINKING/SPEAKING): chat decides on barge-in.
                     emit({**hit, 'mode': 'awake', 'paused': state.paused})
+                    if led:
+                        led.set_state(led.states.LISTEN)
+                        led_hold = time.monotonic() + 1.5
     finally:
         if recorder:
             await asyncio.to_thread(recorder.stop)

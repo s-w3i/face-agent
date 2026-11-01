@@ -1,6 +1,6 @@
 """Cached acknowledgment playback needs no cloud generation or navigation call."""
 import asyncio
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.error import HTTPError
 
@@ -165,6 +166,118 @@ class WakeLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.transitions, [])
         bot.reply.assert_not_awaited()
         voice.set_awake.assert_not_awaited()
+
+
+
+class BargeInTest(unittest.IsolatedAsyncioTestCase):
+    """Wake word during THINKING/SPEAKING (phase 4). No network: request/speech are fakes."""
+
+    async def run_turn(self, *, during='THINKING', speaking_flag=False, barge_flag=True, initial='IDLE',
+                       external=None):
+        status = Authority()
+        status.current = Status(initial, 1, 'startup')
+        inputs = asyncio.Queue()
+        inputs.put_nowait('Tell me a long story.')
+        async def read(timeout=None, notices=None):
+            return await inputs.get()
+        voice = Mock(read=AsyncMock(side_effect=read), hold=AsyncMock(), set_awake=AsyncMock(),
+                     follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                     start_capture=AsyncMock(return_value=True), barge_ins=asyncio.Queue(maxsize=1))
+        reached = asyncio.Event()
+        finish = asyncio.Event()  # Without a barge-in the turn completes normally.
+        async def reply(text, motion_update=False):
+            if during == 'THINKING':
+                reached.set()
+                await finish.wait()
+            return 'Once upon a time…'
+        says = []
+        def api(url, action, value=None):
+            if action == 'status':
+                return dict(robotStatus=dict(revision=status.current.revision))
+            says.append(action)
+            return dict(displays=1, generation='g', sequence=1)
+        async def playback(speech, url):
+            if during == 'SPEAKING':
+                reached.set()
+                await finish.wait()
+            return True
+        bot = Mock(reply=AsyncMock(side_effect=reply), sleep_requested=False, history=[{'role': 'user', 'content': 'x'}])
+        args = SimpleNamespace(url='local', model=None, speak=True, barge_in=barge_flag, barge_in_speaking=speaking_flag)
+        output = io.StringIO()
+        with patch('chat.Chatbot', return_value=bot), patch('chat.robot_name', return_value='Kuro'), \
+                patch('chat.request', side_effect=api), patch('chat.wait_for_speech', side_effect=playback), \
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            task = asyncio.create_task(status_chat_loop(args, status, voice=voice))
+            await asyncio.wait_for(reached.wait(), 2)
+            if external:
+                # Another node (e.g. navigation) publishes at the same moment.
+                status.current = Status(external, status.current.revision + 1, 'navigation')
+                status.events.put_nowait(status.current)
+                status.transitions.append(external)
+            voice.barge_ins.put_nowait(WakeWord(.95, 20.0))
+            await asyncio.sleep(.2)
+            finish.set()  # A reply that completes after the barge-in must still go nowhere.
+            await asyncio.sleep(.2)
+            inputs.put_nowait('/quit')
+            self.assertEqual(await asyncio.wait_for(task, 3), 0)
+        return status, voice, bot, says, output.getvalue()
+
+    async def test_barge_in_during_thinking_cancels_the_turn_and_listens(self):
+        status, voice, bot, says, output = await self.run_turn()
+        self.assertEqual(status.transitions, ['THINKING', 'LISTENING'])
+        self.assertNotIn('say', says)
+        self.assertNotIn('ERROR', status.transitions)
+        voice.start_capture.assert_awaited_once()
+        self.assertAlmostEqual(voice.start_capture.call_args.args[0], 20.05)
+        self.assertEqual(bot.history, [{'role': 'user', 'content': 'x'}])  # Unchanged: the turn never finished.
+        self.assertIn('Barge-in during THINKING', output)
+
+    async def test_speaking_is_not_interrupted_without_the_aec_flag(self):
+        status, voice, bot, says, output = await self.run_turn(during='SPEAKING')
+        self.assertEqual(status.transitions, ['THINKING', 'SPEAKING', 'IDLE'])
+        voice.start_capture.assert_not_awaited()
+        self.assertIn('no barge-in', output)
+
+    async def test_barge_in_during_speaking_when_enabled(self):
+        status, voice, bot, says, _ = await self.run_turn(during='SPEAKING', speaking_flag=True)
+        self.assertEqual(status.transitions, ['THINKING', 'SPEAKING', 'LISTENING'])
+        self.assertNotIn('ERROR', status.transitions)
+        self.assertNotIn('IDLE', status.transitions)
+        voice.start_capture.assert_awaited_once()
+        self.assertEqual(bot.history[-1]['role'], 'system')  # The interruption is noted for the agent.
+
+    async def test_flag_off_ignores_the_wake_word(self):
+        status, voice, _, _, output = await self.run_turn(barge_flag=False)
+        self.assertEqual(status.transitions, ['THINKING', 'SPEAKING', 'IDLE'])
+        voice.start_capture.assert_not_awaited()
+
+    async def test_wake_word_in_other_states_changes_nothing(self):
+        for state in ('IDLE', 'LISTENING', 'WORKING', 'DETECTING'):
+            with self.subTest(state=state):
+                status = Authority()
+                status.current = Status(state, 1, 'startup')
+                inputs = asyncio.Queue()
+                async def read(timeout=None, notices=None):
+                    return await inputs.get()
+                voice = Mock(read=AsyncMock(side_effect=read), hold=AsyncMock(), set_awake=AsyncMock(),
+                             follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                             start_capture=AsyncMock(), barge_ins=asyncio.Queue(maxsize=1))
+                with patch('chat.Chatbot'), patch('chat.request'), redirect_stdout(io.StringIO()):
+                    task = asyncio.create_task(status_chat_loop(
+                        SimpleNamespace(url='local', model=None, speak=True), status, voice=voice))
+                    await asyncio.sleep(.05)
+                    voice.barge_ins.put_nowait(WakeWord(.9, 1.0))
+                    await asyncio.sleep(.1)
+                    inputs.put_nowait('/quit')
+                    self.assertEqual(await asyncio.wait_for(task, 3), 0)
+                self.assertEqual(status.transitions, [])
+                voice.start_capture.assert_not_awaited()
+
+    async def test_navigation_status_at_the_same_moment_wins(self):
+        status, voice, _, _, _ = await self.run_turn(external='WORKING')
+        self.assertEqual(status.transitions, ['THINKING', 'WORKING'])  # Navigation is never interrupted.
+        self.assertNotIn('LISTENING', status.transitions)
+        voice.start_capture.assert_not_awaited()
 
 
 if __name__ == '__main__':

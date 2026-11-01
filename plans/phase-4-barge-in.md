@@ -84,7 +84,49 @@ While Kuro is THINKING (model call, tools, camera) or SPEAKING (browser TTS), sa
 - Don't remove the hold/control gating. It still prevents command capture of the robot's own speech.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-4-barge-in`. **There's no 3.5 mm jack yet (no hardware AEC)**, so as the owner decided:
+- barge-in during **THINKING** is on by default (`DOTS_BARGE_IN`, chat `--barge-in/--no-barge-in`);
+- barge-in during **SPEAKING** is implemented and tested, but off until AEC is verified (`DOTS_BARGE_IN_SPEAKING=1`, `--barge-in-speaking`).
+
+Barge-in needs the openWakeWord engine; Whisper can't listen continuously while awake. **It's inactive until the trained `hi_kuro.onnx` is installed.** It was verified with `hey_jarvis` (temporary `startup.env`, since removed).
+
+**Implementation**
+- Worker: awake wake hits are emitted even while capture is paused, and the LED ring shows LISTEN for 1.5 s.
+- `VoiceInput.barge_ins`: a 1-slot queue for those hits, cleared on mode switches and restarts.
+- `status_chat_loop.watch_barge_in()`:
+  - On a hit in an allowed state, it publishes LISTENING with a revision check (the display then cancels pending speech) and cancels the turn.
+  - The main loop treats that cancellation as deliberate: no ERROR and no IDLE from the old turn. It then requests a capture from wake t + 0.05 s, so "…stop, what's the weather?" becomes the new request.
+  - If the revision changed first (another node), the hit is ignored.
+- History:
+  - THINKING: unchanged, because `Chatbot.reply()` only stores history after `Runner.run` completes.
+  - SPEAKING: `{"role": "system", "content": "The user interrupted your previous reply before it finished playing."}` is appended.
+- Legacy `chat_loop` (`--no-robot-status`): no barge-in (documented).
+
+**Checks**
+- [x] Full suite green: 189 tests. The only errors are the cv2-only tracker files, which pass in the tracking venv.
+  - New `BargeInTest` (7):
+    - THINKING → LISTENING with no `say`, no ERROR, history unchanged, capture at t + 0.05;
+    - a reply that completes after the barge-in is never spoken;
+    - SPEAKING isn't interrupted without the flag (THINKING → SPEAKING → IDLE);
+    - with the flag, SPEAKING → LISTENING with no ERROR/IDLE and the interruption note;
+    - `--no-barge-in`;
+    - IDLE/LISTENING/WORKING/DETECTING change nothing;
+    - navigation publishing WORKING at the same moment wins.
+  - Parent: an awake hit while paused reaches `barge_ins` and never becomes a command or display text.
+- [ ] "Hi Kuro, stop. What's the weather?" during **speech**, ≥ 9/10. **Deferred: needs the jack (AEC) and `DOTS_BARGE_IN_SPEAKING=1`.**
+- [~] Latency. The audible-silence target applies to SPEAKING (deferred).
+  - In THINKING, end of "Hey Jarvis," → LISTENING published: **median 547 ms** over 2 trials (544/549). Of that, ~530 ms is the openWakeWord detection (`wake_hit_ms`) and ~15 ms is the status publish and cancel.
+  - Re-measure with hi_kuro and the jack.
+- [x] Barge-in during THINKING cancels it: **2/2** (`voice_bench.py barge`).
+  - The interrupted "long dragon story" request was **never spoken or shown** (`stale_replies: []`).
+  - The follow-on "What time is it?" was transcribed and answered.
+- [ ] 30 min of normal conversation with 0 self-triggered barge-ins. **Pending the owner.**
+  - In these runs Kuro's own speech produced no awake wake hits: exactly 2 logged, both from the test clips.
+  - SPEAKING hits can't interrupt anything unless the AEC flag is on.
+- [x] Navigation (WORKING) is never interrupted: unit-tested, and WORKING isn't in the barge states.
+
+**OpenAI use in this phase:** 1 TTS clip (cached) and 4 turns: 2 interrupted, partly generated, plus 2 answered.
 
 ## Open issues
-_(Fill in.)_
+- SPEAKING barge-in and its 400 ms audible-silence target wait for the jack. Then run `respeaker.py doctor --aec`, set `DOTS_BARGE_IN_SPEAKING=1`, and repeat the 10-trial check (a SPEAKING variant of `voice_bench.py barge`, with `--barge-delay` placed inside the reply).
+- `phrase_end_to_listening_ms` takes the end of the wake phrase from the first pause in the synthetic clip, so it's approximate (±50 ms).

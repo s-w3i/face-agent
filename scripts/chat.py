@@ -33,6 +33,7 @@ from camera_snapshot import DEFAULT_TOPIC
 
 IDLE_SECONDS = 5.0
 WAKE_CAPTURE_OFFSET = 0.05  # Seconds after the wake hit where a follow-on command capture starts.
+INTERRUPTED_NOTE = {'role': 'system', 'content': 'The user interrupted your previous reply before it finished playing.'}
 VOICE_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
 
@@ -563,6 +564,12 @@ async def main():
     parser.add_argument('--respawn-on-wake', action=argparse.BooleanOptionalAction,
                         default=os.environ.get('DOTS_VOICE_RESPAWN', '0').strip().lower() in ('1', 'true', 'yes'),
                         help='Rollback: restart the microphone worker on every sleep/awake switch.')
+    parser.add_argument('--barge-in', action=argparse.BooleanOptionalAction,
+                        default=os.environ.get('DOTS_BARGE_IN', '1').strip().lower() not in ('0', 'false', 'no'),
+                        help='Saying the wake word while Kuro is thinking interrupts the turn (default).')
+    parser.add_argument('--barge-in-speaking', action=argparse.BooleanOptionalAction,
+                        default=os.environ.get('DOTS_BARGE_IN_SPEAKING', '0').strip().lower() in ('1', 'true', 'yes'),
+                        help='Also interrupt spoken replies. Needs the speaker on the ReSpeaker jack (hardware AEC).')
     parser.add_argument('--wake-model-path', default=os.environ.get('DOTS_WAKE_MODEL_PATH'),
                         help='openWakeWord model (default ~/.local/share/face-agent/wake/hi_kuro.onnx).')
     parser.add_argument('--language', default='en', help='Speech language code, or auto for language detection.')
@@ -698,6 +705,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
     shutdown = threading.Event()
     operation = None
     voice_restart_needed = False
+    barge = None  # (interrupted status, WakeWord) after a deliberate barge-in
+    barge_states = ('THINKING', 'SPEAKING') if getattr(args, 'barge_in_speaking', False) else ('THINKING',)
     changed = asyncio.Event()
     # The initial retained sample was already consumed by RosStatus.__aenter__.
     while not status.events.empty():
@@ -711,6 +720,25 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 changed.set()
                 if operation and not operation.done():
                     operation.cancel()
+
+    async def watch_barge_in():
+        """A wake word during THINKING (and SPEAKING when enabled) interrupts the turn."""
+        nonlocal barge
+        while True:
+            wake = await voice.barge_ins.get()
+            current = status.current
+            if not getattr(args, 'barge_in', True) or current is None or current.status not in barge_states:
+                print(f'Wake word heard during {current.status if current else "?"}; no barge-in.', flush=True)
+                continue
+            interrupted = operation
+            barge = (current.status, wake)
+            # Publishing LISTENING makes the display cancel any pending speech.
+            if not await status.set('LISTENING', expected_revision=current.revision):
+                barge = None  # Another node changed the status first; it wins.
+                continue
+            print(f'Barge-in during {current.status}: stopping and listening.', flush=True)
+            if interrupted and not interrupted.done():
+                interrupted.cancel()
 
     async def watch_voice():
         while True:
@@ -830,6 +858,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
 
     watcher = asyncio.create_task(watch_status())
     voice_watcher = asyncio.create_task(watch_voice()) if voice else None
+    barge_watcher = (asyncio.create_task(watch_barge_in())
+                     if isinstance(getattr(voice, 'barge_ins', None), asyncio.Queue) else None)
     motion_watcher = asyncio.create_task(watch_motion(simulation_server, motions)) if simulation_server else None
     print('Robot chatbot · follows /robot/status. IDLE monitors voice; LISTENING accepts commands; SLEEPING waits for Hi Kuro. /quit exits.', flush=True)
     try:
@@ -851,6 +881,15 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                         voice_restart_needed = False
                     operation = asyncio.create_task(microphone_action(voice.follow_status(current.status)))
                     await operation
+                    if barge is not None:
+                        interrupted, wake = barge
+                        barge = None
+                        if interrupted == 'SPEAKING' and bot.history:
+                            bot.history.append(dict(INTERRUPTED_NOTE))
+                        if current.status == 'LISTENING':
+                            # Keep what was said straight after "Hi Kuro" ("…stop, what's the weather?").
+                            operation = asyncio.create_task(microphone_action(voice.start_capture(wake.t + WAKE_CAPTURE_OFFSET)))
+                            await operation
                 if not accepting:
                     # Voice.read keeps /quit usable even while microphone capture is paused.
                     operation = asyncio.create_task(voice.read(None) if voice else terminal_read(None))
@@ -898,9 +937,9 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 operation = asyncio.create_task(run_turn(text, motion_update))
                 await operation
             except asyncio.CancelledError:
-                if not changed.is_set():
+                if barge is None and not changed.is_set():
                     raise
-                # Do not publish an old turn's result after another node takes control.
+                # Do not publish an old turn's result after a barge-in or another node takes control.
                 continue
             except TimeoutError:
                 if not changed.is_set():
@@ -930,6 +969,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                     if not changed.is_set():
                         raise
             except Exception as error:
+                if barge is not None:
+                    continue  # Playback stopped by our own barge-in: not an error.
                 print('Robot error: ' + str(error), file=sys.stderr)
                 if status.current and not changed.is_set():
                     await status.set('ERROR', expected_revision=status.current.revision)
@@ -944,7 +985,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 await gate(True)
             except (RuntimeError, OSError):
                 pass  # A failed/disconnected child already has input closed.
-        tasks = [task for task in (watcher, voice_watcher, motion_watcher) if task]
+        tasks = [task for task in (watcher, voice_watcher, barge_watcher, motion_watcher) if task]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

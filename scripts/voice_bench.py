@@ -366,6 +366,84 @@ def wake_trials(args):
                 cpu=cpu.report(), thermal=cpu.thermal)
 
 
+def first_pause(path, min_gap=.15):
+    """Seconds into a clip where its first pause starts (end of "Hey Jarvis," in a combined clip)."""
+    import numpy as np
+    with wave.open(str(path)) as file:
+        rate = file.getframerate()
+        pcm = np.frombuffer(file.readframes(file.getnframes()), '<i2').astype(np.float32)
+    frame = rate // 50
+    levels = [math.sqrt(float(np.mean(pcm[i:i + frame] ** 2))) for i in range(0, len(pcm) - frame, frame)]
+    loud = max(levels) * .05
+    started = quiet = None
+    for index, level in enumerate(levels):
+        if level > loud:
+            started = True
+            quiet = None
+        elif started:
+            quiet = quiet if quiet is not None else index
+            if (index - quiet + 1) / 50 >= min_gap:
+                return quiet / 50
+    return None
+
+
+def barge_trials(args):
+    """Wake, ask a long question, then say the wake phrase + a command during THINKING."""
+    if not args.allow_api:
+        raise SystemExit('barge runs paid OpenAI turns (the interrupted one and the new request); '
+                         'rerun with --allow-api and keep --trials small.')
+    config = request(args.url, 'config')
+    robot_voice = config.get('settings', {}).get('ttsVoice', 'marin')
+    voice = args.voice if args.voice != robot_voice else 'echo'
+    wake_clip = speech_clip(args.url, args.wake, voice, True)
+    question_clip = speech_clip(args.url, args.question, voice, True)
+    barge_clip = speech_clip(args.url, args.barge, voice, True)
+    phrase_end = first_pause(barge_clip)
+    print(f'OpenAI: about {2 * args.trials} conversation turns will be used.', file=sys.stderr)
+    log = LogTail(AGENT_LOG); log.start()
+    cpu = CpuSampler(args.url); cpu.start()
+    trials = []
+    ms = lambda a, b: round((a - b) * 1000) if a is not None and b is not None else None
+    try:
+        for trial in range(1, args.trials + 1):
+            if not wait_sleeping_ready(args.url, cpu):
+                trials.append(dict(trial=trial, error='robot did not settle in SLEEPING'))
+                break
+            time.sleep(args.settle)
+            t0 = time.monotonic()
+            play(wake_clip)
+            if not log.wait_for(r'Wake command input ready\.', t0, 30)[0]:
+                trials.append(dict(trial=trial, error='no wake'))
+                continue
+            time.sleep(.3)
+            t_question = time.monotonic()
+            play(question_clip)
+            if not wait_status(args.url, ('THINKING',), 20):
+                trials.append(dict(trial=trial, error='never reached THINKING'))
+                continue
+            time.sleep(args.barge_delay)
+            t_barge = time.monotonic()
+            play(barge_clip)
+            t_hit, _ = log.wait_for(r'Wake word heard while awake', t_barge, 10)
+            t_listen, _ = log.wait_for(r'Barge-in during THINKING', t_barge, 10)
+            t_you, you = log.wait_for(r'^you> ', t_barge, 30)
+            t_robot, robot = log.wait_for(r'^robot> ', t_barge, 90)
+            stale = [line for t, line in log.lines if t_question <= t < t_barge + 30 and line.startswith('robot> ')
+                     and line != robot]
+            end = t_barge + phrase_end if phrase_end is not None else None
+            result = dict(trial=trial, barged=t_listen is not None, wake_hit_ms=ms(t_hit, end),
+                          phrase_end_to_listening_ms=ms(t_listen, end), new_request=you[5:] if you else None,
+                          reply=robot[7:] if robot else None, stale_replies=stale)
+            print(f'trial {trial}: ' + json.dumps({k: v for k, v in result.items() if k != 'trial'}), flush=True)
+            trials.append(result)
+            wait_status(args.url, ('SLEEPING',), 120)
+    finally:
+        log.stop.set(); cpu.stop.set()
+    return dict(kind='barge', trials=trials, barged=sum(1 for t in trials if t.get('barged')),
+                phrase_end_to_listening_ms=summary([t.get('phrase_end_to_listening_ms') for t in trials]),
+                cpu=cpu.report(), thermal=cpu.thermal)
+
+
 def cpu_only(args):
     cpu = CpuSampler(args.url); cpu.start()
     try:
@@ -377,6 +455,10 @@ def cpu_only(args):
 
 def markdown(result):
     lines = []
+    if result['kind'] == 'barge':
+        s = result['phrase_end_to_listening_ms']
+        return (f"Barge-in: {result['barged']}/{len(result['trials'])}; end of wake phrase -> LISTENING "
+                f"median {s['median']} ms, p90 {s['p90']} ms")
     if result['kind'] == 'wake':
         lines += [f"Wake trials: {result['detected']}/{len(result['trials'])} detected "
                   f"(phrase {result['phrase']!r}, voice {result['voice']}, sink {result['sink']})", '',
@@ -418,8 +500,18 @@ def main():
     wake.add_argument('--sink', help='PulseAudio sink to monitor (default: default sink)')
     wake.add_argument('--settle', type=float, default=1.0, help='Extra seconds after the wake worker is ready')
     wake.add_argument('--wake-timeout', type=float, default=25, help='Seconds to wait for a wake detection')
+    barge = sub.add_parser('barge', help='Barge-in during THINKING (paid turns; needs --allow-api)')
+    barge.add_argument('--trials', type=int, default=2)
+    barge.add_argument('--wake', default='Hey Jarvis.')
+    barge.add_argument('--question', default='Please write me a long, detailed story about a dragon who learns to bake bread.')
+    barge.add_argument('--barge', default='Hey Jarvis, what time is it?')
+    barge.add_argument('--barge-delay', type=float, default=.5, help='Seconds into THINKING before barging in')
+    barge.add_argument('--voice', default='ash')
+    barge.add_argument('--settle', type=float, default=1.0)
+    barge.add_argument('--allow-api', action='store_true')
     args = parser.parse_args()
-    result = wake_trials(args) if args.kind == 'wake' else cpu_only(args)
+    result = (wake_trials(args) if args.kind == 'wake' else barge_trials(args) if args.kind == 'barge'
+              else cpu_only(args))
     out = Path(args.out) if args.out else ROOT / 'test-output' / 'bench' / f"{args.kind}-{time.strftime('%Y%m%d-%H%M%S')}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2))
