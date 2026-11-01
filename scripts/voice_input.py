@@ -21,22 +21,29 @@ class MicrophoneDisconnected(RuntimeError):
 class WakeWord:
     """An openWakeWord hit from the sleeping worker; never shown on the display."""
 
-    def __init__(self, score, t):
+    def __init__(self, score, t, continued=False):
         self.score = score; self.t = t
+        self.continued = continued  # The user kept talking after the phrase.
 
     def __repr__(self):
-        return f'WakeWord(score={self.score}, t={self.t})'
+        return f'WakeWord(score={self.score}, t={self.t}, continued={self.continued})'
 
 
 class VoiceInput:
     def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False,
-                 wake_engine=None, wake_model_path=None):
+                 wake_engine=None, wake_model_path=None, respawn=None):
         self.url = url; self.model = model; self.language = language
         self.forward = forward; self.clockwise = clockwise
         self.wake_model = wake_model; self.awake = status_driven
         self.wake_engine = wake_engine or os.environ.get('DOTS_WAKE_ENGINE', 'auto')
         self.wake_model_path = wake_model_path or wake_word.default_model_path()
         self.wake_choice = None
+        # Phase 3: one long-lived worker switches modes by control. DOTS_VOICE_RESPAWN=1
+        # restores the old kill-and-respawn switch (--respawn-on-wake).
+        enabled = lambda name: os.environ.get(name, '0').strip().lower() in ('1', 'true', 'yes')
+        # The legacy per-utterance stream only exists in the respawning worker.
+        self.respawn = (enabled('DOTS_VOICE_RESPAWN') or enabled('DOTS_VOICE_LEGACY_STREAM')
+                        if respawn is None else respawn)
         self.status_driven = status_driven
         self.activity = asyncio.Queue()
         self.process = self.log = None
@@ -86,12 +93,20 @@ class VoiceInput:
         self.failed = None; self.paused = True; self.accepting = False; self.sequence = 0
         self.utterance_active = False; self.turn_complete = False
         self.controls.clear()
-        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
-                   '--silence-seconds', '0.8' if self.awake else '0.4', '--max-seconds', '10', '--vad-mode', '2',
-                   '--stt-model', self.model if self.awake else self.wake_model]
-        if self.status_driven and self.awake:
-            command += ['--single-utterance']
-        if not self.awake:
+        if not self.respawn:
+            command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
+                       '--initial-mode', 'awake' if self.awake else 'sleep',
+                       '--silence-seconds', '0.8', '--sleep-silence-seconds', '0.4', '--max-seconds', '10',
+                       '--vad-mode', '2', '--stt-model', self.model, '--wake-stt-model', self.wake_model]
+            if self.status_driven:
+                command += ['--single-utterance']  # Applies to awake (Realtime) turns only.
+        else:
+            command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
+                       '--silence-seconds', '0.8' if self.awake else '0.4', '--max-seconds', '10', '--vad-mode', '2',
+                       '--stt-model', self.model if self.awake else self.wake_model]
+            if self.status_driven and self.awake:
+                command += ['--single-utterance']
+        if not self.awake or not self.respawn:
             config = await self.api('config')
             name = config.get('appearance', {}).get('name', 'Kuro')
             command += ['--stt-prompt', f'The robot is named {name}.']
@@ -186,7 +201,11 @@ class VoiceInput:
             while line := await self.process.stdout.readline():
                 event = json.loads(line)
                 status = event.get('status')
-                if status == 'microphone_control':
+                if status == 'microphone_control' and ('mode' in event or 'capture' in event):
+                    future = self.controls.pop(event['sequence'], None)
+                    if future and not future.done():
+                        future.set_result(event)
+                elif status == 'microphone_control':
                     future = self.controls.pop(event['sequence'], None)
                     if future and not future.done():
                         # Accept frames following the resume ACK in this same IPC
@@ -202,6 +221,9 @@ class VoiceInput:
                 elif status == 'transcription_incomplete':
                     incomplete = RuntimeError('Microphone transcription failed; local audio remains in test-output/.')
                     self.accepting = False
+                elif status == 'wake_detected' and event.get('mode') == 'awake':
+                    # Phase 3 logs awake hits only; phase 4 turns them into barge-in.
+                    print(f"Wake word heard while awake (score {event.get('score', 0):.2f}).", flush=True)
                 elif status == 'microphone_error':
                     if event.get('category') == 'realtime_unavailable':
                         raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'),
@@ -214,7 +236,8 @@ class VoiceInput:
                         # Local only: the score is logged, nothing reaches the display.
                         print(f"Wake word detected (score {event.get('score', 0):.2f}).", flush=True)
                         if not self.inputs.full():
-                            self.inputs.put_nowait(WakeWord(event.get('score'), event.get('t')))
+                            self.inputs.put_nowait(WakeWord(event.get('score'), event.get('t'),
+                                                            event.get('continued') is True))
                     elif status == 'utterance_started':
                         self.utterance_active = True
                         if self.awake:
@@ -300,6 +323,45 @@ class VoiceInput:
                 finally:
                     self.controls.pop(sequence, None)
 
+    async def send_control(self, payload, timeout):
+        """Send a sequence-acknowledged mode/capture control; return the worker's ack event."""
+        async with self.control_lock:
+            if self.failed:
+                raise self.failed
+            self.sequence += 1
+            sequence = self.sequence
+            future = asyncio.get_running_loop().create_future()
+            self.controls[sequence] = future
+            try:
+                self.process.stdin.write((json.dumps(dict(payload, sequence=sequence)) + '\n').encode())
+                await self.process.stdin.drain()
+                try:
+                    return await asyncio.wait_for(future, timeout)
+                except asyncio.TimeoutError:
+                    error = RealtimeUnavailable('Microphone control timed out; restarting voice input.')
+                    self.failed = error
+                    raise error from None
+            except (BrokenPipeError, ConnectionResetError):
+                await self.reader
+                raise self.failed or RuntimeError('Microphone control connection stopped.')
+            finally:
+                self.controls.pop(sequence, None)
+
+    async def start_capture(self, from_t):
+        """Start a command capture from monotonic time `from_t` (shared clock with the worker)."""
+        self.capture_refusal = None
+        if self.respawn or not self.awake:
+            self.capture_refusal = 'respawning worker' if self.respawn else 'asleep'
+            return False
+        await self.sync_playback()
+        if not self.accepting:
+            self.capture_refusal = f'input closed (held={self.held}, paused={self.paused})'
+            return False
+        event = await self.send_control(dict(capture='start', from_t=float(from_t)), 5)
+        if event.get('accepted') is not True:
+            self.capture_refusal = f"worker refused (paused={event.get('paused')})"
+        return event.get('accepted') is True
+
     async def hold(self, held):
         self.held = held
         if held:
@@ -316,6 +378,8 @@ class VoiceInput:
         """Switch STT with capture closed; sleeping audio stays local."""
         if self.awake == awake:
             return
+        if not self.respawn and not self.failed and self.process and self.process.returncode is None:
+            return await self.switch_mode(awake)
         guard = self.guard
         if guard:
             guard.cancel()
@@ -349,6 +413,39 @@ class VoiceInput:
             await self.sync_playback()
         finally:
             self.held = held; self.replacing = False
+            if guard:
+                self.guard = asyncio.create_task(self.watch_playback())
+
+    async def switch_mode(self, awake):
+        """Long-lived worker: open/close Realtime by control; no process restart."""
+        guard = self.guard
+        if guard:
+            guard.cancel()
+            await asyncio.gather(guard, return_exceptions=True)
+        held = self.held
+        try:
+            await self.control(True)
+            self.accepting = False
+            if awake:
+                print('Connecting to Realtime transcription…', flush=True)
+            async with self.restart_lock:
+                self.held = True
+                self.hint = None; self.partials.clear()
+                while not self.inputs.empty():
+                    self.inputs.get_nowait()
+                event = await self.send_control(dict(mode='awake' if awake else 'sleep'), 120)
+                error = event.get('error')
+                if error:
+                    # The worker stays in sleep mode with wake detection running.
+                    raise RealtimeUnavailable(error.get('message', 'Realtime transcription is unavailable.'),
+                                              retryable=error.get('retryable', True) is True)
+                self.awake = event.get('active_mode') == 'awake'
+            if awake:
+                print('Realtime transcription ready.', flush=True)
+            self.held = held
+            await self.sync_playback()
+        finally:
+            self.held = held
             if guard:
                 self.guard = asyncio.create_task(self.watch_playback())
 

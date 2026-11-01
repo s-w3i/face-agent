@@ -101,7 +101,49 @@ class CancelScope:                       # owns "the current" token
 - Don't block the PortAudio callback or the asyncio loop on STT.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-3-single-worker`. There's still no 3.5 mm jack and no trained `hi_kuro` model, so openWakeWord checks used `hey_jarvis` (temporary `startup.env` lines, removed afterwards).
+
+**Design decisions and deviations**
+- **Follow-on command without AEC.** The plan's "capture from the wake time across the cached ack" would record Kuro's own "Yes? I am here…" (there's no AEC yet) and send it to Realtime as user speech. Instead:
+  - After an openWakeWord hit the worker checks whether you keep talking: 160 ms of speech means yes, 400 ms of silence means no, so a comma pause doesn't end the check.
+  - If you do keep talking, `wake_detected` carries `continued: true`. Chat then **skips the spoken ack**, switches to awake and sends `{"capture":"start","from_t": wake_t + 0.05}`. The recording comes from the ring buffer, now 8 s, so nothing plays over you and nothing is lost.
+  - A plain "Hi Kuro" still gets the cached ack. This works the same with or without the jack.
+- **A Realtime failure on `mode: awake`** comes back as an error in the mode **ack** (`error.category = realtime_unavailable`), not as a `microphone_error` event. The existing parent treats `microphone_error` as worker death, and here the worker stays alive in sleep mode with T2 running. The parent raises `RealtimeUnavailable` from `set_awake`, so the callers' handling is unchanged.
+- **The Whisper wake engine** also uses the single worker: Whisper `small` is loaded once and kept, about 390 MB RSS.
+- The old path stays behind `DOTS_VOICE_RESPAWN=1` / chat `--respawn-on-wake` (`respeaker.py` without `--initial-mode` = the old `listen()`). `DOTS_VOICE_LEGACY_STREAM=1` implies it.
+- A capture request replaces a hardware-VAD recording that started less than 1.5 s earlier, because it's the same speech and more.
+
+**Checks**
+- [x] Full suite green: 182 tests. The only errors are the cv2-only tracker files, which pass in the tracking venv.
+  - New `test_cancel.py` and `test_respeaker_worker.py` (11 tests, on a real AudioProducer with a fake stream): mode switch, Realtime failure keeps sleep + T2, VAD capture → Realtime → paused_after, pause mid-recording discards, cancel during `finish()` suppresses, capture from `from_t`, capture refused while asleep, continued/plain wake, comma pause, capture replaces a fresh VAD recording.
+  - In `test_voice_input.py`: a single spawn across 4 mode switches, a Realtime failure keeps the same process, a continued wake → `start_capture`. The respawn-protocol tests are pinned to `DOTS_VOICE_RESPAWN=1`.
+  - `test_fast_wake.py`: a continued wake skips the ack (transitions `['IDLE']`) and requests the capture at t + 0.05.
+  - The recovery tests still do a full restart.
+- [x] Sleep → awake switch with no respawn, `scripts/voice_mode_cycles.sh` (IDLE set via `/robot/set_status` → "Realtime transcription ready."; each figure includes about 1 s of `ros2` CLI startup):
+
+  | Path | Median | Max | Worker |
+  | --- | --- | --- | --- |
+  | Old respawn (`DOTS_VOICE_RESPAWN=1`, 10 cycles) | **6.06 s** | 6.36 s | a new PID every cycle |
+  | Long-lived (50 cycles) | **1.92 s** | 2.16 s | one PID |
+
+  That's about 4.1 s saved per switch, more than the old worker startup. Falling asleep no longer leaves a deaf gap while Whisper reloads.
+  - "Wake command input ready." after a *plain* wake: 12434 ms (Whisper, 10 trials) versus 13289 ms at BASELINE. It's capped by the 3 s cached ack, which the respawn already overlapped.
+  - After a *continued* openWakeWord wake (no ack): **0.7–1.1 s** after the sentence ends.
+- [x] "Hey Jarvis, what time is it?" in one breath: **3/3 answered** (2 trials, plus 1 diagnostic).
+  - A local Whisper transcription of the saved follow-on capture shows it starts exactly at "What" (0.00 s), with no wake-phrase tail and no clipping.
+  - Plain "Hey Jarvis.": 6/6 got the ack and were not treated as continued.
+  - With the Whisper engine, "Hi Kuro, what time is it?" already worked through the transcript remainder; that's unchanged.
+- [x] 50 sleep↔awake cycles: **threads constant at 15**, one PID, **RSS +2.5 MB** (389.8 → 392.3 MB).
+- [x] IDLE hardware-VAD commands: 0.8 s endpoint, 10 s cap, partials, single utterance, all unchanged (worker tests plus the live runs above).
+
+**Bugs found and fixed during the live checks**
+- A continued wake waited on the skipped ack's playback, so `wait_for_speech(None)` returned False and the robot went to ERROR. Fixed; the test's playback stub now behaves like the real helper.
+- `chat.microphone_action()` never returned its task's result, so the follow-on capture logged "not accepted" even though it had been accepted. Fixed and asserted.
+- **Found by accident, older than this work:** `test_chat.ChatCheck.test_sleep_wake_three_second_inactivity_and_closing_message` ran `chat.main()` against the **live** service (`DOTS_URL` default :5173) and switched it to words mode. That is the "Voice input paused while the robot service is unavailable" state seen at the start of this work, and after every suite run. `ChatCheck` now points `DOTS_URL` at a closed port; a full suite run leaves the live robot in voice mode.
+
+**OpenAI use in this phase:** 1 TTS clip (cached) and 4 conversation turns (3 one-breath trials plus 1 that errored before replying), plus the Realtime sockets that waking opens.
 
 ## Open issues
-_(Fill in.)_
+- The continuation check delays a *plain* openWakeWord wake by about 0.3–0.4 s: detection log 720–870 ms with `hey_jarvis`, versus 432 ms in phase 2. Tunable with `--wake-continuation` (0 disables) and the `speech_continues` silence window.
+- In SPEAKING the hardware-VAD capture is gated by the pause, as before. Barge-in is phase 4.
+- `voice_mode_cycles.sh` timings include the `ros2` CLI startup. Only the difference between the two paths is meaningful.

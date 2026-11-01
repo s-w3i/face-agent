@@ -32,6 +32,7 @@ from camera_vision import CameraFeed, capture_camera, VisionUnavailable, without
 from camera_snapshot import DEFAULT_TOPIC
 
 IDLE_SECONDS = 5.0
+WAKE_CAPTURE_OFFSET = 0.05  # Seconds after the wake hit where a follow-on command capture starts.
 VOICE_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
 
@@ -559,6 +560,9 @@ async def main():
     parser.add_argument('--wake-model', default=os.environ.get('DOTS_WAKE_MODEL', 'small'), help='Local Whisper model/directory for the Hi {name} wake phrase.')
     parser.add_argument('--wake-engine', choices=['auto', 'oww', 'whisper'], default=os.environ.get('DOTS_WAKE_ENGINE', 'auto'),
                         help='auto: openWakeWord when its model matches the robot name, otherwise local Whisper.')
+    parser.add_argument('--respawn-on-wake', action=argparse.BooleanOptionalAction,
+                        default=os.environ.get('DOTS_VOICE_RESPAWN', '0').strip().lower() in ('1', 'true', 'yes'),
+                        help='Rollback: restart the microphone worker on every sleep/awake switch.')
     parser.add_argument('--wake-model-path', default=os.environ.get('DOTS_WAKE_MODEL_PATH'),
                         help='openWakeWord model (default ~/.local/share/face-agent/wake/hi_kuro.onnx).')
     parser.add_argument('--language', default='en', help='Speech language code, or auto for language detection.')
@@ -614,7 +618,8 @@ async def main():
             status = await stack.enter_async_context(RosStatus()) if args.robot_status else None
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
                 args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None,
-                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path)) if args.mode == 'voice' else None
+                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path,
+                respawn=args.respawn_on_wake)) if args.mode == 'voice' else None
             if status:
                 if voice:
                     if args.speak:
@@ -728,7 +733,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         # Finish capture/mode handshakes even if another ROS node interrupts.
         task = asyncio.create_task(action)
         try:
-            await asyncio.shield(task)
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             await task
             raise
@@ -776,10 +781,15 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
             raise RuntimeError('Speech playback failed or was interrupted.')
         await set_state('SLEEPING' if closing else 'IDLE')
 
-    async def wake_up():
+    async def wake_up(wake=None):
+        # "Hi Kuro, what time is it?": the user is still talking, so skip the spoken ack
+        # (no robot audio over the command, which matters without hardware AEC) and
+        # capture straight from the ring buffer instead.
+        continued = (isinstance(wake, WakeWord) and wake.continued and voice is not None
+                     and getattr(voice, 'respawn', False) is not True)
         if voice:
             await gate(True)
-        if args.speak:
+        if args.speak and not continued:
             await set_state('SPEAKING')
             await wait_display(status.current.revision)
             speech = await asyncio.to_thread(request, args.url, 'wake-ack',
@@ -791,7 +801,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         # immediately from disk, without a cloud greeting or TTS request.
         connecting = asyncio.create_task(microphone_action(voice.set_awake(True))) if voice else None
         try:
-            if args.speak and not await wait_for_speech(speech, args.url):
+            if speech is not None and not await wait_for_speech(speech, args.url):
                 raise RuntimeError('Wake acknowledgment playback failed or was interrupted.')
             if connecting:
                 await connecting
@@ -806,6 +816,11 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 await asyncio.gather(connecting, return_exceptions=True)
         await set_state('IDLE')
         print('Wake command input ready.', flush=True)
+        if continued:
+            await gate(False)
+            if not await microphone_action(voice.start_capture(wake.t + WAKE_CAPTURE_OFFSET)):
+                print('Follow-on command capture was not accepted (' + str(getattr(voice, 'capture_refusal', None)) +
+                      '); listening normally.', flush=True)
 
     async def run_turn(text, motion_update):
         try:
@@ -857,8 +872,9 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                     continue  # Phase 2: a wake hit outside SLEEPING is only logged.
                 if current.status == 'SLEEPING' and isinstance(text, WakeWord):
                     # openWakeWord already matched the phrase; same path as a bare "Hi Kuro".
-                    print('Wake phrase detected; Kuro is awake.', flush=True)
-                    operation = asyncio.create_task(wake_up())
+                    print('Wake phrase detected; Kuro is awake.' +
+                          (' Capturing the rest of the sentence.' if text.continued else ''), flush=True)
+                    operation = asyncio.create_task(wake_up(text))
                     await operation
                     continue
                 if current.status == 'SLEEPING':
@@ -1010,6 +1026,8 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
                     print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
                     continue
                 await voice.hold(False)
+                if text.continued and not voice.respawn:
+                    await voice.start_capture(text.t + WAKE_CAPTURE_OFFSET)
                 continue
             if isinstance(text, WakeRequest):
                 if time.monotonic() >= text.expires:

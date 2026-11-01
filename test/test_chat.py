@@ -25,6 +25,12 @@ from agents.tool_context import ToolContext
 
 class ChatCheck(unittest.TestCase):
     def setUp(self):
+        # main() defaults to the live robot service (DOTS_URL or :5173); point it at a closed
+        # port so a test that doesn't patch chat.request can never switch the real robot to
+        # words mode.
+        url = patch.dict(os.environ, {'DOTS_URL': 'http://127.0.0.1:9'})
+        url.start()
+        self.addCleanup(url.stop)
         tracking = patch('chat.start_tracking')
         self.tracking = tracking.start()
         self.addCleanup(tracking.stop)

@@ -120,15 +120,18 @@ class WakeLoopTest(unittest.IsolatedAsyncioTestCase):
         status = Authority()
         status.current = Status(initial, 1, 'startup')
         voice = Mock(read=AsyncMock(side_effect=inputs), hold=AsyncMock(), set_awake=AsyncMock(),
-                     follow_status=AsyncMock(), activity=asyncio.Queue())
+                     follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                     start_capture=AsyncMock(return_value=True))
         def api(url, action, value=None):
             if action == 'status':
                 return dict(robotStatus=dict(revision=status.current.revision))
             return dict(displays=1, generation='g', sequence=1)
         bot = Mock(reply=AsyncMock(return_value='Hello.'), sleep_requested=False)
         output = io.StringIO()
+        async def playback(speech, url):
+            return speech is not None  # Like the real helper: no clip means nothing played.
         with patch('chat.Chatbot', return_value=bot), patch('chat.robot_name', return_value='Kuro'), \
-                patch('chat.request', side_effect=api), patch('chat.wait_for_speech', AsyncMock(return_value=True)), \
+                patch('chat.request', side_effect=api), patch('chat.wait_for_speech', side_effect=playback), \
                 redirect_stdout(output):
             from types import SimpleNamespace
             self.assertEqual(await asyncio.wait_for(status_chat_loop(
@@ -142,6 +145,20 @@ class WakeLoopTest(unittest.IsolatedAsyncioTestCase):
         bot.reply.assert_not_awaited()
         self.assertIn('Wake phrase detected; Kuro is awake.', output)
         self.assertIn('Wake command input ready.', output)
+
+    async def test_continued_wake_skips_spoken_ack_and_captures_from_ring(self):
+        status, voice, bot, output = await self.run_inputs([WakeWord(.9, 10.0, continued=True), '/quit'])
+        self.assertEqual(status.transitions, ['IDLE'])  # No SPEAKING: nothing plays over the user.
+        voice.set_awake.assert_awaited_once_with(True)
+        voice.start_capture.assert_awaited_once()
+        self.assertAlmostEqual(voice.start_capture.call_args.args[0], 10.05)
+        voice.hold.assert_any_await(False)
+        self.assertIn('Capturing the rest of the sentence.', output)
+        self.assertNotIn('not accepted', output)
+
+    async def test_plain_wake_never_requests_a_capture(self):
+        _, voice, _, _ = await self.run_inputs([WakeWord(.9, 10.0), '/quit'])
+        voice.start_capture.assert_not_awaited()
 
     async def test_openwakeword_hit_while_awake_is_ignored(self):
         status, voice, bot, _ = await self.run_inputs([WakeWord(.9, 10.0), '/quit'], initial='IDLE')

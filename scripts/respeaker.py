@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ from usb.core import USBError
 from voice_errors import RealtimeUnavailable
 from respeaker_vendor.tuning import find, PARAMETERS
 from audio_bus import AudioBus, AudioProducer, DeviceUnavailable, ReSpeakerControl
+from cancel import CancelScope
 
 ROOT = Path(__file__).resolve().parents[1]
 RATE = 16000
@@ -71,6 +73,13 @@ class SpeechEndpoint:
 
 
 class Controls:
+    """Sequence-acknowledged stdin controls.
+
+    {"paused": bool, "sequence": n}                  every worker
+    {"mode": "sleep"|"awake", "sequence": n}         long-lived worker (serve) only
+    {"capture": "start", "from_t": t, "sequence": n}  long-lived worker only
+    """
+
     def __init__(self, paused=False):
         self.paused = paused
         self.sequence = self.generation = 0
@@ -78,18 +87,58 @@ class Controls:
         self.resume_at = 0
         self.capture_closed = asyncio.Event()
         self.capture_closed.set()
+        self.capturing = False  # Set by the T3 recorder thread around each subscription.
+        self.scope = CancelScope()
+        self.mode = None
+        self.on_mode = self.on_capture = None  # Installed by serve().
+
+    def invalidate(self, reason):
+        self.generation += 1  # Invalidate recordings/STT from before this control.
+        self.scope.cancel_current(reason)
+
+    async def released(self):
+        """The recorder has unsubscribed; the shared stream itself may stay open."""
+        await self.capture_closed.wait()
+        while self.capturing:
+            await asyncio.sleep(.01)
+
+    def _sequence(self, value, keys):
+        if (not isinstance(value, dict) or set(value) != keys or type(value['sequence']) is not int
+                or value['sequence'] <= self.sequence):
+            raise RuntimeError('Invalid microphone capture control.')
+        self.sequence = value['sequence']
 
     async def apply(self, value):
+        if isinstance(value, dict) and 'mode' in value and self.on_mode:
+            self._sequence(value, {'mode', 'sequence'})
+            if value['mode'] not in ('sleep', 'awake'):
+                raise RuntimeError('Invalid microphone mode.')
+            self.invalidate('mode')
+            await self.released()
+            error = await self.on_mode(value['mode'])
+            ack = {'status': 'microphone_control', **value, 'paused': self.paused, 'active_mode': self.mode}
+            if error is not None:
+                ack['error'] = dict(category='realtime_unavailable', message=str(error),
+                                    retryable=getattr(error, 'retryable', True))
+            emit(ack)
+            return
+        if isinstance(value, dict) and 'capture' in value and self.on_capture:
+            self._sequence(value, {'capture', 'from_t', 'sequence'})
+            if value['capture'] != 'start' or type(value['from_t']) not in (int, float) or not math.isfinite(value['from_t']):
+                raise RuntimeError('Invalid microphone capture request.')
+            accepted = await self.on_capture(float(value['from_t']))
+            emit({'status': 'microphone_control', **value, 'accepted': accepted, 'paused': self.paused})
+            return
         if (not isinstance(value, dict) or set(value) != {'paused', 'sequence'}
                 or type(value['paused']) is not bool or type(value['sequence']) is not int
                 or value['sequence'] <= self.sequence):
             raise RuntimeError('Invalid microphone capture control.')
         self.paused = value['paused']
         self.sequence = value['sequence']
-        self.generation += 1  # Invalidate recordings/STT from before this control.
+        self.invalidate('control')
         self.resume_at = time.monotonic() + .5
         if self.paused:
-            await self.capture_closed.wait()
+            await self.released()
         # The parent may start speech as soon as it receives this acknowledgment.
         emit({'status': 'microphone_control', **value})
 
@@ -388,6 +437,365 @@ async def listen(args, dev):
             emit({'status': 'capture_stats', **producer.stats()})
 
 
+RING_SECONDS = 8.0  # Enough history for a wake-initiated capture after a Realtime connect.
+CAPTURE_REQUEST_TTL = 2.0
+
+
+async def speech_continues(bus, t, min_voiced=.16, silence=.4, start=.1, limit=1.0, vad_mode=2):
+    """After a wake hit at capture time `t`: is the user still talking ("Hi Kuro, what time…")?
+
+    Reads the ring as audio arrives: `min_voiced` seconds of speech means yes (decided as
+    soon as it is heard); `silence` seconds without speech means a plain wake. A comma
+    pause shorter than `silence` therefore does not end the check. 0 disables it.
+    """
+    if min_voiced <= 0:
+        return False
+    vad = webrtcvad.Vad(vad_mode)
+    frame_bytes = FRAME_SAMPLES * 2
+    frame_seconds = FRAME_SAMPLES / RATE
+    position = t + start
+    voiced = quiet = 0
+    deadline = time.monotonic() + limit + 1.0
+    while position < t + start + limit and time.monotonic() < deadline:
+        pcm, _, _ = bus.ring.read_since(position)
+        frames = len(pcm) // frame_bytes
+        if not frames:
+            await asyncio.sleep(.02)
+            continue
+        for index in range(frames):
+            if vad.is_speech(pcm[index * frame_bytes:(index + 1) * frame_bytes], RATE):
+                voiced += 1; quiet = 0
+            else:
+                quiet += 1
+            if voiced * frame_seconds >= min_voiced:
+                return True
+            if quiet * frame_seconds >= silence:
+                return False
+        position += frames * frame_seconds
+    return False
+
+
+class CommandRecorder(threading.Thread):
+    """T3: wait for hardware VAD or a capture request, record one utterance from the bus.
+
+    PCM and lifecycle items go to the asyncio loop in order through `handoff`
+    (call_soon_threadsafe); the loop owns Realtime and STT. Each capture holds its own
+    CancelToken, so a control, mode switch or newer trigger cancels only older work.
+    """
+
+    def __init__(self, args, dev, producer, state, loop, handoff, led=None):
+        super().__init__(name='command-recorder', daemon=True)
+        self.args = args; self.dev = dev; self.producer = producer; self.state = state
+        self.loop = loop; self.handoff = handoff; self.led = led
+        self.armed = threading.Event()
+        self.armed.set()
+        self.requests = queue.Queue()
+        self.stop_event = threading.Event()
+        self.error = None
+        self.utterance_id = 0
+        self.current = None  # (token, trigger, monotonic start) of the capture in progress
+
+    def post(self, *item):
+        self.loop.call_soon_threadsafe(self.handoff.put_nowait, item)
+
+    def listening(self):
+        state = self.state
+        uses_vad = state.mode == 'awake' or (state.mode == 'sleep' and getattr(self.args, 'wake_engine', 'whisper') != 'oww')
+        return uses_vad and not state.paused and not state.stopping and time.monotonic() >= state.resume_at
+
+    def request(self, from_t):
+        """Loop thread: accept a capture start when one can begin now.
+
+        A hardware-VAD recording that started in the last 1.5 s is replaced: it is the
+        same speech, and the requested capture also has everything since `from_t`.
+        """
+        state = self.state
+        if state.mode != 'awake' or state.paused or state.stopping:
+            return False
+        current = self.current
+        if state.capturing or not self.armed.is_set():
+            if not current or current[1] != 'hardware_vad' or time.monotonic() - current[2] > 1.5:
+                return False
+            current[0].cancel('capture_request')
+        self.requests.put((from_t, time.monotonic()))
+        return True
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                if not self.armed.wait(.05):
+                    continue
+                from_t = None
+                while not self.requests.empty():
+                    value, requested = self.requests.get_nowait()
+                    if time.monotonic() - requested <= CAPTURE_REQUEST_TTL:
+                        from_t = value
+                if from_t is None:
+                    if not self.listening() or not self.dev.is_voice():
+                        self.stop_event.wait(.05)
+                        continue
+                self.armed.clear()
+                self.capture(from_t)
+        except BaseException as error:  # Reported to the worker loop, never swallowed.
+            self.error = error
+            self.post('error', error)
+
+    def cancelled(self, token, generation):
+        state = self.state
+        return token.cancelled or state.paused or state.stopping or state.generation != generation
+
+    def capture(self, from_t=None):
+        args, state, bus = self.args, self.state, self.producer.bus
+        awake = state.mode == 'awake'
+        endpoint = SpeechEndpoint(args.silence_seconds if awake else getattr(args, 'sleep_silence_seconds', args.silence_seconds))
+        vad = webrtcvad.Vad(args.vad_mode)
+        generation = state.generation
+        state.capturing = True  # Before re-checking pause, so a pause ack waits for us.
+        try:
+            token = state.scope.new()
+            if self.cancelled(token, generation):
+                self.armed.set()
+                return
+            self.utterance_id += 1
+            utterance_id = self.utterance_id
+            self.current = (token, 'capture_request' if from_t is not None else 'hardware_vad', time.monotonic())
+            sub = bus.subscribe('command')
+            try:
+                if from_t is not None:
+                    preroll, _, last_seq = bus.preroll(sub, since=from_t)
+                else:
+                    preroll, _, last_seq = bus.preroll(sub, seconds=getattr(args, 'preroll_seconds', PREROLL_SECONDS))
+                expected = last_seq + 1 if last_seq else None
+                pcm = bytearray()
+                direction = self.dev.direction
+                next_direction = 0.0
+                emit({'status': 'utterance_started', 'utterance_id': utterance_id, 'doa_deg': direction,
+                      'trigger': 'capture_request' if from_t is not None else 'hardware_vad'})
+                self.post('begin', utterance_id, token)
+                if self.led:
+                    self.led.set_state(self.led.states.LISTEN)
+                if preroll:
+                    pcm.extend(preroll)
+                    self.post('audio', preroll)
+                while True:
+                    if self.cancelled(token, generation):
+                        emit({'status': 'utterance_discarded', 'utterance_id': utterance_id})
+                        self.post('discarded', utterance_id)
+                        return
+                    block = sub.get(.5)
+                    if self.producer.failed:
+                        raise self.producer.failed
+                    if block is None or block.seq <= last_seq:
+                        continue
+                    if block.overflow or (expected is not None and block.seq != expected):
+                        raise RuntimeError(OVERFLOW_MESSAGE)
+                    expected = block.seq + 1
+                    if self.cancelled(token, generation):
+                        continue  # Reported as discarded at the top of the loop.
+                    data = block.pcm
+                    pcm.extend(data)
+                    self.post('audio', data)
+                    voiced = vad.is_speech(data, RATE)
+                    finished = endpoint.update(voiced, len(data) // 2)
+                    now = time.monotonic()
+                    if voiced and now >= next_direction:
+                        direction = self.dev.direction
+                        emit({'status': 'speech_direction', 'native_doa_deg': direction,
+                              'utterance_id': utterance_id})
+                        if self.led:
+                            self.led.set_listen(direction)
+                        next_direction = now + .25
+                    reason = 'silence' if finished else None
+                    if not reason and len(pcm) >= round(args.max_seconds * RATE) * 2:
+                        reason = 'maximum_duration'
+                    if reason:
+                        self.post('done', {'pcm': bytes(pcm), 'doa_deg': direction, 'utterance_id': utterance_id,
+                                           'reason': reason, 'silence_seconds': endpoint.silent_samples / RATE,
+                                           'generation': generation}, token)
+                        return
+            finally:
+                bus.unsubscribe(sub)
+        finally:
+            self.current = None
+            state.capturing = False
+
+    def stop(self, timeout=2.0):
+        self.stop_event.set()
+        self.join(timeout)
+
+
+async def serve(args, dev):
+    """Long-lived worker: switch sleep/awake by control instead of respawning (phase 3)."""
+    device = select_input(args.device)
+    output = Path(args.wav).resolve()
+    if output.exists():
+        raise RuntimeError(f'Recording already exists: {output}; choose another --wav path.')
+    loop = asyncio.get_running_loop()
+    state = Controls(paused=args.control_stdin)
+    dev = ReSpeakerControl(dev)
+    handoff = asyncio.Queue()
+    stt_lock = asyncio.Lock()
+    oww = getattr(args, 'wake_engine', 'whisper') == 'oww'
+    led = realtime = transcriber = wake = recorder = controller = None
+    backends = {}
+    clip_count = 0
+    producer = AudioProducer(AudioBus(ring_seconds=RING_SECONDS), device, RATE, FRAME_SAMPLES)
+
+    async def open_realtime():
+        from respeaker_realtime import RealtimeTranscriber
+        emit({'status': 'transcription_loading', 'model': args.stt_model})
+        opened = await RealtimeTranscriber.open(emit, args.stt_model, args.language)
+        emit({'status': 'transcription_ready', 'model': args.stt_model, 'backend': 'realtime'})
+        return opened
+
+    async def set_mode(mode):
+        """Open/close Realtime for the mode; on failure keep the previous mode and report it."""
+        nonlocal realtime, transcriber
+        async with stt_lock:
+            if mode == 'awake' and realtime is None and not args.no_stt:
+                try:
+                    realtime = await open_realtime()
+                except RealtimeUnavailable as error:
+                    return error
+            elif mode == 'sleep':
+                if realtime is not None:
+                    await realtime.close()
+                    realtime = None
+                if not oww and transcriber is None and not args.no_stt:
+                    from respeaker_stt import Transcriber
+                    model = getattr(args, 'wake_stt_model', 'small')
+                    emit({'status': 'transcription_loading', 'model': model})
+                    # Loaded once and kept: sleep/awake switches never reload Whisper.
+                    transcriber = await asyncio.to_thread(Transcriber, model, args.language, getattr(args, 'stt_prompt', None))
+                    emit({'status': 'transcription_ready', 'model': model, 'backend': 'local'})
+            state.mode = mode
+            return None
+
+    async def request_capture(from_t):
+        return recorder.request(from_t)
+
+    try:
+        producer.start()
+        if not args.no_led:
+            from respeaker_led import LEDController
+            led = LEDController(brightness=20)
+        error = await set_mode(args.initial_mode)
+        if error is not None:
+            raise error
+        if oww:
+            from wake_word import WakeWordThread
+            wake = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
+                                  on_detect=lambda hit: loop.call_soon_threadsafe(handoff.put_nowait, ('wake', hit)))
+            wake.start()
+            await asyncio.to_thread(wake.ready.wait, 60)
+            if wake.error:
+                raise wake.error
+        recorder = CommandRecorder(args, dev, producer, state, loop, handoff, led)
+        state.on_mode, state.on_capture = set_mode, request_capture
+        recorder.start()
+        controller = asyncio.create_task(read_controls(state)) if args.control_stdin else None
+        emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
+              'trigger': 'wake_word' if oww else 'hardware_vad', 'mode': state.mode,
+              'wake_engine': 'oww' if oww else 'whisper', 'silence_seconds': args.silence_seconds,
+              'max_seconds': args.max_seconds, 'vad_mode': args.vad_mode})
+        deadline = time.monotonic() + args.seconds if args.seconds else math.inf
+        while not state.stopping and time.monotonic() < deadline:
+            check_controller(controller)
+            if producer.failed:
+                raise producer.failed
+            if wake and wake.error:
+                raise wake.error
+            if led and not state.capturing and recorder.armed.is_set():
+                led.off() if state.paused else led.set_state(led.states.IDLE)
+            try:
+                item = await asyncio.wait_for(handoff.get(), .05)
+            except TimeoutError:
+                continue
+            kind = item[0]
+            if kind == 'error':
+                raise item[1]
+            if kind == 'begin':
+                utterance_id, token = item[1:]
+                backend = None
+                async with stt_lock:
+                    if state.mode == 'awake' and not args.no_stt and not token.cancelled:
+                        if realtime is None:
+                            realtime = await open_realtime()  # Reopened lazily after a discard.
+                        realtime.begin(utterance_id)
+                        backend = 'realtime'
+                    elif state.mode == 'sleep' and transcriber:
+                        backend = 'local'
+                backends[utterance_id] = backend
+            elif kind == 'audio':
+                if realtime is not None and realtime.turn is not None:
+                    realtime.append(item[1])
+            elif kind == 'discarded':
+                if backends.pop(item[1], None) == 'realtime' and realtime is not None:
+                    # Drop unfinished remote audio and its context before the next turn.
+                    async with stt_lock:
+                        await realtime.close()
+                        realtime = None
+                recorder.armed.set()
+            elif kind == 'done':
+                event, token = item[1:]
+                backend = backends.pop(event['utterance_id'], None)
+                clip_count += 1
+                path = save_clip(output, clip_count, event)
+                result = None
+                if backend and led:
+                    led.set_state(led.states.THINK)
+                if backend == 'realtime':
+                    # Hold the lock: a mode switch must not close the socket mid-finish.
+                    async with stt_lock:
+                        if realtime is not None and realtime.turn is not None:
+                            result = await realtime.finish()
+                elif backend == 'local':
+                    result = await asyncio.to_thread(transcriber.transcribe, path)
+                check_controller(controller)
+                if (result is not None and not token.cancelled and not state.stopping and not state.paused
+                        and state.generation == event['generation']):
+                    final_fields = {}
+                    if getattr(args, 'single_utterance', False) and backend == 'realtime':
+                        state.paused = True
+                        final_fields['paused_after'] = True
+                    emit({'status': 'transcript_final', 'item_id': f'local-{event["utterance_id"]}',
+                          'utterance_id': event['utterance_id'], 'wav': str(path), 'doa_deg': event['doa_deg'],
+                          'backend': backend, **result, **final_fields})
+                recorder.armed.set()
+                if args.once:
+                    break
+            elif kind == 'wake':
+                hit = item[1]
+                wake.wake_word_detected.clear()  # Consumed here; T2 only ever sets it.
+                if state.mode == 'sleep':
+                    if state.paused or time.monotonic() < state.resume_at:
+                        # The robot's own playback ("Say Hi Kuro…") or a closed gate.
+                        emit({'status': 'wake_ignored', 'reason': 'paused', 'score': hit['score']})
+                        continue
+                    hit['continued'] = await speech_continues(producer.bus, hit['t'],
+                                                              getattr(args, 'wake_continuation', .16), vad_mode=args.vad_mode)
+                    emit({**hit, 'mode': 'sleep'})
+                    if args.once:
+                        break
+                else:
+                    emit({**hit, 'mode': 'awake', 'paused': state.paused})
+    finally:
+        if recorder:
+            await asyncio.to_thread(recorder.stop)
+        if wake:
+            await asyncio.to_thread(wake.stop, 1.0)
+            emit({'status': 'wake_stats', **wake.stats()})
+        if realtime:
+            await realtime.close()
+        if controller:
+            controller.cancel()
+            await asyncio.gather(controller, return_exceptions=True)
+        if led:
+            led.off()
+        producer.stop()
+        emit({'status': 'capture_stats', **producer.stats()})
+
+
 def run(args, dev):
     if args.command == 'doctor' and (args.aec or args.compare):
         import respeaker_aec
@@ -398,6 +806,8 @@ def run(args, dev):
     elif args.command == 'doctor':
         emit({'control_version_byte': dev.version, 'usb_device_revision': hex(dev.dev.bcdDevice),
               'parameters': {name: dev.read(name) for name in PARAMETERS}})
+    elif getattr(args, 'initial_mode', None):
+        asyncio.run(serve(args, dev))
     else:
         asyncio.run(listen(args, dev))
 
@@ -430,6 +840,13 @@ def main():
     parser.add_argument('--wake-model-path', help='openWakeWord .onnx model (default DOTS_WAKE_MODEL_PATH or '
                         '~/.local/share/face-agent/wake/hi_kuro.onnx)')
     parser.add_argument('--wake-threshold', type=float, help='Wake score threshold (default: model .json or 0.5)')
+    parser.add_argument('--initial-mode', choices=['sleep', 'awake'],
+                        help='Long-lived worker: start in this mode and switch with {"mode": …} controls')
+    parser.add_argument('--sleep-silence-seconds', type=float, default=0.4,
+                        help='Endpoint silence in sleep mode with the Whisper wake engine')
+    parser.add_argument('--wake-stt-model', default='small', help='Local Whisper model for sleep mode (Whisper wake engine)')
+    parser.add_argument('--wake-continuation', type=float, default=0.16,
+                        help='Seconds of speech right after a wake hit that mark "still speaking" (0 disables)')
     aec = parser.add_argument_group('doctor --aec (echo cancellation check; stop the voice stack first)')
     aec.add_argument('--aec', action='store_true', help='Record all channels while playing speech through --sink')
     aec.add_argument('--compare', action='store_true', help='Compare the latest saved --aec runs per label')
@@ -444,6 +861,10 @@ def main():
         parser.error('Seconds must be finite: session >= 0; silence > 0; maximum > silence.')
     if not 0 <= args.preroll_seconds <= 1.5:
         parser.error('--preroll-seconds must be between 0 and 1.5.')
+    if args.initial_mode and args.legacy_stream:
+        parser.error('--initial-mode needs the continuous stream; drop --legacy-stream.')
+    if args.initial_mode and not 0 < args.sleep_silence_seconds < args.max_seconds:
+        parser.error('--sleep-silence-seconds must be positive and below --max-seconds.')
     if args.wake_engine == 'oww':
         import wake_word
         args.wake_model_path = str(Path(args.wake_model_path).expanduser() if args.wake_model_path

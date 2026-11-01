@@ -28,7 +28,9 @@ class VoiceIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
         # Never pick up a wake model installed on this machine.
-        wake_env = patch.dict(os.environ, {'DOTS_WAKE_ENGINE': 'auto', 'DOTS_WAKE_MODEL_PATH': str(root / 'wake/hi_kuro.onnx')})
+        # These tests drive the respawn protocol (rollback path); LongLivedWorkerTest covers phase 3.
+        wake_env = patch.dict(os.environ, {'DOTS_WAKE_ENGINE': 'auto', 'DOTS_WAKE_MODEL_PATH': str(root / 'wake/hi_kuro.onnx'),
+                                           'DOTS_VOICE_RESPAWN': '1'})
         wake_env.start()
         self.addCleanup(wake_env.stop)
         config = root / 'robot-config.json'
@@ -508,8 +510,10 @@ for line in sys.stdin:
             async with VoiceInput(self.url, status_driven=True) as voice:
                 voice.terminal_open = False
                 old = voice.process
-                await voice.follow_status('IDLE')
+                # The playback guard may unpause the child before follow_status does, so
+                # the worker failure can surface from either call.
                 with self.assertRaisesRegex(RealtimeUnavailable, 'queue full'):
+                    await voice.follow_status('IDLE')
                     await voice.read(2)
                 voice.partials['old'] = 'Interrupted words'
                 voice.activity.put_nowait('LISTENING')
@@ -546,3 +550,117 @@ for line in sys.stdin:
                 await voice.ensure_microphone()
             self.assertEqual(start.call_count, 5)
             self.assertFalse(voice.accepting)
+
+
+LONG_LIVED_CHILD = """import json,sys
+args=sys.argv[1:]
+mode=args[args.index('--initial-mode')+1]
+fail_awake='--fail-awake' in args
+print(json.dumps(dict(status='listening', mode=mode)), flush=True)
+paused=True
+for line in sys.stdin:
+    control=json.loads(line)
+    if 'mode' in control:
+        ack=dict(status='microphone_control', **control, paused=paused)
+        if control['mode']=='awake' and fail_awake:
+            fail_awake=False
+            ack.update(active_mode=mode, error=dict(category='realtime_unavailable', message='Realtime offline', retryable=True))
+        else:
+            mode=control['mode']; ack['active_mode']=mode
+        print(json.dumps(ack), flush=True)
+    elif 'capture' in control:
+        ok=mode=='awake' and not paused
+        print(json.dumps(dict(status='microphone_control', **control, accepted=ok, paused=paused)), flush=True)
+        if ok:
+            print(json.dumps(dict(status='utterance_started', utterance_id=7)), flush=True)
+            print(json.dumps(dict(status='transcript_final', item_id='seven', text='what time is it %.2f' % control['from_t'], utterance_id=7, paused_after=True)), flush=True)
+    else:
+        paused=control['paused']
+        print(json.dumps(dict(status='microphone_control', **control)), flush=True)
+        if not paused and mode=='sleep' and '--wake-engine' in args:
+            print(json.dumps(dict(status='wake_detected', score=.9, t=40.0, continued=True, mode='sleep')), flush=True)
+"""
+
+
+class LongLivedWorkerTest(VoiceIntegrationTest):
+    """Phase 3: one worker for sleep and awake; the inherited respawn tests are disabled here."""
+
+    for _name in [n for n in dir(VoiceIntegrationTest) if n.startswith('test_')]:
+        locals()[_name] = None
+    del _name
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        respawn = patch.dict(os.environ, {'DOTS_VOICE_RESPAWN': '0'})
+        respawn.start()
+        self.addCleanup(respawn.stop)
+
+    def spawn_child(self, extra=()):
+        child = Path(self.directory.name) / 'long_lived.py'
+        child.write_text(LONG_LIVED_CHILD)
+        original = asyncio.create_subprocess_exec
+        self.commands = []
+        async def spawn(*command, **options):
+            self.commands.append(command)
+            return await original(sys.executable, str(child), *command[2:], *extra, **options)
+        return spawn
+
+    def patches(self, spawn):
+        return (patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}),
+                patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn),
+                patch('serve.Handler.log_message'), redirect_stdout(io.StringIO()))
+
+    async def test_mode_switch_never_spawns_a_second_worker(self):
+        env, exec_patch, log, out = self.patches(self.spawn_child())
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out:
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                for state, revision in (('IDLE', 2), ('SLEEPING', 3), ('LISTENING', 4), ('SLEEPING', 5)):
+                    self.server.apply_robot_status(dict(status=state, revision=revision, source='test'))
+                    await voice.follow_status(state)
+                    self.assertEqual(voice.awake, state != 'SLEEPING')
+        self.assertEqual(len(self.commands), 1)
+        command = self.commands[0]
+        self.assertEqual(command[command.index('--initial-mode') + 1], 'sleep')
+        self.assertEqual(command[command.index('--stt-model') + 1], 'gpt-live-transcribe')
+        self.assertEqual(command[command.index('--wake-stt-model') + 1], 'small')
+        self.assertIn('--single-utterance', command)
+
+    async def test_realtime_failure_keeps_worker_alive_in_sleep_mode(self):
+        env, exec_patch, log, out = self.patches(self.spawn_child(extra=('--fail-awake',)))
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out:
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                with self.assertRaises(RealtimeUnavailable) as raised:
+                    await voice.set_awake(True)
+                self.assertTrue(raised.exception.retryable)
+                self.assertFalse(voice.awake)
+                self.assertIsNone(voice.failed)
+                self.assertIsNone(voice.process.returncode)
+                await voice.set_awake(True)  # The same worker connects on the next attempt.
+                self.assertTrue(voice.awake)
+        self.assertEqual(len(self.commands), 1)
+
+    async def test_continued_wake_requests_capture_from_wake_time(self):
+        model = Path(self.directory.name) / 'wake/hi_kuro.onnx'
+        model.parent.mkdir()
+        model.write_bytes(b'onnx')
+        model.with_suffix('.json').write_text(json.dumps(dict(name='Kuro')))
+        env, exec_patch, log, out = self.patches(self.spawn_child())
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out:
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.follow_status('SLEEPING')
+                wake = await asyncio.wait_for(voice.read(), 3)
+                self.assertTrue(wake.continued)
+                self.server.apply_robot_status(dict(status='IDLE', revision=2, source='test'))
+                await voice.follow_status('IDLE')
+                self.assertTrue(await voice.start_capture(wake.t + .05))
+                self.assertEqual(await asyncio.wait_for(voice.read(), 3), 'what time is it 40.05')
+                self.server.apply_robot_status(dict(status='SLEEPING', revision=3, source='test'))
+                await voice.follow_status('SLEEPING')
+                self.assertFalse(await voice.start_capture(1.0))  # Never while asleep.
+        self.assertEqual(len(self.commands), 1)
