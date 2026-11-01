@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from serve import RobotServer
-from voice_input import VoiceInput, MicrophoneDisconnected
+from voice_input import VoiceInput, MicrophoneDisconnected, WakeWord
 from voice_errors import RealtimeUnavailable
 from dotsctl import request
 
@@ -27,6 +27,10 @@ class VoiceIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
+        # Never pick up a wake model installed on this machine.
+        wake_env = patch.dict(os.environ, {'DOTS_WAKE_ENGINE': 'auto', 'DOTS_WAKE_MODEL_PATH': str(root / 'wake/hi_kuro.onnx')})
+        wake_env.start()
+        self.addCleanup(wake_env.stop)
         config = root / 'robot-config.json'
         config.write_text((ROOT / 'robot-config.default.json').read_text())
         self.server = RobotServer(('127.0.0.1', 0), config_file=config, static_root=root / 'web', key_file=root / 'private/key')
@@ -175,6 +179,52 @@ for line in sys.stdin:
                 self.assertEqual(await asyncio.wait_for(voice.read(), 3), 'Hi Kuro')
                 self.assertEqual(self.server.listening_text['text'], '')
                 self.assertEqual(models, ['small', 'gpt-live-transcribe', 'small'])
+
+    async def test_openwakeword_hit_wakes_without_display_text_and_name_mismatch_uses_whisper(self):
+        root = Path(self.directory.name)
+        model = root / 'wake/hi_kuro.onnx'
+        model.parent.mkdir()
+        model.write_bytes(b'onnx')
+        model.with_suffix('.json').write_text(json.dumps(dict(phrase='hi kuro', name='Kuro', threshold=.42)))
+        child = root / 'wake_microphone.py'
+        child.write_text('''import json,sys
+oww='--wake-engine' in sys.argv
+print(json.dumps(dict(status='listening', trigger='wake_word' if oww else 'hardware_vad')), flush=True)
+for line in sys.stdin:
+    control=json.loads(line)
+    print(json.dumps(dict(status='microphone_control', **control)), flush=True)
+    if not control['paused'] and oww:
+        print(json.dumps(dict(status='wake_detected', score=.91, t=12.5, model='hi_kuro')), flush=True)
+''')
+        original = asyncio.create_subprocess_exec
+        commands = []
+        async def spawn(*command, **options):
+            commands.append(command)
+            return await original(sys.executable, str(child), *command[2:], **options)
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        output = io.StringIO()
+        with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
+                patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
+                patch('serve.Handler.log_message'), redirect_stdout(output):
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.follow_status('SLEEPING')
+                wake = await asyncio.wait_for(voice.read(), 3)
+                self.assertIsInstance(wake, WakeWord)
+                self.assertEqual((wake.score, wake.t), (.91, 12.5))
+                self.assertEqual(self.server.listening_text['text'], '')  # Wake audio never reaches the display.
+                command = commands[-1]
+                self.assertEqual(command[command.index('--wake-engine') + 1], 'oww')
+                self.assertEqual(command[command.index('--wake-model-path') + 1], str(model))
+                self.assertEqual(command[command.index('--wake-threshold') + 1], '0.42')
+                # A studio rename makes the model stale: the next sleeping start uses Whisper.
+                config = await asyncio.to_thread(request, self.url, 'config')
+                config['appearance']['name'] = 'Dots'
+                await asyncio.to_thread(request, self.url, 'config', config)
+                await voice.restart(awake=False)
+                self.assertNotIn('--wake-engine', commands[-1])
+        self.assertIn('Wake engine: oww (openWakeWord model hi_kuro.onnx).', output.getvalue())
+        self.assertIn('Wake engine: whisper (wake model hi_kuro.onnx was trained for "Kuro", but the robot is named "Dots").', output.getvalue())
 
     async def test_speech_hints_are_session_scoped_and_rejected_during_playback(self):
         with patch('serve.Handler.log_message'):

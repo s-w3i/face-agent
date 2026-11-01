@@ -6,6 +6,8 @@ Measured 2026-11-02 on `pi5-wip` @ `400aea9` (Raspberry Pi 5 Model B, 8 GB, kern
 
 ## How the numbers were taken
 
+> **OpenAI cost note (added after the owner asked):** the 10 baseline trials (plus 2 smoke trials) each ran a full paid turn: Realtime STT, the agent model and a spoken reply. That's no longer the default. `voice_bench.py` now needs `--allow-api` for `--command` and for synthesizing any uncached clip. Wake-only trials use the three cached clips in `~/.cache/face-agent/bench/`.
+
 - `scripts/voice_bench.py` (new, read-only):
   - `wake` synthesizes "Hi Kuro." once, in a voice that isn't the robot's (`ash`), through serve.py `/api/speech`. It plays the clip through the default speaker and timestamps the agent log lines as they arrive.
   - It also records the speaker's monitor source (`parec`), so the end of the phrase and the start of the acknowledgment sit on the same clock. CPU is sampled once per second for each process group, tagged with the live `/robot/status`.
@@ -76,7 +78,7 @@ scripts/audio_output.sh respeaker                                  # persistent 
 .venv/bin/python scripts/respeaker.py doctor --aec --sink respeaker
 .venv/bin/python scripts/respeaker.py doctor --aec --compare        # prints ch0_reduction_db and target_met
 systemctl --user start face-agent.service
-.venv/bin/python scripts/voice_bench.py wake --trials 10 --command "What time is it?"   # optional: new wake/CPU numbers
+.venv/bin/python scripts/voice_bench.py wake --trials 10              # optional: wake/CPU numbers, no paid API turns
 ```
 
 Then fill in the "pending" row above. Also check by ear: talk over the playback during the `--aec` run, and listen to channel 0 of the saved WAV (`sox test-output/aec/respeaker-*.wav ch0.wav remix 1`).

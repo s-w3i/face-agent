@@ -222,9 +222,14 @@ class GlobalStatusCheck(unittest.IsolatedAsyncioTestCase):
                 bot.reply.assert_not_awaited()
                 self.assertEqual(self.agent.current.status, 'SLEEPING')
                 inputs.put_nowait('Hi Kuro')
+                # Fast wake: a bare greeting is acknowledged without an agent turn.
+                await until(lambda: voice.awake and self.agent.current.status == 'IDLE')
+                bot.reply.assert_not_awaited()
+                await self.remote.set('SLEEPING')
+                await until(lambda: self.agent.current.status == 'SLEEPING' and not voice.awake)
+                inputs.put_nowait('Hi Kuro, what time is it?')
                 await until(lambda: bot.reply.await_count == 1 and self.agent.current.status == 'IDLE')
-                self.assertEqual(bot.reply.call_args.args[0], 'Hi Kuro')
-                self.assertTrue(voice.awake)
+                self.assertEqual(bot.reply.call_args.args[0], 'Hi Kuro, what time is it?')
                 inputs.put_nowait('/quit')
                 self.assertEqual(await asyncio.wait_for(task, 5), 0)
             finally:

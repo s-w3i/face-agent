@@ -88,7 +88,46 @@ class WakeWordThread(threading.Thread):  # daemon=False; joined on shutdown
 - Don't commit the `.onnx` model to git unless the owner agrees. It lives in `~/.local/share`.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-2-wake-word`. The custom **"hi kuro" model doesn't exist yet**: the owner trains it in Colab using [docs/wake-word-training.md](../docs/wake-word-training.md).
+- Until then the robot auto-selects Whisper. The agent log shows `Wake engine: whisper (no wake model at …/hi_kuro.onnx)`.
+- The openWakeWord path was verified end to end with the pre-trained `hey_jarvis_v0.1` model, forced through `DOTS_WAKE_ENGINE=oww` (temporary `startup.env` lines, since removed).
+
+Dependencies:
+- `openwakeword==0.6.0` is installed `--no-deps`. tflite-runtime has no 3.12 wheel; ONNX is used.
+- Its package `__init__` also imports scikit-learn and scipy. Pinned in `requirements-respeaker.txt`: `scipy>=1.13,<1.17`, `scikit-learn>=1.5,<1.8`, `tqdm`, `requests` (owner chose the official package over vendoring). An unpinned install would pull numpy 2.x; the pins keep numpy 1.26.4.
+- Shared feature models are in `~/.local/share/face-agent/wake/`. `setup_respeaker.sh` installs all of it.
+
+Checks:
+- [x] Full suite green: 162 tests in `.venv`. The only errors are the cv2-only tracker files, which pass in the tracking venv.
+  - The phase 0 `test_global_status` failure is fixed: the test now expects the fast-wake path.
+  - New: `test/test_wake_word.py` (threshold/patience, refractory, reset, payload, stop/join < 1 s, drop counter, engine choice, offline replay = live rule).
+  - New worker tests: the oww engine never loads Whisper or polls hardware VAD, and a hit while paused is only logged.
+  - New parent tests: `WakeWord` sentinel, no display text, rename → Whisper with a log line.
+  - New chat tests: sentinel → `SLEEPING → SPEAKING → IDLE` with no agent turn; a hit while awake is ignored.
+- [ ] Offline eval ≥ 19/20 true wakes and ≤ 1 false wake per 10 min. **Pending the owner:** the trained model, plus `scripts/wake_eval.py record-positive` / `record-negative` / `evaluate`.
+- [~] Live wake latency, 10 synthetic "Hey Jarvis." trials through the speaker (`test-output/bench/phase2-oww-jarvis.json`):
+
+  | Metric | openWakeWord (hey_jarvis) | BASELINE (Whisper small) |
+  | --- | --- | --- |
+  | Detection rate | 10/10 | 9/10 |
+  | End of phrase → `Wake phrase detected` | **432 ms** median, p90 488 | 9979 ms, p90 10488 |
+  | End of phrase → ack audible | **630 ms**, p90 679 | 10262 ms |
+  | End of phrase → `Wake command input ready.` | **3693 ms**, p90 3726 | 13289 ms |
+
+  This is 23× faster, but the target was ≤ 300 ms. About 160 ms of it is `patience=2` (two 80 ms frames) plus the score rising after the phrase ends. Re-measure with the real hi_kuro model. `patience=1` would save 80 ms, at some risk of false wakes.
+  - Commands after the wake transcribed 10/10 as "What time is it?" (phase 1 pre-roll).
+- [~] CPU:
+  - The wake thread costs **9.7% of one core** in the live worker at idle clocks (6.8% at full clock in an isolated benchmark).
+  - The worker with openWakeWord averages 11.4% in a quiet room, or 23.6% including model loads at each respawn.
+  - The Whisper engine uses 1.3% when the room is quiet but **118% while it transcribes each utterance** (any TV or conversation).
+  - The ≤ 5% target is not met; see open issues.
+- [ ] 1 h of TV/radio while SLEEPING, ≤ 1 false wake. **Pending the owner** (needs the trained model).
+- [x] Rename → the next voice start logs `Wake engine: whisper (wake model hi_kuro.onnx was trained for "Kuro", but the robot is named "Dots")`. This is unit-tested with a real `RobotServer` config change and a fake worker. Whisper then wakes on "Hi <newname>" as before.
 
 ## Open issues
-- When the openWakeWord engine is used, commands spoken straight after the phrase are lost until phase 3 or 4.
+- With openWakeWord, commands spoken straight after the phrase are still lost, until phase 3.
+- **Wake CPU above the 5% target.** The embedding model alone costs 3.8 ms per 80 ms frame.
+  - `wake_word.load_model` already shrinks openWakeWord's 10 s raw buffer to 1 s. That removes a per-frame list copy and saves about 40% with identical features, verified against stock scores; any difference is openWakeWord's own random init.
+  - Further option (not done): gate inference on a cheap energy/VAD signal and replay the ring's last ~1.5 s into the model when sound starts.
+- **Wake latency 432 ms against the 300 ms target**, measured with `hey_jarvis`. Re-check with hi_kuro.
+- `voice_bench.py` paid-API use is now opt-in (`--allow-api`), at the owner's request.

@@ -22,7 +22,7 @@ from agents import Agent, Runner, WebSearchTool, ToolOutputImage, ToolOutputText
 from agents.mcp import MCPServerStdio, MCPServerStreamableHttp
 from dotsctl import request
 from launch_robot import stop
-from voice_input import VoiceInput, MicrophoneDisconnected
+from voice_input import VoiceInput, MicrophoneDisconnected, WakeWord
 from voice_errors import RealtimeUnavailable
 from ros_wake import RosWake, WakeRequest
 from ros_status import RosStatus
@@ -557,6 +557,10 @@ async def main():
     parser.add_argument('--mode', choices=['words', 'voice'], default='words', help='Typed words (default) or ReSpeaker microphone input.')
     parser.add_argument('--stt-model', default='gpt-live-transcribe', choices=['gpt-live-transcribe'], help='Awake transcription through the OpenAI Realtime API.')
     parser.add_argument('--wake-model', default=os.environ.get('DOTS_WAKE_MODEL', 'small'), help='Local Whisper model/directory for the Hi {name} wake phrase.')
+    parser.add_argument('--wake-engine', choices=['auto', 'oww', 'whisper'], default=os.environ.get('DOTS_WAKE_ENGINE', 'auto'),
+                        help='auto: openWakeWord when its model matches the robot name, otherwise local Whisper.')
+    parser.add_argument('--wake-model-path', default=os.environ.get('DOTS_WAKE_MODEL_PATH'),
+                        help='openWakeWord model (default ~/.local/share/face-agent/wake/hi_kuro.onnx).')
     parser.add_argument('--language', default='en', help='Speech language code, or auto for language detection.')
     parser.add_argument('--mic-forward-deg', type=float, default=0, help='Native DOA of camera centre; this robot uses 0 degrees.')
     parser.add_argument('--mic-clockwise', action=argparse.BooleanOptionalAction, default=False,
@@ -609,7 +613,8 @@ async def main():
                 print('Navigation configured on demand; startup does not contact the remote MCP.', flush=True)
             status = await stack.enter_async_context(RosStatus()) if args.robot_status else None
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
-                args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None)) if args.mode == 'voice' else None
+                args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None,
+                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path)) if args.mode == 'voice' else None
             if status:
                 if voice:
                     if args.speak:
@@ -848,6 +853,14 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                     continue
                 if not text or changed.is_set():
                     continue
+                if isinstance(text, WakeWord) and current.status != 'SLEEPING':
+                    continue  # Phase 2: a wake hit outside SLEEPING is only logged.
+                if current.status == 'SLEEPING' and isinstance(text, WakeWord):
+                    # openWakeWord already matched the phrase; same path as a bare "Hi Kuro".
+                    print('Wake phrase detected; Kuro is awake.', flush=True)
+                    operation = asyncio.create_task(wake_up())
+                    await operation
+                    continue
                 if current.status == 'SLEEPING':
                     if not isinstance(text, str) or not wake_trigger(text, robot_name(args.url)):
                         continue
@@ -986,6 +999,18 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
+            if isinstance(text, WakeWord):
+                if awake:
+                    continue
+                try:
+                    await wake_up()
+                except RealtimeUnavailable as error:
+                    print(str(error), file=sys.stderr)
+                    await finish_turn(True)
+                    print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
+                    continue
+                await voice.hold(False)
+                continue
             if isinstance(text, WakeRequest):
                 if time.monotonic() >= text.expires:
                     await wake.complete(text, False, 'Wake request expired.')

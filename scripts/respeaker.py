@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import wave
 
@@ -23,15 +24,19 @@ FRAME_SAMPLES = 320  # 20 ms of mono PCM16; supported by WebRTC VAD.
 PREROLL_SECONDS = 0.3  # Audio from before the hardware VAD fired; keeps speech onsets.
 DIAGNOSTICS = False
 OVERFLOW_MESSAGE = 'Audio capture overflowed; refusing to transcribe incomplete speech.'
+EMIT_LOCK = threading.Lock()  # Worker threads and the asyncio loop share stdout.
 
 
 def emit(value):
-    if DIAGNOSTICS:
-        print(json.dumps(value), flush=True)
-    elif value.get('status') == 'transcript_final':
-        print(value['text'], flush=True)
-    elif value.get('status') in ('warning', 'microphone_error'):
-        print(value.get('message', 'Microphone failed.'), file=sys.stderr, flush=True)
+    with EMIT_LOCK:
+        if DIAGNOSTICS:
+            print(json.dumps(value), flush=True)
+        elif value.get('status') == 'transcript_final':
+            print(value['text'], flush=True)
+        elif value.get('status') == 'wake_detected':
+            print(f"Wake word detected (score {value.get('score', 0):.2f}).", flush=True)
+        elif value.get('status') in ('warning', 'microphone_error'):
+            print(value.get('message', 'Microphone failed.'), file=sys.stderr, flush=True)
 
 
 def select_input(requested=None):
@@ -249,6 +254,46 @@ def save_clip(output, clip_count, event):
     return path
 
 
+async def wake_loop(args, state, controller, producer, led, device, deadline):
+    """SLEEPING with openWakeWord: T2 replaces hardware VAD -> record -> local Whisper."""
+    from wake_word import WakeWordThread
+    loop = asyncio.get_running_loop()
+    hits = asyncio.Queue()
+    wake = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
+                          on_detect=lambda hit: loop.call_soon_threadsafe(hits.put_nowait, hit))
+    wake.start()
+    try:
+        await asyncio.to_thread(wake.ready.wait, 60)
+        if wake.error:
+            raise wake.error
+        emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
+              'trigger': 'wake_word', 'model': Path(args.wake_model_path).name,
+              'threshold': args.wake_threshold})
+        while not state.stopping and time.monotonic() < deadline:
+            check_controller(controller)
+            if producer.failed:
+                raise producer.failed
+            if wake.error:
+                raise wake.error
+            if led:
+                led.off() if state.paused else led.set_state(led.states.IDLE)
+            try:
+                hit = await asyncio.wait_for(hits.get(), .05)
+            except TimeoutError:
+                continue
+            wake.wake_word_detected.clear()  # Consumed here; T2 only ever sets it.
+            if state.paused or time.monotonic() < state.resume_at:
+                # The robot's own playback or a closed gate: never treat it as a wake.
+                emit({'status': 'wake_ignored', 'reason': 'paused', 'score': hit['score']})
+                continue
+            emit(hit)
+            if args.once:
+                break
+    finally:
+        await asyncio.to_thread(wake.stop, 1.0)
+        emit({'status': 'wake_stats', **wake.stats()})
+
+
 async def listen(args, dev):
     device = select_input(args.device)
     output = Path(args.wav).resolve()
@@ -269,6 +314,10 @@ async def listen(args, dev):
         if not args.no_led:
             from respeaker_led import LEDController
             led = LEDController(brightness=20)
+        if getattr(args, 'wake_engine', 'whisper') == 'oww':
+            deadline = time.monotonic() + args.seconds if args.seconds else math.inf
+            await wake_loop(args, state, controller, producer, led, device, deadline)
+            return
         transcriber = None
         if not args.no_stt:
             emit({'status': 'transcription_loading', 'model': args.stt_model})
@@ -376,6 +425,11 @@ def main():
     parser.add_argument('--preroll-seconds', type=float, default=PREROLL_SECONDS,
                         help='Audio kept from before the hardware voice trigger (0-1.5 s)')
     parser.add_argument('--legacy-stream', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--wake-engine', choices=['whisper', 'oww'], default='whisper',
+                        help='oww: openWakeWord model on the continuous stream instead of hardware VAD + local Whisper')
+    parser.add_argument('--wake-model-path', help='openWakeWord .onnx model (default DOTS_WAKE_MODEL_PATH or '
+                        '~/.local/share/face-agent/wake/hi_kuro.onnx)')
+    parser.add_argument('--wake-threshold', type=float, help='Wake score threshold (default: model .json or 0.5)')
     aec = parser.add_argument_group('doctor --aec (echo cancellation check; stop the voice stack first)')
     aec.add_argument('--aec', action='store_true', help='Record all channels while playing speech through --sink')
     aec.add_argument('--compare', action='store_true', help='Compare the latest saved --aec runs per label')
@@ -390,6 +444,18 @@ def main():
         parser.error('Seconds must be finite: session >= 0; silence > 0; maximum > silence.')
     if not 0 <= args.preroll_seconds <= 1.5:
         parser.error('--preroll-seconds must be between 0 and 1.5.')
+    if args.wake_engine == 'oww':
+        import wake_word
+        args.wake_model_path = str(Path(args.wake_model_path).expanduser() if args.wake_model_path
+                                   else wake_word.default_model_path())
+        if args.legacy_stream:
+            parser.error('--wake-engine oww needs the continuous stream; drop --legacy-stream.')
+        if not Path(args.wake_model_path).is_file():
+            parser.error(f'No wake model at {args.wake_model_path}.')
+        if args.wake_threshold is None:
+            args.wake_threshold = wake_word.metadata(args.wake_model_path).get('threshold', wake_word.DEFAULT_THRESHOLD)
+        if not 0 < args.wake_threshold < 1:
+            parser.error('--wake-threshold must be between 0 and 1.')
     dev = None
     try:
         dev = find()

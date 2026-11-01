@@ -10,6 +10,11 @@ and record the speaker's monitor so phrase end and acknowledgment onset share on
     .venv/bin/python scripts/voice_bench.py wake --trials 3 --command "What time is it?"
 
 Results go to test-output/bench/*.json (gitignored) and a Markdown summary is printed.
+
+OpenAI cost: wake-only trials are local apart from the Realtime transcription socket
+that waking opens (no audio is sent unless someone speaks). `--command` runs a full
+paid turn per trial (Realtime STT + agent model + spoken reply), and synthesizing a
+clip that is not cached yet is one TTS request; both require --allow-api.
 """
 import argparse
 import json
@@ -234,12 +239,16 @@ def default_sink():
     return subprocess.run(['pactl', 'get-default-sink'], capture_output=True, text=True, check=True).stdout.strip()
 
 
-def speech_clip(url, text, voice):
+def speech_clip(url, text, voice, allow_api=False):
     """Synthesize once through serve.py /api/speech and cache under ~/.cache/face-agent/bench."""
     cache = CACHE / 'bench'
     cache.mkdir(parents=True, exist_ok=True)
     path = cache / (re.sub(r'[^a-z0-9]+', '-', f'{voice} {text}'.lower()).strip('-') + '.wav')
     if not path.exists():
+        if not allow_api:
+            raise SystemExit(f'{path.name} is not cached; synthesizing it is one OpenAI TTS request. '
+                             'Rerun with --allow-api.')
+        print(f'OpenAI: synthesizing {text!r} once (cached afterwards).', file=sys.stderr)
         body = json.dumps(dict(text=text, voice=voice)).encode()
         with urlopen(Request(url.rstrip('/') + '/api/speech', data=body,
                              headers={'Content-Type': 'application/json'}), timeout=120) as response:
@@ -295,8 +304,13 @@ def wake_trials(args):
     name = config.get('appearance', {}).get('name', 'Kuro')
     robot_voice = config.get('settings', {}).get('ttsVoice', 'marin')
     voice = args.voice if args.voice != robot_voice else ('echo' if robot_voice != 'echo' else 'ash')
-    wake_clip = speech_clip(args.url, args.phrase or f'Hi {name}.', voice)
-    command_clip = speech_clip(args.url, args.command, voice) if args.command else None
+    if args.command and not args.allow_api:
+        raise SystemExit('--command runs a paid OpenAI turn per trial (Realtime STT, agent model, spoken reply). '
+                         'Rerun with --allow-api, and keep --trials small.')
+    if args.command:
+        print(f'OpenAI: {args.trials} full conversation turn(s) will be used.', file=sys.stderr)
+    wake_clip = speech_clip(args.url, args.phrase or f'Hi {name}.', voice, args.allow_api)
+    command_clip = speech_clip(args.url, args.command, voice, args.allow_api) if args.command else None
     sink = args.sink or default_sink()
     log = LogTail(AGENT_LOG); log.start()
     monitor = MonitorRecorder(sink); monitor.start()
@@ -396,7 +410,9 @@ def main():
     wake = sub.add_parser('wake', help='Synthetic wake trials (robot must be able to reach SLEEPING)')
     wake.add_argument('--trials', type=int, default=10)
     wake.add_argument('--phrase', help='Wake phrase text (default "Hi <name>.")')
-    wake.add_argument('--command', help='Speak this command after each wake, e.g. "What time is it?"')
+    wake.add_argument('--command', help='Speak this command after each wake (paid turn; needs --allow-api)')
+    wake.add_argument('--allow-api', action='store_true',
+                      help='Permit OpenAI calls: --command turns and synthesizing uncached clips')
     wake.add_argument('--command-delay', type=float, default=0.3)
     wake.add_argument('--voice', default='ash', help='Synthetic speaker voice; never the robot voice')
     wake.add_argument('--sink', help='PulseAudio sink to monitor (default: default sink)')

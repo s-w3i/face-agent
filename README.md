@@ -101,7 +101,7 @@ A newly started status manager begins in **IDLE**. If a manager is already runni
 - **IDLE:** monitors the ReSpeaker hardware voice flag. Speech starts **LISTENING** and opens recording.
 - **LISTENING:** records one utterance, ending after **2 seconds of continuous nonspeech**, then enters **THINKING**. A conversation or another ROS node can also request LISTENING directly when an answer is needed.
 - **THINKING / SPEAKING:** input capture is paused. After the reply finishes, Kuro returns to IDLE.
-- **SLEEPING:** local Whisper checks for **“Hi Kuro”**, using the configured character name. Other speech is ignored. Wake-detection text never appears on the display, and sleeping audio is not sent to OpenAI.
+- **SLEEPING:** a local wake-word model ([openWakeWord](docs/wake-word-training.md), about 7% of one core) listens for **“Hi Kuro”** on the continuous microphone stream. Without a trained model, or when the model's name doesn't match the configured character name, local Whisper checks transcripts for “Hi <name>” instead (`Wake engine: …` in the agent log says which one is active). Other speech is ignored. Wake detection never appears on the display, and sleeping audio is not sent to OpenAI. With openWakeWord, a command spoken in the same breath as “Hi Kuro” is not captured yet; wait for the acknowledgment.
 - **WORKING / DETECTING / ERROR:** show their corresponding animation and pause microphone capture.
 
 Kuro sleeps after **5 seconds of inactivity** while command input is available. Recording, transcription, thinking, and speech playback do not count toward that timeout. A goodbye or thank-you without a further request produces a closing reply and then sleeps.
@@ -430,9 +430,11 @@ for the selected voice before the startup-ready announcement and stored under
 `~/.cache/face-agent/wake-ack/`. Waking replays this local clip while Realtime
 connects, with the microphone held closed through playback and connection. A
 bare “Hi Kuro” skips the generated greeting; a command after the wake phrase
-still reaches the agent. Cached acknowledgment playback needs no network.
+still reaches the agent (Whisper wake engine only). Cached acknowledgment playback needs no network.
 Changing the speech voice requires restarting the agent to prepare its clip.
-`DOTS_WAKE_MODEL` or `--wake-model` overrides the default `small` wake model. `--no-speak` also disables
+`DOTS_WAKE_ENGINE` (`auto`, `oww` or `whisper`) and `DOTS_WAKE_MODEL_PATH` choose the wake engine and model;
+see [docs/wake-word-training.md](docs/wake-word-training.md).
+`DOTS_WAKE_MODEL` or `--wake-model` overrides the default `small` Whisper wake model. `--no-speak` also disables
 the startup announcement. An external ROS status change takes precedence.
 
 Startup readiness audio is also persisted under

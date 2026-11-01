@@ -17,6 +17,7 @@ from chat import status_chat_loop
 from dotsctl import request
 from serve import RobotServer
 from ros_status import Status
+from voice_input import WakeWord
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -114,6 +115,39 @@ class WakeLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ['cached audio', 'connecting', 'playback finished'])
         self.assertEqual(status.transitions, ['SPEAKING', 'IDLE'])
         voice.hold.assert_any_await(True)
+
+    async def run_inputs(self, inputs, initial='SLEEPING', speak=True):
+        status = Authority()
+        status.current = Status(initial, 1, 'startup')
+        voice = Mock(read=AsyncMock(side_effect=inputs), hold=AsyncMock(), set_awake=AsyncMock(),
+                     follow_status=AsyncMock(), activity=asyncio.Queue())
+        def api(url, action, value=None):
+            if action == 'status':
+                return dict(robotStatus=dict(revision=status.current.revision))
+            return dict(displays=1, generation='g', sequence=1)
+        bot = Mock(reply=AsyncMock(return_value='Hello.'), sleep_requested=False)
+        output = io.StringIO()
+        with patch('chat.Chatbot', return_value=bot), patch('chat.robot_name', return_value='Kuro'), \
+                patch('chat.request', side_effect=api), patch('chat.wait_for_speech', AsyncMock(return_value=True)), \
+                redirect_stdout(output):
+            from types import SimpleNamespace
+            self.assertEqual(await asyncio.wait_for(status_chat_loop(
+                SimpleNamespace(url='local', model=None, speak=speak), status, voice=voice), 3), 0)
+        return status, voice, bot, output.getvalue()
+
+    async def test_openwakeword_hit_uses_the_cached_wake_path(self):
+        status, voice, bot, output = await self.run_inputs([WakeWord(.9, 10.0), '/quit'])
+        self.assertEqual(status.transitions, ['SPEAKING', 'IDLE'])
+        voice.set_awake.assert_awaited_once_with(True)
+        bot.reply.assert_not_awaited()
+        self.assertIn('Wake phrase detected; Kuro is awake.', output)
+        self.assertIn('Wake command input ready.', output)
+
+    async def test_openwakeword_hit_while_awake_is_ignored(self):
+        status, voice, bot, _ = await self.run_inputs([WakeWord(.9, 10.0), '/quit'], initial='IDLE')
+        self.assertEqual(status.transitions, [])
+        bot.reply.assert_not_awaited()
+        voice.set_awake.assert_not_awaited()
 
 
 if __name__ == '__main__':

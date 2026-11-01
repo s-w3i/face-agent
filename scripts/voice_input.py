@@ -11,17 +11,32 @@ import time
 
 from dotsctl import request
 from voice_errors import RealtimeUnavailable
+import wake_word
 
 
 class MicrophoneDisconnected(RuntimeError):
     pass
 
 
+class WakeWord:
+    """An openWakeWord hit from the sleeping worker; never shown on the display."""
+
+    def __init__(self, score, t):
+        self.score = score; self.t = t
+
+    def __repr__(self):
+        return f'WakeWord(score={self.score}, t={self.t})'
+
+
 class VoiceInput:
-    def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False):
+    def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False,
+                 wake_engine=None, wake_model_path=None):
         self.url = url; self.model = model; self.language = language
         self.forward = forward; self.clockwise = clockwise
         self.wake_model = wake_model; self.awake = status_driven
+        self.wake_engine = wake_engine or os.environ.get('DOTS_WAKE_ENGINE', 'auto')
+        self.wake_model_path = wake_model_path or wake_word.default_model_path()
+        self.wake_choice = None
         self.status_driven = status_driven
         self.activity = asyncio.Queue()
         self.process = self.log = None
@@ -49,7 +64,7 @@ class VoiceInput:
                 self.awake = global_status.get('status') != 'SLEEPING'
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log = log_path.open('a')
-            print('Voice mode · connecting Realtime; waiting for ReSpeaker.' if self.awake else 'Voice mode · loading local Whisper; waiting for ReSpeaker.', flush=True)
+            print('Voice mode · connecting Realtime; waiting for ReSpeaker.' if self.awake else 'Voice mode · starting local wake detection; waiting for ReSpeaker.', flush=True)
             try:
                 await self.start_microphone()
             except MicrophoneDisconnected:
@@ -80,6 +95,14 @@ class VoiceInput:
             config = await self.api('config')
             name = config.get('appearance', {}).get('name', 'Kuro')
             command += ['--stt-prompt', f'The robot is named {name}.']
+            engine, threshold, reason = wake_word.choose_engine(self.wake_engine, self.wake_model_path, name)
+            if (engine, reason) != self.wake_choice:
+                # One line per change, not one per sleep cycle.
+                print(f'Wake engine: {engine} ({reason}).', flush=True)
+                self.wake_choice = (engine, reason)
+            if engine == 'oww':
+                command += ['--wake-engine', 'oww', '--wake-model-path', str(self.wake_model_path),
+                            '--wake-threshold', str(threshold)]
         if self.language:
             command += ['--language', self.language]
         if os.environ.get('DOTS_VOICE_LEGACY_STREAM', '0').strip().lower() in ('1', 'true', 'yes'):
@@ -187,7 +210,12 @@ class VoiceInput:
                         raise MicrophoneDisconnected('ReSpeaker USB connection lost.')
                     raise incomplete or RuntimeError('Microphone failed. Check ~/.cache/face-agent/microphone-chat.log.')
                 elif self.accepting:
-                    if status == 'utterance_started':
+                    if status == 'wake_detected' and not self.awake:
+                        # Local only: the score is logged, nothing reaches the display.
+                        print(f"Wake word detected (score {event.get('score', 0):.2f}).", flush=True)
+                        if not self.inputs.full():
+                            self.inputs.put_nowait(WakeWord(event.get('score'), event.get('t')))
+                    elif status == 'utterance_started':
                         self.utterance_active = True
                         if self.awake:
                             self.activity.put_nowait('LISTENING')
@@ -416,6 +444,8 @@ class VoiceInput:
                 except asyncio.QueueEmpty:
                     pass
                 else:
+                    if isinstance(event, WakeWord):
+                        return event
                     self.direction(event.get('doa_deg'), event.get('utterance_id'))
                     try:
                         await self.publish_hint(await self.api('status'))
