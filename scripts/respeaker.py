@@ -19,6 +19,7 @@ from voice_errors import RealtimeUnavailable
 from respeaker_vendor.tuning import find, PARAMETERS
 from audio_bus import AudioBus, AudioProducer, DeviceUnavailable, ReSpeakerControl
 from cancel import CancelScope
+from worker_threads import DropRate, Heartbeat, RestartBudget, join_all, rss_kb, stack_of, thread_cpu
 
 ROOT = Path(__file__).resolve().parents[1]
 RATE = 16000
@@ -26,6 +27,17 @@ FRAME_SAMPLES = 320  # 20 ms of mono PCM16; supported by WebRTC VAD.
 PREROLL_SECONDS = 0.3  # Audio from before the hardware VAD fired; keeps speech onsets.
 DIAGNOSTICS = False
 OVERFLOW_MESSAGE = 'Audio capture overflowed; refusing to transcribe incomplete speech.'
+METRICS_SECONDS = 60
+LOCAL_STT_TIMEOUT = 60  # Whisper small takes ~10 s on the Pi 5; only a hang gets this far.
+
+
+class WorkerFailure(RuntimeError):
+    """A supervised thread failed in a way only a fresh worker can fix."""
+
+    def __init__(self, message, category, reconnectable=True):
+        super().__init__(message)
+        self.category = category
+        self.reconnectable = reconnectable
 EMIT_LOCK = threading.Lock()  # Worker threads and the asyncio loop share stdout.
 
 
@@ -494,6 +506,9 @@ class CommandRecorder(threading.Thread):
         self.error = None
         self.utterance_id = 0
         self.current = None  # (token, trigger, monotonic start) of the capture in progress
+        self.current_utterance = None
+        self.failed_utterance = None  # Utterance in progress when this thread raised.
+        self.heartbeat = Heartbeat('command-recorder', 2.0)
 
     def post(self, *item):
         self.loop.call_soon_threadsafe(self.handoff.put_nowait, item)
@@ -523,6 +538,7 @@ class CommandRecorder(threading.Thread):
     def run(self):
         try:
             while not self.stop_event.is_set():
+                self.heartbeat.beat()
                 if not self.armed.wait(.05):
                     continue
                 from_t = None
@@ -559,6 +575,7 @@ class CommandRecorder(threading.Thread):
             self.utterance_id += 1
             utterance_id = self.utterance_id
             self.current = (token, 'capture_request' if from_t is not None else 'hardware_vad', time.monotonic())
+            self.current_utterance = utterance_id
             sub = bus.subscribe('command')
             try:
                 if from_t is not None:
@@ -578,6 +595,7 @@ class CommandRecorder(threading.Thread):
                     pcm.extend(preroll)
                     self.post('audio', preroll)
                 while True:
+                    self.heartbeat.beat()
                     if self.cancelled(token, generation):
                         emit({'status': 'utterance_discarded', 'utterance_id': utterance_id})
                         self.post('discarded', utterance_id)
@@ -588,7 +606,11 @@ class CommandRecorder(threading.Thread):
                     if block is None or block.seq <= last_seq:
                         continue
                     if block.overflow or (expected is not None and block.seq != expected):
-                        raise RuntimeError(OVERFLOW_MESSAGE)
+                        # Incomplete speech is never transcribed; drop this utterance only.
+                        emit({'status': 'utterance_discarded', 'utterance_id': utterance_id,
+                              'reason': 'overflow', 'message': OVERFLOW_MESSAGE})
+                        self.post('discarded', utterance_id)
+                        return
                     expected = block.seq + 1
                     if self.cancelled(token, generation):
                         continue  # Reported as discarded at the top of the loop.
@@ -615,8 +637,12 @@ class CommandRecorder(threading.Thread):
                         return
             finally:
                 bus.unsubscribe(sub)
+        except BaseException:
+            self.failed_utterance = self.current_utterance
+            raise
         finally:
             self.current = None
+            self.current_utterance = None
             state.capturing = False
 
     def stop(self, timeout=2.0):
@@ -675,6 +701,30 @@ async def serve(args, dev):
     async def request_capture(from_t):
         return recorder.request(from_t)
 
+    async def start_wake():
+        from wake_word import WakeWordThread
+        thread = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
+                                on_detect=lambda hit: loop.call_soon_threadsafe(handoff.put_nowait, ('wake', hit)))
+        thread.start()
+        await asyncio.to_thread(thread.ready.wait, 60)
+        return thread
+
+    wake_budget = RestartBudget(3, 300)
+    recorder_budget = RestartBudget(3, 60)
+    wake_drops = DropRate(.01, 10)
+    next_metrics = time.monotonic() + METRICS_SECONDS
+    last_tick = time.monotonic()
+
+    def metrics():
+        stats = producer.stats()
+        return {'status': 'metrics', 'mode': state.mode, **stats, 'wake': wake.stats() if wake else None,
+                'thread_cpu_s': thread_cpu(), 'rss_kb': rss_kb(), 'threads': threading.active_count()}
+
+    def stalled(heartbeat, thread):
+        emit({'status': 'warning', 'message': f'{heartbeat.name} thread stuck for more than {heartbeat.limit:g} s.',
+              'stack': stack_of(thread)})
+        return WorkerFailure(f'Microphone {heartbeat.name} thread stopped responding; restarting the worker.', 'stalled')
+
     try:
         producer.start()
         if not args.no_led:
@@ -684,13 +734,9 @@ async def serve(args, dev):
         if error is not None:
             raise error
         if oww:
-            from wake_word import WakeWordThread
-            wake = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
-                                  on_detect=lambda hit: loop.call_soon_threadsafe(handoff.put_nowait, ('wake', hit)))
-            wake.start()
-            await asyncio.to_thread(wake.ready.wait, 60)
+            wake = await start_wake()
             if wake.error:
-                raise wake.error
+                raise WorkerFailure(f'Wake-word model failed to load: {wake.error}', 'wake_engine')
         recorder = CommandRecorder(args, dev, producer, state, loop, handoff, led)
         state.on_mode, state.on_capture = set_mode, request_capture
         recorder.start()
@@ -704,8 +750,28 @@ async def serve(args, dev):
             check_controller(controller)
             if producer.failed:
                 raise producer.failed
+            now = time.monotonic()
+            if now - last_tick > 1.0:
+                # The whole process was paused (SIGSTOP, swap, overload): every heartbeat is old
+                # for the same reason, so give the threads a fresh window instead of replacing them.
+                for thread in (wake, recorder):
+                    if thread is not None:
+                        thread.heartbeat.beat()
+            last_tick = now
             if wake and wake.error:
-                raise wake.error
+                if not wake_budget.allow(now):
+                    raise WorkerFailure('The wake-word engine failed repeatedly; falling back to Whisper.', 'wake_engine')
+                emit({'status': 'warning', 'message': f'Wake-word thread failed ({wake.error!r}); restarting it.'})
+                wake = await start_wake()
+            if wake and wake.heartbeat.stale(now):
+                raise stalled(wake.heartbeat, wake)
+            if recorder.is_alive() and recorder.heartbeat.stale(now):
+                raise stalled(recorder.heartbeat, recorder)
+            if wake and wake.sub and (lost := wake_drops.check(producer.seq, wake.sub.dropped, now)):
+                emit({'status': 'warning', 'message': f'Wake detection is falling behind: {lost:.1%} of audio dropped in 10 s.'})
+            if now >= next_metrics:
+                next_metrics = now + METRICS_SECONDS
+                emit(metrics())
             if led and not state.capturing and recorder.armed.is_set() and time.monotonic() >= led_hold:
                 led.off() if state.paused else led.set_state(led.states.IDLE)
             try:
@@ -714,7 +780,25 @@ async def serve(args, dev):
                 continue
             kind = item[0]
             if kind == 'error':
-                raise item[1]
+                error = item[1]
+                if isinstance(error, (DeviceUnavailable, USBError)):
+                    raise error
+                # T3 raised: drop its utterance (never transcribe partial audio) and restart it.
+                if recorder.failed_utterance is not None:
+                    emit({'status': 'utterance_discarded', 'utterance_id': recorder.failed_utterance, 'reason': 'error'})
+                    if backends.pop(recorder.failed_utterance, None) == 'realtime' and realtime is not None:
+                        async with stt_lock:
+                            await realtime.close()
+                            realtime = None
+                state.capturing = False
+                if not recorder_budget.allow(now):
+                    raise WorkerFailure(f'The command recorder failed repeatedly ({error!r}).', 'recorder')
+                emit({'status': 'warning', 'message': f'Command recorder failed ({error!r}); restarting it.'})
+                previous = recorder
+                recorder = CommandRecorder(args, dev, producer, state, loop, handoff, led)
+                recorder.utterance_id = previous.utterance_id
+                recorder.start()
+                continue
             if kind == 'begin':
                 utterance_id, token = item[1:]
                 backend = None
@@ -751,7 +835,11 @@ async def serve(args, dev):
                         if realtime is not None and realtime.turn is not None:
                             result = await realtime.finish()
                 elif backend == 'local':
-                    result = await asyncio.to_thread(transcriber.transcribe, path)
+                    try:
+                        result = await asyncio.wait_for(asyncio.to_thread(transcriber.transcribe, path), LOCAL_STT_TIMEOUT)
+                    except TimeoutError:
+                        emit({'status': 'warning', 'message': f'Local transcription took over {LOCAL_STT_TIMEOUT} s; dropped.'})
+                        result = None
                 check_controller(controller)
                 if (result is not None and not token.cancelled and not state.stopping and not state.paused
                         and state.generation == event['generation']):
@@ -786,9 +874,12 @@ async def serve(args, dev):
                         led_hold = time.monotonic() + 1.5
     finally:
         if recorder:
-            await asyncio.to_thread(recorder.stop)
+            recorder.stop_event.set()
         if wake:
-            await asyncio.to_thread(wake.stop, 1.0)
+            wake.stop_event.set()
+        stuck = await asyncio.to_thread(join_all, [recorder, wake], 2.0)
+        if wake:
+            await asyncio.to_thread(wake.stop, .1)
             emit({'status': 'wake_stats', **wake.stats()})
         if realtime:
             await realtime.close()
@@ -799,6 +890,9 @@ async def serve(args, dev):
             led.off()
         producer.stop()
         emit({'status': 'capture_stats', **producer.stats()})
+        stuck += [t.name for t in threading.enumerate() if t.name == 'audio-watchdog' and t.is_alive()]
+        if stuck:
+            emit({'status': 'warning', 'message': 'Threads did not stop: ' + ', '.join(stuck)})
 
 
 def run(args, dev):
@@ -894,6 +988,8 @@ def main():
         event = dict(status='microphone_error', reconnectable=isinstance(error, DeviceUnavailable) or isinstance(error, USBError) and error.errno == 19)
         if isinstance(error, RealtimeUnavailable):
             event.update(category='realtime_unavailable', message=str(error), retryable=error.retryable)
+        if isinstance(error, WorkerFailure):
+            event.update(category=error.category, message=str(error), reconnectable=error.reconnectable)
         emit(event)
         print('ReSpeaker error: ' + str(error), file=sys.stderr)
         return 1

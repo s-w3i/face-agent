@@ -38,6 +38,7 @@ class VoiceInput:
         self.wake_engine = wake_engine or os.environ.get('DOTS_WAKE_ENGINE', 'auto')
         self.wake_model_path = wake_model_path or wake_word.default_model_path()
         self.wake_choice = None
+        self.wake_engine_failed = False  # openWakeWord crashed repeatedly: use Whisper from now on.
         # Phase 3: one long-lived worker switches modes by control. DOTS_VOICE_RESPAWN=1
         # restores the old kill-and-respawn switch (--respawn-on-wake).
         enabled = lambda name: os.environ.get(name, '0').strip().lower() in ('1', 'true', 'yes')
@@ -112,6 +113,8 @@ class VoiceInput:
             name = config.get('appearance', {}).get('name', 'Kuro')
             command += ['--stt-prompt', f'The robot is named {name}.']
             engine, threshold, reason = wake_word.choose_engine(self.wake_engine, self.wake_model_path, name)
+            if engine == 'oww' and self.wake_engine_failed:
+                engine, reason = 'whisper', 'openWakeWord failed repeatedly in this session'
             if (engine, reason) != self.wake_choice:
                 # One line per change, not one per sleep cycle.
                 print(f'Wake engine: {engine} ({reason}).', flush=True)
@@ -146,7 +149,7 @@ class VoiceInput:
                 return False
             if not isinstance(self.failed, MicrophoneDisconnected):
                 raise self.failed
-            print('Microphone USB connection lost. Reconnecting ReSpeaker.', file=sys.stderr, flush=True)
+            print(f'{self.failed} Reconnecting ReSpeaker.', file=sys.stderr, flush=True)
             self.accepting = False; self.hint = None; self.partials.clear()
             while not self.inputs.empty():
                 self.inputs.get_nowait()
@@ -228,12 +231,20 @@ class VoiceInput:
                     print(f"Wake word heard while awake (score {event.get('score', 0):.2f}).", flush=True)
                     if not self.barge_ins.full():
                         self.barge_ins.put_nowait(WakeWord(event.get('score'), event.get('t')))
+                elif status in ('metrics', 'warning'):
+                    # Worker health goes to microphone-chat.log, never to the display or OpenAI.
+                    if self.log:
+                        self.log.write(json.dumps(dict(event, time=time.strftime('%Y-%m-%dT%H:%M:%S'))) + '\n')
+                        self.log.flush()
                 elif status == 'microphone_error':
+                    if event.get('category') == 'wake_engine':
+                        self.wake_engine_failed = True
+                        raise MicrophoneDisconnected(event.get('message', 'Wake-word engine failed.'))
                     if event.get('category') == 'realtime_unavailable':
                         raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'),
                                                   retryable=event.get('retryable', True) is True)
                     if event.get('reconnectable') is True:
-                        raise MicrophoneDisconnected('ReSpeaker USB connection lost.')
+                        raise MicrophoneDisconnected(event.get('message') or 'ReSpeaker USB connection lost.')
                     raise incomplete or RuntimeError('Microphone failed. Check ~/.cache/face-agent/microphone-chat.log.')
                 elif self.accepting:
                     if status == 'wake_detected' and not self.awake:

@@ -130,6 +130,9 @@ class WakeWordThread(threading.Thread):
         # Set on each hit; cleared by whoever acts on it, never by this thread.
         self.wake_word_detected = detected or threading.Event()
         self.ready = threading.Event()
+        from worker_threads import Heartbeat
+        self.heartbeat = Heartbeat('wake-word', 2.0)
+        self.heartbeat.paused = True  # The model load is not a stall.
         self.error = None
         self.detector = None
         self.sub = None
@@ -140,7 +143,9 @@ class WakeWordThread(threading.Thread):
         try:
             self.detector = WakeDetector(self.model_factory(), self.threshold, self.patience, self.refractory)
             self.ready.set()
+            self.heartbeat.paused = False
             while not self.stop_event.is_set():
+                self.heartbeat.beat()
                 block = self.sub.get(.2)
                 if block is None:
                     continue
@@ -153,6 +158,7 @@ class WakeWordThread(threading.Thread):
         except BaseException as error:  # Reported to the worker's main loop, never swallowed.
             self.error = error
         finally:
+            self.heartbeat.paused = True
             self.ready.set()
             self.bus.unsubscribe(self.sub)
 

@@ -79,7 +79,55 @@ The supervisor is internal, so there's no flag. Revert the phase commit if neede
 - Don't send metrics to the display or to OpenAI.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-5-robustness`.
+
+**Design as built** (`scripts/worker_threads.py`, wired into `respeaker.serve()`)
+- Python threads can't be killed, so:
+  - a thread that **raised** is restarted within a budget;
+  - a thread that's **stuck** (no heartbeat) has its stack logged and is escalated as a reconnectable `microphone_error` with `category: stalled`. The parent's existing reconnect path then replaces the worker. No new parent retry loop was added.
+
+| Source | Failure | Handling |
+| --- | --- | --- |
+| T1 | stream stall or stop | reopen 3× (0.2/0.5/1 s), then `DeviceUnavailable` → reconnectable (phase 1) |
+| T1 | `USBError` errno 19 | reconnectable (unchanged) |
+| T2 | model exception | restart up to 3×/5 min, then `category: wake_engine`. The parent sets `wake_engine_failed` and the next worker uses Whisper. |
+| T3 | overflow or a dropped block in an utterance | `utterance_discarded` (`reason: overflow`); worker keeps running |
+| T3 | other exception | its utterance → `utterance_discarded` (`reason: error`), Realtime turn dropped, T3 restarted (3/min), then `category: recorder` |
+| T2/T3 | heartbeat older than 2 s | stack → `warning` in the log, then `category: stalled` |
+| Local STT | over 60 s | result dropped with a warning |
+| Realtime | `RealtimeUnavailable` | unchanged |
+
+- **Deviation (STT watchdog 60 s, not 5 s):** Whisper `small` takes about 10 s for a wake clip on this Pi (BASELINE), so a 5 s limit would fire on every Whisper wake. Realtime keeps its own 30 s timeout.
+- **Process-wide pause rule (found live):** after `SIGSTOP`/`SIGCONT`, all heartbeats are old for the same reason. If the supervisor loop itself was paused for more than 1 s, heartbeats are refreshed instead of judged.
+- **Metrics:** every 60 s → `microphone-chat.log`, written by the parent. Fields: frames, overflows, reopens, per-subscription depth and drops, wake stats, CPU seconds per thread (`/proc/self/task`), RSS, thread count. Wake drop rate above 1% over 10 s → `warning`.
+- **Shutdown:** stop events, joins with a 2 s timeout, and a `warning` naming any thread that didn't stop.
+- **onnxruntime:** openWakeWord already uses `intra_op_num_threads=1` / `ncpu=1` (checked in phase 2).
+
+**Checks**
+- [x] Full suite green: 203 tests. The only errors are the cv2-only tracker files, which pass in the tracking venv.
+  - `test_worker_threads.py` (5).
+  - Fault injection in `test_respeaker_worker.py`:
+    - stalled stream → `DeviceUnavailable`;
+    - a wake model raising once → restart, and detection continues;
+    - always raising → `wake_engine` after 3 restarts;
+    - T3 raising mid-utterance → discarded, restarted, and the next utterance is transcribed;
+    - overflow mid-utterance → discarded and still running;
+    - stuck recorder → `stalled` with its stack;
+    - a whole-process pause isn't treated as stuck (this test fails without the fix);
+    - periodic metrics;
+    - shutdown with busy threads in < 3 s, with no thread left.
+  - Parent: `wake_engine` → restart without `--wake-engine`; metrics and warnings land in `microphone-chat.log`.
+- [ ] Unplug and replug the ReSpeaker during IDLE, SPEAKING and SLEEPING. **Pending the owner.**
+- [x] `kill -STOP` the worker for 3 s, then `kill -CONT`:
+  - First run: the robot recovered by itself in about 3 s (`Microphone reconnected.`, SLEEPING with voice), but through a **false** "stuck" escalation.
+  - After the pause rule: same worker PID, no warning, still SLEEPING with voice.
+- [~] Soak (free, no paid turns): 100 sleep↔awake cycles via `/robot/set_status`, about 38 min.
+  - The first worker ran **73 cycles**: threads constant at 15, RSS 390.2 → 391.6 MB.
+  - Cycles 73–91 overlapped an unplanned network fault: Realtime connects timed out ("unavailable after 3 connection attempts") while about 400 MB of phase 7 HEFs downloaded. The existing recovery replaced the worker 5 times and the robot returned on its own. After the network recovered, cycles 92–100 were normal and it ended SLEEPING with voice.
+  - Worker metrics: 0 stream reopens, 2 input overflows (both in the first minute while Whisper loaded, outside any utterance), no wake drops (Whisper engine, no T2).
+  - **0 unrecovered failures.**
+  - The plan's full **1 h soak with 20 wakes, 10 barge-ins, 30 commands and 2 USB replugs is pending the owner**, since it needs the hi_kuro model, paid turns and hands on the cable.
 
 ## Open issues
-_(Fill in.)_
+- Overflows while Whisper loads (startup) show the callback can be starved for a moment under full CPU load. They're harmless outside an utterance. Inside one, the utterance is now discarded, not the worker.
+- Escalated failures (`stalled`, `recorder`) reuse the USB reconnect path. Its log line now names the real cause instead of always "USB connection lost".

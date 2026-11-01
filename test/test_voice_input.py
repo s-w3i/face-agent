@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -557,6 +557,12 @@ args=sys.argv[1:]
 mode=args[args.index('--initial-mode')+1]
 fail_awake='--fail-awake' in args
 print(json.dumps(dict(status='listening', mode=mode)), flush=True)
+print(json.dumps(dict(status='metrics', frames=1600, overflows=0, rss_kb=123)), flush=True)
+if '--fail-wake' in args and '--wake-engine' in args:
+    print(json.dumps(dict(status='warning', message='Wake-word thread failed; restarting it.')), flush=True)
+    print(json.dumps(dict(status='microphone_error', category='wake_engine', reconnectable=True,
+                          message='The wake-word engine failed repeatedly; falling back to Whisper.')), flush=True)
+    sys.exit(1)
 paused=True
 for line in sys.stdin:
     control=json.loads(line)
@@ -659,6 +665,28 @@ class LongLivedWorkerTest(VoiceIntegrationTest):
                 self.assertEqual((wake.score, wake.t), (.97, 55.0))
                 self.assertTrue(voice.inputs.empty())  # Never treated as a command or display text.
                 self.assertEqual(self.server.listening_text['text'], '')
+
+    async def test_wake_engine_failure_restarts_on_whisper_and_logs_health(self):
+        model = Path(self.directory.name) / 'wake/hi_kuro.onnx'
+        model.parent.mkdir()
+        model.write_bytes(b'onnx')
+        model.with_suffix('.json').write_text(json.dumps(dict(name='Kuro')))
+        env, exec_patch, log, out = self.patches(self.spawn_child(extra=('--fail-wake',)))
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out, redirect_stderr(io.StringIO()) as errors, \
+                patch('voice_input.asyncio.sleep', new_callable=AsyncMock):
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.ensure_microphone()  # Usually already recovered during startup sync.
+                self.assertTrue(voice.wake_engine_failed)
+                self.assertIsNone(voice.failed)
+                self.assertGreaterEqual(len(self.commands), 2)
+        self.assertIn('--wake-engine', self.commands[0])
+        self.assertNotIn('--wake-engine', self.commands[-1])  # Whisper from now on.
+        self.assertIn('falling back to Whisper. Reconnecting ReSpeaker.', errors.getvalue())
+        health = (Path(self.directory.name) / 'face-agent/microphone-chat.log').read_text()
+        self.assertIn('"status": "metrics"', health)
+        self.assertIn('Wake-word thread failed', health)
 
     async def test_continued_wake_requests_capture_from_wake_time(self):
         model = Path(self.directory.name) / 'wake/hi_kuro.onnx'

@@ -10,7 +10,7 @@ source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" >/dev/null 2>&1
 source ros2/install/local_setup.bash >/dev/null 2>&1
 log="$HOME/.cache/face-agent/stack-agent.log"
 status() { .venv/bin/python -c "import sys;sys.path.insert(0,'scripts');from dotsctl import request;print((request('http://127.0.0.1:5173','status').get('robotStatus') or {}).get('status'))"; }
-worker() { pgrep -f "scripts/respeaker.py --diagnostics --control-stdin" | head -1; }
+worker() { pgrep -f "^[^ ]*/python [^ ]*scripts/respeaker.py --diagnostics --control-stdin" | head -1; }
 for i in $(seq 1 "$cycles"); do
   for _ in $(seq 1 120); do [ "$(status)" = SLEEPING ] && break; sleep 0.5; done
   sleep 1

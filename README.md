@@ -110,6 +110,15 @@ Conversation input appears centered above the character; smaller reply subtitles
 
 Temporary Realtime disconnections, transcription timeouts, audio queue overflow, an unexpected voice worker exit, or a stalled playback gate automatically restart the microphone/transcription worker. The agent shows ERROR with input paused while reconnecting, then returns to IDLE only after the replacement worker is ready. Retries wait 1, 2, 4, 8, 15, then 30 seconds between attempts, continuing at 30 seconds while unavailable. Conversation history stays intact; repeat the interrupted utterance, which is never automatically replayed. Recovery stops if another ROS node changes the status, including publishing its own ERROR. Rejected credentials, quota, or configuration need correction; after fixing them, set IDLE to retry. Other unrelated errors remain visible as ERROR.
 
+Inside the microphone worker, every thread is supervised:
+- Audio that overflows or drops during an utterance discards only that utterance.
+- If the command recorder raises, it discards its utterance and restarts, up to 3 times a minute.
+- If the wake-word thread raises, it restarts up to 3 times in 5 minutes. After that the worker reports a `wake_engine` failure, and the replacement worker uses Whisper wake detection for the rest of the session.
+- A thread that stops responding for 2 seconds is logged with its stack, and the worker is replaced through the reconnect path above.
+- A stalled audio stream is reopened three times before it counts as a USB disconnect.
+
+Once a minute the worker writes a `metrics` line to `~/.cache/face-agent/microphone-chat.log`: frames, overflows, stream reopens, per-consumer queue depth and drops, wake detections and peak score, CPU seconds per thread, RSS and thread count. Warnings are logged there too, for example a wake detector that drops more than 1% of audio over 10 seconds. None of this is sent to the display or to OpenAI.
+
 To start asleep, run the manager **before** the display or chatbot in another terminal:
 
 ```bash

@@ -301,6 +301,155 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.status('transcript_final'))
         self.assertEqual(len(self.status('transcript_final')), 1)
 
+    # ---- phase 5: fault injection -------------------------------------------------
+
+    async def test_stalled_stream_reports_reconnectable_device_error(self):
+        class Silent(PacedStream):
+            def run(self):
+                pass  # Never delivers a frame (USB audio stopped).
+        def stalled(bus, device, rate, block):
+            producer = ab.AudioProducer(bus, device, rate, block, stream_factory=Silent, stall_seconds=.1)
+            producer.REOPEN_DELAYS = (.01, .01, .01)
+            return producer
+        with patch('respeaker.AudioProducer', side_effect=stalled):
+            task = asyncio.create_task(r.serve(arguments(self.directory.name), self.dev))
+            with self.assertRaises(r.DeviceUnavailable):
+                await asyncio.wait_for(task, 5)
+
+    def wake_model(self, failures):
+        state = dict(calls=0)
+        def predict(frame):
+            state['calls'] += 1
+            if state['calls'] in failures:
+                raise RuntimeError('onnxruntime failure')
+            return {'hi_kuro': .9 if state['calls'] % 40 in (10, 11) else 0.0}
+        model = Mock()
+        model.predict.side_effect = predict
+        return model
+
+    async def test_wake_model_error_restarts_the_thread_and_detection_continues(self):
+        with patch('wake_word.load_model', return_value=self.wake_model({3})):
+            await self.start(wake_engine='oww')
+            await self.control(1, paused=False)
+            self.state.resume_at = 0
+            await self.until(lambda: self.status('wake_detected'), timeout=5)
+        self.assertTrue(any('Wake-word thread failed' in e.get('message', '') for e in self.status('warning')))
+        self.assertFalse(self.task.done())
+
+    async def test_repeated_wake_model_errors_become_a_wake_engine_failure(self):
+        with patch('wake_word.load_model', return_value=self.wake_model(set(range(1, 1000)))):
+            task = asyncio.create_task(r.serve(arguments(self.directory.name, wake_engine='oww'), self.dev))
+            with self.assertRaises(r.WorkerFailure) as raised:
+                await asyncio.wait_for(task, 5)
+        self.assertEqual(raised.exception.category, 'wake_engine')
+        self.assertEqual(len([e for e in self.status('warning') if 'restarting it' in e['message']]), 3)
+
+    async def test_recorder_error_mid_utterance_discards_and_recorder_restarts(self):
+        test = self
+        class GlitchyDev:
+            calls = 0
+            def is_voice(self):
+                return test.voice
+            @property
+            def direction(self):
+                GlitchyDev.calls += 1
+                if GlitchyDev.calls == 2:
+                    raise ValueError('pyusb glitch')
+                return 30
+        self.dev = GlitchyDev()
+        await self.start(initial_mode='awake')
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        self.speech = True
+        self.voice = True
+        await self.until(lambda: self.status('utterance_discarded'))
+        self.assertEqual(self.status('utterance_discarded')[0]['reason'], 'error')
+        self.voice = False
+        await asyncio.sleep(.1)
+        self.voice = True  # The restarted recorder takes the next utterance.
+        await self.until(lambda: len(self.status('utterance_started')) == 2)
+        self.voice = False
+        self.speech = False
+        await self.until(lambda: self.status('transcript_final'))
+        self.assertTrue(any('Command recorder failed' in e['message'] for e in self.status('warning')))
+
+    async def test_overflow_during_utterance_discards_it_and_keeps_running(self):
+        await self.start(initial_mode='awake')
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        recorder = next(t for t in threading.enumerate() if t.name == 'command-recorder')
+        original = recorder.producer.bus.publish
+        def lossy(pcm, t, seq, overflow=False):
+            original(pcm, t, seq, overflow or seq % 25 == 0)
+        recorder.producer.bus.publish = lossy
+        self.speech = True
+        self.voice = True
+        await self.until(lambda: self.status('utterance_discarded'))
+        discarded = self.status('utterance_discarded')[0]
+        self.assertEqual(discarded['reason'], 'overflow')
+        self.assertEqual(self.status('transcript_final'), [])
+        self.assertFalse(self.task.done())
+
+    async def test_stuck_recorder_is_escalated_with_its_stack(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        def hang():
+            release.wait(5)  # pyusb control transfer that never returns
+            return False
+        self.dev.is_voice.side_effect = hang
+        from worker_threads import Heartbeat as RealHeartbeat
+        with patch('respeaker.Heartbeat', side_effect=lambda name, limit: RealHeartbeat(name, .3)):
+            task = asyncio.create_task(r.serve(arguments(self.directory.name, initial_mode='awake'), self.dev))
+            await self.until(lambda: self.status('listening'))
+            await self.state.apply(dict(paused=False, sequence=1))
+            self.state.resume_at = 0
+            with self.assertRaises(r.WorkerFailure) as raised:
+                await asyncio.wait_for(task, 5)
+        self.assertEqual(raised.exception.category, 'stalled')
+        warning = next(e for e in self.status('warning') if 'stuck' in e['message'])
+        self.assertIn('hang', warning['stack'])
+
+    async def test_whole_process_pause_is_not_reported_as_a_stuck_thread(self):
+        from worker_threads import Heartbeat as RealHeartbeat
+        with patch('respeaker.Heartbeat', side_effect=lambda name, limit: RealHeartbeat(name, .3)):
+            await self.start(initial_mode='awake')
+            await self.control(1, paused=False)
+            self.state.resume_at = 0
+            await asyncio.sleep(.1)
+            recorder = next(t for t in threading.enumerate() if t.name == 'command-recorder')
+            with recorder.dev.lock:  # The recorder blocks in is_voice()...
+                time.sleep(1.2)      # ...while the event loop is blocked too: like SIGSTOP.
+            await asyncio.sleep(.5)
+        self.assertFalse(self.task.done())
+        self.assertFalse([e for e in self.status('warning') if 'stuck' in e['message']])
+
+    async def test_metrics_are_emitted_periodically(self):
+        with patch('respeaker.METRICS_SECONDS', .2):
+            await self.start(initial_mode='awake')
+            await self.until(lambda: self.status('metrics'), timeout=3)
+        metrics = self.status('metrics')[0]
+        for key in ('frames', 'overflows', 'reopen_count', 'subscriptions', 'thread_cpu_s', 'rss_kb', 'threads'):
+            self.assertIn(key, metrics)
+        self.assertIn('command-recorder', metrics['thread_cpu_s'])
+
+    async def test_shutdown_with_busy_threads_is_quick_and_leaves_nothing_running(self):
+        model = Mock()
+        model.predict.return_value = {'hi_kuro': 0.0}
+        with patch('wake_word.load_model', return_value=model):
+            await self.start(initial_mode='awake', wake_engine='oww')
+            await self.control(1, paused=False)
+            self.state.resume_at = 0
+            self.speech = True
+            self.voice = True
+            await self.until(lambda: self.status('utterance_started'))
+            started = time.monotonic()
+            self.state.stopping = True
+            await asyncio.wait_for(self.task, 3)
+        self.assertLess(time.monotonic() - started, 3)
+        names = {t.name for t in threading.enumerate() if t.is_alive()}
+        self.assertFalse(names & {'command-recorder', 'wake-word', 'audio-watchdog'})
+        self.assertFalse([e for e in self.status('warning') if 'did not stop' in e['message']])
+
     def recorder_bus(self):
         recorder = next(t for t in threading.enumerate() if t.name == 'command-recorder')
         return recorder.producer.bus
