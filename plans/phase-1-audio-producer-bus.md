@@ -91,7 +91,24 @@ Rules:
 - Don't call `dev.*` without the lock.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-1-audio-bus`.
+
+- [x] Full suite green, plus the new `test/test_audio_bus.py` (12 tests).
+  - `.venv`: 145 tests, with only the errors that predate this phase (see BASELINE.md).
+  - `test_respeaker.py` keeps the old assertions: 10 s cap, trigger before capture, pause discards, overflow/disconnect return nothing, single utterance, late transcript suppressed.
+  - It adds pre-roll, a dropped block, idle stream failure, `--legacy-stream` and `--preroll-seconds 0`.
+- [x] `respeaker.py --no-stt --once --diagnostics`, driven by the synthetic "What time is it?" through the speaker:
+  - The WAV now opens with about 260 ms of room noise (−40 to −50 dBFS per 20 ms) before the speech starts.
+  - Baseline: every recording started mid-speech (first 60 ms at −17 to −34 dBFS), and 2/9 transcripts lost "What".
+- [x] `respeaker.py --once --diagnostics` (Realtime): **5/5 transcribed "What time is it?" exactly**, each with 0 overflows and 0 reopens.
+- [x] 30 min idle, standalone with `--no-stt --seconds 1800` and the stack stopped:
+  - 28,800,640 frames (1800.04 s, nothing lost), **0 overflows, 0 reopens**;
+  - worker CPU **0.88% mean** (max 1.03%, `pidstat` 60 s samples), versus the BASELINE idle worker at 1.2–1.3%. Target was ≤ baseline + 3 points.
+- [ ] Unplugging the USB mic → `microphone_error reconnectable` within 2 s. **Manual check pending (owner).**
+  - Covered by tests: a stalled stream reopens 3× and then reports `DeviceUnavailable`.
+  - In practice `dev.is_voice()` raises USBError errno 19 on unplug within one 50 ms poll; the existing reconnectable path handles that.
 
 ## Open issues
-_(Fill in.)_
+- The worst-case watchdog path (no USB error, stream silently stalled) takes 0.5 s detection plus the 0.2/0.5/1 s backoff, so it can exceed the 2 s target. Unplugging normally surfaces sooner through pyusb.
+- `capture_stats` is only emitted when the worker exits. Periodic metrics are phase 5.
+- During the suite run before this phase's last edits, one full-suite run stalled for more than 600 s. It didn't recur in three later runs (each about 170 s), and every file passes on its own. If it shows up again, look at the ROS-based `test_global_status` first.
