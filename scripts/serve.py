@@ -2,6 +2,7 @@
 """Local dots display service: static assets, one config file, and live commands."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import base64
+import hashlib
 import io
 import json
 import math
@@ -131,6 +132,7 @@ class RobotServer(ThreadingHTTPServer):
             raise ValueError('The private key must be outside the workspace and web files.')
         # ponytail: one speech job per robot; add a queue if concurrent callers need it.
         self.speech_lock = threading.Lock()
+        self.wake_ack_lock = threading.Lock()
         self.speech_socket = None; self.speech_identity = None; self.speech_opened = 0
         self.audio = None
         self.changed = threading.Condition()
@@ -312,6 +314,41 @@ class RobotServer(ThreadingHTTPServer):
             wav.setparams((1, 2, 24000, 0, 'NONE', 'not compressed')); wav.writeframes(pcm)
         return audio.getvalue()
 
+    def wake_ack(self, *, prepare=False):
+        return self.cached_announcement('Yes? I am here, what can I help you?', 'wake-ack', prepare=prepare)
+
+    def startup_ready_text(self, *, sleeping=True):
+        name = self.config()['appearance']['name']
+        text = f'{name} is ready.'
+        return text + f' Say Hi {name} to wake me up.' if sleeping else text
+
+    def startup_ready(self, *, sleeping=True, prepare=False):
+        return self.cached_announcement(self.startup_ready_text(sleeping=sleeping),
+                                        'startup-ready', prepare=prepare)
+
+    def cached_announcement(self, text, cache_name, *, prepare=False):
+        """Generate once per voice/text; cached playback never contacts the cloud."""
+        voice = self.config()['settings'].get('ttsVoice', 'marin')
+        identity = hashlib.sha256(f'{SPEECH_MODEL}|{voice}|{text}'.encode()).hexdigest()
+        cache = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent' / cache_name
+        path = cache / f'{identity}.wav'
+        with self.wake_ack_lock:
+            if path.exists():
+                return path.read_bytes()
+            if not prepare:
+                raise ValueError('Announcement is not cached for this voice and text. Restart the voice agent.')
+            audio = self.speech(dict(text=text, voice=voice))
+            cache.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix='wake.', dir=cache)
+            try:
+                with os.fdopen(descriptor, 'wb') as output:
+                    output.write(audio)
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            return audio
+
     def finish_clip(self, clip, events, sequence):
         try:
             for event in events:
@@ -338,6 +375,8 @@ class Handler(SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
     def end_headers(self):
+        if urlparse(self.path).path == '/' or urlparse(self.path).path.endswith('.html'):
+            self.send_header('Cache-Control', 'no-store')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
         super().end_headers()
@@ -534,8 +573,25 @@ class Handler(SimpleHTTPRequestHandler):
                 self.reply(dict(configured=True)); return
             if path == '/api/speech-stream':
                 self.local_voice(); self.stream_reply(self.server.speech_events(value)); return
-            if path in ('/api/speech', '/api/say'):
+            if path in ('/api/speech', '/api/say', '/api/wake-ack', '/api/startup-ready'):
                 self.local_voice()
+                if path == '/api/wake-ack':
+                    if not isinstance(value, dict) or set(value) - {'prepare', 'statusRevision'} or type(value.get('prepare', False)) is not bool:
+                        raise ValueError('Supply prepare or a robot status revision for wake acknowledgment.')
+                    if value.get('prepare'):
+                        self.server.wake_ack(prepare=True)
+                        self.reply(dict(ready=True)); return
+                    value = dict(text='Yes? I am here, what can I help you?', **value)
+                if path == '/api/startup-ready':
+                    if (not isinstance(value, dict) or set(value) - {'prepare', 'statusRevision', 'sleeping'}
+                            or type(value.get('prepare', False)) is not bool
+                            or type(value.get('sleeping', True)) is not bool):
+                        raise ValueError('Supply prepare, sleeping, or a robot status revision for startup announcement.')
+                    sleeping = value.get('sleeping', True)
+                    if value.get('prepare'):
+                        self.server.startup_ready(sleeping=sleeping, prepare=True)
+                        self.reply(dict(ready=True)); return
+                    value = dict(value, text=self.server.startup_ready_text(sleeping=sleeping))
                 if isinstance(value, dict) and 'text' not in value:
                     value = dict(value, text=f"Hi, I am {self.server.config()['appearance']['name']}.")
                 with self.server.changed:
@@ -545,7 +601,9 @@ class Handler(SimpleHTTPRequestHandler):
                     previous_sequence = self.server.command['sequence']
                 streaming = path == '/api/say' and isinstance(value, dict) and value.get('stream') is True
                 events = self.server.speech_events(value) if streaming else None
-                audio = SpeechClip(next(events)) if streaming else self.server.speech(value)
+                audio = (self.server.wake_ack() if path == '/api/wake-ack' else
+                         self.server.startup_ready(sleeping=sleeping) if path == '/api/startup-ready' else
+                         SpeechClip(next(events)) if streaming else self.server.speech(value))
                 if path == '/api/speech':
                     self.audio_reply(audio); return
                 with self.server.changed:

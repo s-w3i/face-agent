@@ -137,6 +137,10 @@ for line in sys.stdin:
         async def spawn(*command, **options):
             model = command[command.index('--stt-model') + 1]
             models.append(model)
+            self.assertEqual(command[command.index('--silence-seconds') + 1],
+                             '0.8' if model == 'gpt-live-transcribe' else '0.4')
+            self.assertEqual(command[command.index('--max-seconds') + 1], '10')
+            self.assertEqual(command[command.index('--vad-mode') + 1], '2')
             self.assertEqual('--single-utterance' in command, model == 'gpt-live-transcribe')
             return await original(sys.executable, str(child), model, **options)
         self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))

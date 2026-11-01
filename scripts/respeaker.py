@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ReSpeaker hardware voice trigger, two-second audio endpoint, Realtime or local STT."""
+"""ReSpeaker hardware voice trigger, 0.8-second audio endpoint, Realtime or local STT."""
 import argparse
 import asyncio
 import json
@@ -57,7 +57,7 @@ def select_input(requested=None):
 
 class SpeechEndpoint:
     """Measure consecutive nonspeech samples rather than elapsed USB/CPU time."""
-    def __init__(self, seconds=2.0):
+    def __init__(self, seconds=0.8):
         self.limit = round(seconds * RATE)
         self.silent_samples = 0
 
@@ -112,7 +112,7 @@ def check_controller(controller):
 async def record_utterance(args, dev, device, state, led, utterance_id, deadline, controller, realtime=None):
     """Capture only after hardware VAD. Pausing discards and closes the clip."""
     endpoint = SpeechEndpoint(args.silence_seconds)
-    vad = webrtcvad.Vad(1)
+    vad = webrtcvad.Vad(args.vad_mode)
     pcm = bytearray()
     direction = dev.direction
     next_direction = 0.0
@@ -206,7 +206,8 @@ async def listen(args, dev):
             emit({'status': 'transcription_ready', 'model': args.stt_model,
                   'backend': 'realtime' if realtime else 'local'})
         emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
-              'trigger': 'hardware_vad', 'silence_seconds': args.silence_seconds})
+              'trigger': 'hardware_vad', 'silence_seconds': args.silence_seconds,
+              'max_seconds': args.max_seconds, 'vad_mode': args.vad_mode})
         deadline = time.monotonic() + args.seconds if args.seconds else math.inf
         utterance_id = clip_count = 0
         while not state.stopping and time.monotonic() < deadline:
@@ -272,8 +273,10 @@ def main():
     parser.add_argument('--device', help='PortAudio input index/name; auto-detect ReSpeaker by default')
     parser.add_argument('--seconds', type=float, default=0, help='Limit session duration; 0 waits indefinitely')
     parser.add_argument('--once', action='store_true', help='Exit after one utterance')
-    parser.add_argument('--silence-seconds', type=float, default=2.0)
-    parser.add_argument('--max-seconds', type=float, default=30, help='Maximum length of one utterance')
+    parser.add_argument('--silence-seconds', type=float, default=0.8)
+    parser.add_argument('--max-seconds', type=float, default=10, help='Maximum length of one utterance')
+    parser.add_argument('--vad-mode', type=int, choices=range(4), default=2,
+                        help='WebRTC VAD aggressiveness: 0 (least) to 3 (most)')
     parser.add_argument('--wav', default=str(ROOT / 'test-output' / f'respeaker-{time.time_ns()}.wav'))
     parser.add_argument('--no-stt', action='store_true', help='Save utterances without transcription')
     parser.add_argument('--no-led', action='store_true', help='Leave the LED ring alone')

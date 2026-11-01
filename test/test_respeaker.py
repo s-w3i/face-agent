@@ -20,19 +20,19 @@ import respeaker as r
 def arguments(path, **changes):
     values = dict(device=None, wav=str(path), control_stdin=False, no_led=True,
                   no_stt=True, stt_model='small', language='en', seconds=0,
-                  once=True, silence_seconds=2, max_seconds=30)
+                  once=True, silence_seconds=0.8, max_seconds=10, vad_mode=2)
     return SimpleNamespace(**{**values, **changes})
 
 
 class EndpointTest(unittest.TestCase):
-    def test_two_seconds_of_audio_and_speech_resets_timer(self):
+    def test_point_eight_seconds_of_audio_and_speech_resets_timer(self):
         endpoint = r.SpeechEndpoint()
-        for _ in range(99):
+        for _ in range(39):
             self.assertFalse(endpoint.update(False, 320))
         self.assertTrue(endpoint.update(False, 320))
         self.assertFalse(endpoint.update(True, 320))
         self.assertEqual(endpoint.silent_samples, 0)
-        for _ in range(99):
+        for _ in range(39):
             self.assertFalse(endpoint.update(False, 320))
         self.assertTrue(endpoint.update(False, 320))
 
@@ -87,6 +87,21 @@ class EndpointTest(unittest.TestCase):
 
 
 class CaptureTest(unittest.IsolatedAsyncioTestCase):
+    async def test_continuous_speech_stops_at_ten_seconds(self):
+        stream = Mock()
+        stream.__enter__ = Mock(return_value=stream)
+        stream.__exit__ = Mock(return_value=False)
+        stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), False)
+        with patch('respeaker.sd.InputStream', return_value=stream), \
+                patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+            vad.return_value.is_speech.return_value = True
+            event = await r.record_utterance(arguments('unused.wav'), Mock(direction=20),
+                                             1, r.Controls(), None, 1, math.inf, None)
+        self.assertEqual(event['reason'], 'maximum_duration')
+        self.assertEqual(len(event['pcm']) / (r.RATE * 2), 10)
+        self.assertEqual(stream.read.call_count, 500)
+        self.assertEqual(event['silence_seconds'], 0)
+
     async def test_idle_waits_for_hardware_before_opening_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             args = arguments(Path(directory) / 'voice.wav')
@@ -110,10 +125,11 @@ class CaptureTest(unittest.IsolatedAsyncioTestCase):
                 await r.listen(args, dev)
                 self.assertEqual(trigger_count, 3)
                 capture.assert_called_once()
-                self.assertEqual(stream.read.call_count, 100)
+                self.assertEqual(stream.read.call_count, 40)
+                vad.assert_called_once_with(2)
                 saved = [call.args[0] for call in emit.call_args_list if call.args[0]['status'] == 'utterance_saved'][0]
-                self.assertEqual(saved['silence_seconds'], 2)
-                self.assertEqual(saved['duration_seconds'], 2)
+                self.assertEqual(saved['silence_seconds'], 0.8)
+                self.assertEqual(saved['duration_seconds'], 0.8)
 
     async def test_pause_acknowledged_only_after_stream_closes_and_clip_discarded(self):
         state = r.Controls()

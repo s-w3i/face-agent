@@ -71,7 +71,9 @@ class VoiceInput:
         self.failed = None; self.paused = True; self.accepting = False; self.sequence = 0
         self.utterance_active = False; self.turn_complete = False
         self.controls.clear()
-        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin', '--stt-model', self.model if self.awake else self.wake_model]
+        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
+                   '--silence-seconds', '0.8' if self.awake else '0.4', '--max-seconds', '10', '--vad-mode', '2',
+                   '--stt-model', self.model if self.awake else self.wake_model]
         if self.status_driven and self.awake:
             command += ['--single-utterance']
         if not self.awake:

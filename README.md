@@ -323,7 +323,7 @@ Test the microphone separately with the chatbot stopped:
 .venv/bin/python scripts/respeaker.py --no-stt --once --diagnostics
 ```
 
-The hardware voice flag is polled every 50 ms. Recording opens only after that trigger; there is no idle capture or pre-roll, so stream startup can miss the very beginning of speech. Capture uses 16 kHz mono PCM. WebRTC VAD checks 20 ms frames and stops after 2 seconds of consecutive nonspeech; new speech resets that countdown. Utterances are limited to 30 seconds by default.
+The hardware voice flag is polled every 50 ms. Recording opens only after that trigger; there is no idle capture or pre-roll, so stream startup can miss the very beginning of speech. Capture uses 16 kHz mono PCM. WebRTC VAD uses mode 2, checks 20 ms frames and stops after 0.8 seconds of consecutive nonspeech; new speech resets that countdown. Utterances are limited to 10 seconds. Voice chat uses `small` locally with a 0.4-second silence timeout for wake detection. Awake command recording uses 0.8 seconds of silence. Both modes retain the 10-second recording cap and VAD mode 2. Standalone capture can override them with `--silence-seconds`, `--max-seconds`, and `--vad-mode` (0–3).
 
 Standalone options include `--silence-seconds`, `--max-seconds`, `--device INDEX_OR_NAME`, and `--no-led`. Unique WAV files are saved under ignored `test-output/`, including the trailing silence. Local Whisper needs its model downloaded once; Realtime needs the configured API key and internet access. Playback pauses close the microphone stream before speech output resumes.
 
@@ -354,6 +354,113 @@ For a new animation pack:
 No frontend build is needed after copying the pack. Re-bake after changing appearance, motion strength, reduced motion, or background. Name, voice, subtitles, and gaze remain live settings. Keep the API key device-local, and install environments/build ROS interfaces separately on each machine.
 
 See [pre-rendered playback details](docs/prerendered.md) for pack format and gaze limitations, [tracking details](docs/human-tracking.md) for model/camera internals, and [motion reference](docs/dots-motion-reference.md) for renderer observations. The runtime commands and status behavior in this README describe the current `pi5` branch.
+
+## Real robot navigation over LAN MCP
+
+The face agent can connect to the robot navigation server from the Pi without
+installing ROS navigation packages or copying the map/waypoint XML to the Pi.
+The MCP link uses the private LAN; existing cloud chat/voice services retain their
+normal connectivity requirements.
+
+Actual robot navigation is the saved default on this Pi. These settings in
+`~/.config/face-agent/startup.env` persist across stack relaunches and logins:
+
+```bash
+DOTS_NAV_MCP_URL=http://192.168.10.10:8000/mcp
+DOTS_NAV_MCP_MOCK=0
+```
+
+After changing these settings, restart the desktop service:
+
+```bash
+systemctl --user restart face-agent.service
+```
+
+For a manual chat session use `--navigation-mcp-url http://192.168.10.10:8000/mcp`
+(or its alias `--mcp-url`). `DOTS_NAV_MCP_URL` supplies the default. Explicit
+`--turtlesim` selects the simulator instead of the configured real robot.
+
+Check the same connection without a cloud request, camera, microphone, or motion:
+
+```bash
+cd ~/face-agent
+.venv/bin/python scripts/chat.py --navigation-mcp-url http://192.168.10.10:8000/mcp --check-navigation-mcp
+```
+
+Navigation tools connect on demand; startup does not contact the remote server. Requests such as “Go to
+the kitchen” use `navigate_to_region` and the names loaded by `wp_map_tools` on
+the robot. The current names are `kitchen`, `bedroom`, and `living room`.
+Navigation tools wait for Nav2 to finish, and the agent only reports arrival
+when the navigation result confirms success. Simulator queue/status/announcement
+hooks are disabled for this connection. Movement requests are not automatically
+retried after connection failures.
+
+Keep the robot MCP server, Nav2, localization, and waypoint bridge running at
+`192.168.10.10:8000`. The robot pose must be localized before requesting movement.
+Read startup diagnostics in `~/.cache/face-agent/stack-agent.log`.
+
+After the local voice worker is ready, the voice agent
+says “Kuro is ready. Say Hi Kuro to wake me up.” once per start. The microphone
+is paused through playback, then local wake listening resumes. Wait for this
+announcement before saying “Hi Kuro”; the face display can appear earlier.
+Realtime command transcription connects after waking. A fixed “Yes? I am here, what can I help you?” WAV is generated once
+for the selected voice before the startup-ready announcement and stored under
+`~/.cache/face-agent/wake-ack/`. Waking replays this local clip while Realtime
+connects, with the microphone held closed through playback and connection. A
+bare “Hi Kuro” skips the generated greeting; a command after the wake phrase
+still reaches the agent. Cached acknowledgment playback needs no network.
+Changing the speech voice requires restarting the agent to prepare its clip.
+`DOTS_WAKE_MODEL` or `--wake-model` overrides the default `small` wake model. `--no-speak` also disables
+the startup announcement. An external ROS status change takes precedence.
+
+Startup readiness audio is also persisted under
+`~/.cache/face-agent/startup-ready/`, keyed by the selected voice and robot name.
+Both sleeping and already-awake startup phrases are prepared once; subsequent
+starts play the local WAV without a cloud speech connection. Changing the voice
+or robot name requires one online preparation before offline playback is available.
+The microphone remains paused through the announcement, then wake listening resumes.
+
+## Voice tests with the robot stationary
+
+Use the standalone mock endpoint `http://192.168.10.10:8001/mcp` while the real
+robot setup is incomplete. This server reads the same waypoint XML but imports
+no ROS code and has no publishers, Nav2 actions, or physical robot connection.
+Its three tools simulate pose, named navigation, and cancellation.
+
+To temporarily select mock mode, replace the actual-mode settings in
+`~/.config/face-agent/startup.env` with these values and restart the service:
+
+```bash
+DOTS_NAV_MCP_URL=http://192.168.10.10:8001/mcp
+DOTS_NAV_MCP_MOCK=1
+```
+
+Mock mode probes the endpoint before attaching its tools and refuses a real
+server. It never falls back to the real MCP URL. Stop the real MCP endpoint
+when running this stationary test. Keep voice mode running normally, say “Hi Kuro”, then test:
+
+- “Go to the kitchen.”
+- “Go to the bedroom.”
+- “Go to the living room.”
+
+The voice reply should clearly describe a completed mock test with the robot
+staying still. All reported navigation poses and arrivals are simulated.
+
+Read-only check on the Pi:
+
+```bash
+.venv/bin/python scripts/chat.py --navigation-mcp-url http://192.168.10.10:8001/mcp --navigation-mcp-mock --check-navigation-mcp
+```
+
+Start the mock server on the robot computer:
+
+```bash
+/home/robot10/MCP-for-Robocup-Malaysia-2026/.venv/bin/python -m robot_mcp.mock_region_nav_server --host 192.168.10.10 --port 8001 --waypoints /home/robot10/maps/waypoints.xml
+```
+
+When the physical setup is complete, explicitly restore port 8000, set
+`DOTS_NAV_MCP_MOCK=0`, restart the real MCP server, and restart the face-agent
+service to enable physical navigation again.
 
 ## Optional turtlesim control
 
@@ -452,3 +559,25 @@ source /opt/ros/jazzy/setup.bash
 ```
 
 Bundled runtime notices are in [public/local-dots/THIRD_PARTY_NOTICES.txt](public/local-dots/THIRD_PARTY_NOTICES.txt). Font licenses are in [public/fonts/](public/fonts/).
+
+
+### Boot readiness
+
+The desktop autostart helper imports the graphical-session environment before
+starting `face-agent.service`. The service waits for DISPLAY or WAYLAND_DISPLAY
+instead of failing before graphical login. The face, camera, microphone and
+cached ready announcement start independently of the remote navigation server.
+
+Navigation tool definitions are stored locally in
+`scripts/navigation_tool_manifest.json`. Tool discovery and ordinary conversation
+make no network request to the navigation MCP. Each actual navigation-tool call
+opens a connection, validates the remote tools (and mock identity when enabled),
+calls once, then closes it. An unavailable server returns a tool error while chat
+continues; a later explicit request tries again. A lost in-flight request is
+reported as unconfirmed and movement is never automatically replayed.
+`--check-navigation-mcp` remains an explicit read-only connectivity check. Update
+the local tool manifest if the remote navigation tool contract changes.
+
+On the robot computer, `region-nav-mcp.service` is enabled and the robot10 user
+manager has lingering enabled so its endpoint can start before desktop login.
+The face agent does not depend on this service being available.

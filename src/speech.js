@@ -11,6 +11,7 @@ export class SpeechPlayer {
     this.generation++;
     this.reader?.cancel().catch(() => {}); this.reader = null;
     this.finishStream?.(); this.finishStream = null;
+    this.finishPlayback?.(); this.finishPlayback = null;
     for (const source of this.sources) { source.onended = null; source.stop(); source.disconnect(); }
     this.sources.clear();
     if (this.source) {
@@ -33,11 +34,20 @@ export class SpeechPlayer {
     this.samples = new Float32Array(this.analyser.fftSize);
     source.buffer = buffer; source.connect(this.analyser); this.analyser.connect(this.context.destination);
     this.source = source;
+    let resolvePlayback;
+    const playback = new Promise(resolve => { resolvePlayback = resolve; });
+    this.finishPlayback = resolvePlayback;
     source.onended = () => {
       if (this.source !== source) return;
-      this.source = null; source.disconnect(); this.analyser.disconnect(); this.onSubtitle(''); onEnd();
+      this.source = null; source.disconnect(); this.analyser.disconnect(); this.onSubtitle('');
+      this.finishPlayback = null; onEnd(); resolvePlayback();
     };
-    this.onSubtitle(text); onStart(); source.start();
+    try {
+      this.onSubtitle(text); onStart(); source.start();
+      await playback;
+    } catch (error) {
+      this.stop(); throw error;
+    }
   }
 
   async stream(response, onStart, onEnd, onTiming = () => {}, text = '') {

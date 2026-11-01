@@ -8,10 +8,15 @@ if [ ! -r "$camera_setup" ]; then
   exit 1
 fi
 source "$camera_setup"
+
 exec ros2 launch orbbec_camera gemini_330_series.launch.py \
   camera_name:=head_camera \
-  enable_color:=true color_width:=1280 color_height:=720 color_fps:=15 color_format:=MJPG \
-  enable_depth:=true depth_width:=640 depth_height:=480 depth_fps:=30 depth_format:=Y16 \
-  enable_point_cloud:=true enable_colored_point_cloud:=false \
-  enable_frame_sync:=false enable_laser:=true laser_energy_level:=5 \
+  enable_color:=true color_width:=640 color_height:=480 \
+  color_fps:=15 color_format:=MJPG \
+  enable_depth:=true depth_width:=640 depth_height:=480 \
+  depth_fps:=15 depth_format:=Y16 \
+  depth_registration:=true enable_frame_sync:=true \
+  enable_point_cloud:=false enable_colored_point_cloud:=false \
+  enable_laser:=true laser_energy_level:=5 \
+  color_qos:=SENSOR_DATA depth_qos:=SENSOR_DATA \
   uvc_backend:=v4l2 retry_on_usb3_detection_failure:=false "$@"
