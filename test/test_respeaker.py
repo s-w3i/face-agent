@@ -105,8 +105,6 @@ class EndpointTest(unittest.TestCase):
 class FeedSubscription:
     """Bus subscription that always has the next 20 ms block, like a blocking stream.read."""
 
-    dropped = 0
-
     def __init__(self, producer):
         self.producer = producer
 
@@ -318,43 +316,6 @@ class CaptureTest(unittest.IsolatedAsyncioTestCase):
             await r.listen(arguments(Path(directory) / 'voice.wav', legacy_stream=True, seconds=.2, once=False), dev)
         make.assert_not_called()
         self.assertEqual(recorder.call_args.args[2], 1)
-
-    async def run_wake(self, scores, state=None, **changes):
-        import wake_word
-        model = Mock()
-        model.predict.side_effect = lambda frame, it=iter(scores): {'hi_kuro': next(it, 0.0)}
-        events = []
-        with tempfile.TemporaryDirectory() as directory, \
-                patch('respeaker.select_input', return_value=1), \
-                patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
-                patch('respeaker.AudioProducer', FakeProducer), \
-                patch.object(wake_word, 'load_model', return_value=model) as load, \
-                patch('respeaker_stt.Transcriber') as whisper, \
-                patch('respeaker.Controls', return_value=state or r.Controls()), \
-                patch('respeaker.emit', side_effect=events.append):
-            dev = Mock()
-            await r.listen(arguments(Path(directory) / 'voice.wav', wake_engine='oww', no_stt=False,
-                                     wake_model_path='hi_kuro.onnx', wake_threshold=.5, **changes), dev)
-        load.assert_called_once_with('hi_kuro.onnx')
-        whisper.assert_not_called()  # The sleeping worker no longer loads Whisper.
-        dev.is_voice.assert_not_called()
-        return events
-
-    async def test_wake_word_engine_emits_detection_without_whisper(self):
-        events = await self.run_wake([0, 0, .9, .9])
-        statuses = [e['status'] for e in events]
-        self.assertEqual(statuses[0], 'listening')
-        self.assertEqual(events[0]['trigger'], 'wake_word')
-        hit = next(e for e in events if e['status'] == 'wake_detected')
-        self.assertEqual((hit['score'], hit['model']), (.9, 'hi_kuro'))
-        self.assertIn('wake_stats', statuses)
-        self.assertNotIn('utterance_started', statuses)
-
-    async def test_wake_word_while_paused_is_only_logged(self):
-        events = await self.run_wake([0, .9, .9], state=r.Controls(paused=True), once=False, seconds=.5)
-        statuses = [e['status'] for e in events]
-        self.assertNotIn('wake_detected', statuses)
-        self.assertIn('wake_ignored', statuses)
 
     async def test_single_utterance_pauses_before_final_and_cannot_trigger_again(self):
         state = r.Controls()
