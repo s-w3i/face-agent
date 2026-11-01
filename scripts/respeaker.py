@@ -15,15 +15,14 @@ import webrtcvad
 from usb.core import USBError
 from voice_errors import RealtimeUnavailable
 from respeaker_vendor.tuning import find, PARAMETERS
+from audio_bus import AudioBus, AudioProducer, DeviceUnavailable, ReSpeakerControl
 
 ROOT = Path(__file__).resolve().parents[1]
 RATE = 16000
 FRAME_SAMPLES = 320  # 20 ms of mono PCM16; supported by WebRTC VAD.
+PREROLL_SECONDS = 0.3  # Audio from before the hardware VAD fired; keeps speech onsets.
 DIAGNOSTICS = False
-
-
-class DeviceUnavailable(RuntimeError):
-    """The USB microphone or its active audio stream disappeared."""
+OVERFLOW_MESSAGE = 'Audio capture overflowed; refusing to transcribe incomplete speech.'
 
 
 def emit(value):
@@ -109,43 +108,111 @@ def check_controller(controller):
         controller.result()
 
 
-async def record_utterance(args, dev, device, state, led, utterance_id, deadline, controller, realtime=None):
-    """Capture only after hardware VAD. Pausing discards and closes the clip."""
+class BusCapture:
+    """One utterance read from the continuous stream, starting with ring-buffer pre-roll."""
+
+    def __init__(self, producer, preroll_seconds=PREROLL_SECONDS):
+        self.producer = producer
+        self.preroll_seconds = preroll_seconds
+        self.sub = None
+
+    def __enter__(self):
+        bus = self.producer.bus
+        # Subscribe before reading the ring so no block falls between them.
+        self.sub = bus.subscribe('command')
+        self.preroll, _, self.last_seq = bus.preroll(self.sub, seconds=self.preroll_seconds)
+        self.expected = self.last_seq + 1 if self.last_seq else None
+        return self
+
+    def __exit__(self, *exception):
+        self.producer.bus.unsubscribe(self.sub)
+
+    async def read(self):
+        """The next 20 ms of PCM, or None if nothing arrived (the producer watchdog handles stalls)."""
+        while True:
+            block = await asyncio.to_thread(self.sub.get, .5)
+            if self.producer.failed:
+                raise self.producer.failed
+            if block is None:
+                return None
+            if block.seq <= self.last_seq:
+                continue  # Already part of the pre-roll.
+            if block.overflow or (self.expected is not None and block.seq != self.expected):
+                raise RuntimeError(OVERFLOW_MESSAGE)  # Input overflow or a dropped block.
+            self.expected = block.seq + 1
+            return block.pcm
+
+
+class StreamCapture:
+    """Rollback path (--legacy-stream): open an InputStream per utterance, without pre-roll."""
+
+    preroll = b''
+
+    def __init__(self, device):
+        self.device = device
+
+    def __enter__(self):
+        self.context = sd.InputStream(samplerate=RATE, channels=1, dtype='int16',
+                                      device=self.device, blocksize=FRAME_SAMPLES)
+        self.stream = self.context.__enter__()
+        return self
+
+    def __exit__(self, *exception):
+        return self.context.__exit__(*exception)
+
+    async def read(self):
+        try:
+            chunk, overflow = await asyncio.to_thread(self.stream.read, FRAME_SAMPLES)
+        except sd.PortAudioError as error:
+            raise DeviceUnavailable('ReSpeaker audio stream stopped.') from error
+        if overflow:
+            raise RuntimeError(OVERFLOW_MESSAGE)
+        return chunk.astype('<i2', copy=False).tobytes()
+
+
+async def record_utterance(args, dev, capture, state, led, utterance_id, deadline, controller, realtime=None):
+    """Capture only after hardware VAD. Pausing discards the clip and releases capture.
+
+    `capture` is the running AudioProducer (continuous stream with pre-roll), or a
+    PortAudio device for the --legacy-stream per-utterance InputStream.
+    """
     endpoint = SpeechEndpoint(args.silence_seconds)
     vad = webrtcvad.Vad(args.vad_mode)
     pcm = bytearray()
     direction = dev.direction
     next_direction = 0.0
     generation = state.generation
+    legacy = capture is None or isinstance(capture, (int, str))
+    source = (StreamCapture(capture) if legacy else
+              BusCapture(capture, getattr(args, 'preroll_seconds', PREROLL_SECONDS)))
     state.capture_closed.clear()
     try:
-        with sd.InputStream(samplerate=RATE, channels=1, dtype='int16',
-                            device=device, blocksize=FRAME_SAMPLES) as stream:
+        with source:
             emit({'status': 'utterance_started', 'utterance_id': utterance_id,
                   'doa_deg': direction})
             if realtime:
                 realtime.begin(utterance_id)
             if led:
                 led.set_state(led.states.LISTEN)
+            if source.preroll:
+                pcm.extend(source.preroll)
+                if realtime:
+                    realtime.append(source.preroll)
             while True:
                 check_controller(controller)
                 if state.paused or state.stopping or state.generation != generation:
                     emit({'status': 'utterance_discarded', 'utterance_id': utterance_id})
                     return None
-                try:
-                    chunk, overflow = await asyncio.to_thread(stream.read, FRAME_SAMPLES)
-                except sd.PortAudioError as error:
-                    raise DeviceUnavailable('ReSpeaker audio stream stopped.') from error
-                if overflow:
-                    raise RuntimeError('Audio capture overflowed; refusing to transcribe incomplete speech.')
+                data = await source.read()
+                if data is None:
+                    continue
                 if state.paused or state.stopping or state.generation != generation:
                     return None
-                data = chunk.astype('<i2', copy=False).tobytes()
                 pcm.extend(data)
                 if realtime:
                     realtime.append(data)
                 voiced = vad.is_speech(data, RATE)
-                finished = endpoint.update(voiced, len(chunk))
+                finished = endpoint.update(voiced, len(data) // 2)
                 now = time.monotonic()
                 if voiced and now >= next_direction:
                     direction = dev.direction
@@ -165,7 +232,8 @@ async def record_utterance(args, dev, device, state, led, utterance_id, deadline
                             'silence_seconds': endpoint.silent_samples / RATE,
                             'generation': generation}
     finally:
-        # Stream has closed before a playback-pause acknowledgment can be sent.
+        # The recorder has unsubscribed (or its legacy stream has closed) before a
+        # playback-pause acknowledgment can be sent. The shared stream may stay open.
         state.capture_closed.set()
 
 
@@ -188,9 +256,16 @@ async def listen(args, dev):
         raise RuntimeError(f'Recording already exists: {output}; choose another --wav path.')
     state = Controls(paused=args.control_stdin)
     controller = asyncio.create_task(read_controls(state)) if args.control_stdin else None
+    dev = ReSpeakerControl(dev)  # pyusb calls are serialized across capture threads.
     led = None
     realtime = None
+    producer = None
     try:
+        if not getattr(args, 'legacy_stream', False):
+            # T1: one continuous stream from now on; audio stays in a 2 s in-memory ring
+            # and reaches a recorder only after the hardware trigger below.
+            producer = AudioProducer(AudioBus(), device, RATE, FRAME_SAMPLES)
+            producer.start()
         if not args.no_led:
             from respeaker_led import LEDController
             led = LEDController(brightness=20)
@@ -212,17 +287,20 @@ async def listen(args, dev):
         utterance_id = clip_count = 0
         while not state.stopping and time.monotonic() < deadline:
             check_controller(controller)
+            if producer and producer.failed:
+                raise producer.failed
             if led:
                 led.off() if state.paused else led.set_state(led.states.IDLE)
             if state.paused or time.monotonic() < state.resume_at:
                 await asyncio.sleep(.05)
                 continue
-            # Firmware alone triggers capture. No idle InputStream or pre-roll.
+            # Firmware alone triggers capture; the recording then starts with pre-roll.
             if not dev.is_voice():
                 await asyncio.sleep(.05)
                 continue
             utterance_id += 1
-            event = await record_utterance(args, dev, device, state, led, utterance_id, deadline, controller, realtime)
+            event = await record_utterance(args, dev, producer or device, state, led, utterance_id,
+                                           deadline, controller, realtime)
             if event is None:
                 if realtime:
                     # Drop unfinished remote audio and its context before accepting a new turn.
@@ -256,6 +334,9 @@ async def listen(args, dev):
             await asyncio.gather(controller, return_exceptions=True)
         if led:
             led.off()
+        if producer:
+            producer.stop()
+            emit({'status': 'capture_stats', **producer.stats()})
 
 
 def run(args, dev):
@@ -292,6 +373,9 @@ def main():
     parser.add_argument('--stt-model', default='gpt-live-transcribe', help='Realtime gpt-live-transcribe, or a local Whisper model/directory')
     parser.add_argument('--stt-prompt', help='Optional local Whisper vocabulary hint (not sent to Realtime).')
     parser.add_argument('--language', default='en', help='Language code, or auto to detect it')
+    parser.add_argument('--preroll-seconds', type=float, default=PREROLL_SECONDS,
+                        help='Audio kept from before the hardware voice trigger (0-1.5 s)')
+    parser.add_argument('--legacy-stream', action='store_true', help=argparse.SUPPRESS)
     aec = parser.add_argument_group('doctor --aec (echo cancellation check; stop the voice stack first)')
     aec.add_argument('--aec', action='store_true', help='Record all channels while playing speech through --sink')
     aec.add_argument('--compare', action='store_true', help='Compare the latest saved --aec runs per label')
@@ -304,6 +388,8 @@ def main():
     if (not all(math.isfinite(n) for n in (args.seconds, args.silence_seconds, args.max_seconds))
             or args.seconds < 0 or args.silence_seconds <= 0 or args.max_seconds <= args.silence_seconds):
         parser.error('Seconds must be finite: session >= 0; silence > 0; maximum > silence.')
+    if not 0 <= args.preroll_seconds <= 1.5:
+        parser.error('--preroll-seconds must be between 0 and 1.5.')
     dev = None
     try:
         dev = find()

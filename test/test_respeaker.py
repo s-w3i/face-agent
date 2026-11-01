@@ -14,6 +14,7 @@ import wave
 
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+import audio_bus as ab
 import respeaker as r
 
 
@@ -101,94 +102,217 @@ class EndpointTest(unittest.TestCase):
             self.assertTrue(emit.call_args.args[0]['reconnectable'])
 
 
+class FeedSubscription:
+    """Bus subscription that always has the next 20 ms block, like a blocking stream.read."""
+
+    def __init__(self, producer):
+        self.producer = producer
+
+    def get(self, timeout=None):
+        producer = self.producer
+        if producer.before_read:
+            producer.before_read()
+        producer.reads += 1
+        producer.seq += 1 + (producer.reads in producer.gap_at)
+        return ab.Block(producer.value.tobytes(), 0.0, producer.seq, producer.reads in producer.overflow_at)
+
+    def close(self):
+        pass
+
+
+class FakeProducer:
+    """AudioProducer stand-in: no PortAudio, counts command subscriptions and reads."""
+
+    def __init__(self, *args, **kwargs):
+        self.bus = ab.AudioBus()
+        self.bus.subscribe = self.subscribe
+        self.bus.unsubscribe = self.unsubscribe
+        self.failed = None
+        self.started = self.stopped = False
+        self.reads = self.seq = self.subscriptions = 0
+        self.subscribed = False
+        self.overflow_at = set(); self.gap_at = set()
+        self.before_read = None
+        self.value = np.zeros(320, np.int16)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def subscribe(self, name, maxsize=100):
+        self.subscriptions += 1; self.subscribed = True
+        return FeedSubscription(self)
+
+    def unsubscribe(self, sub):
+        self.subscribed = False
+
+
+def record(producer, state=None, args=None, realtime=None, dev=None):
+    return r.record_utterance(args or arguments('unused.wav'), dev or Mock(direction=20), producer,
+                              state or r.Controls(), None, 1, math.inf, None, realtime)
+
+
 class CaptureTest(unittest.IsolatedAsyncioTestCase):
     async def test_continuous_speech_stops_at_ten_seconds(self):
-        stream = Mock()
-        stream.__enter__ = Mock(return_value=stream)
-        stream.__exit__ = Mock(return_value=False)
-        stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), False)
-        with patch('respeaker.sd.InputStream', return_value=stream), \
-                patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+        producer = FakeProducer()
+        with patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
             vad.return_value.is_speech.return_value = True
-            event = await r.record_utterance(arguments('unused.wav'), Mock(direction=20),
-                                             1, r.Controls(), None, 1, math.inf, None)
+            event = await record(producer)
         self.assertEqual(event['reason'], 'maximum_duration')
         self.assertEqual(len(event['pcm']) / (r.RATE * 2), 10)
-        self.assertEqual(stream.read.call_count, 500)
+        self.assertEqual(producer.reads, 500)
         self.assertEqual(event['silence_seconds'], 0)
+        self.assertFalse(producer.subscribed)
 
-    async def test_idle_waits_for_hardware_before_opening_stream(self):
+    async def test_idle_waits_for_hardware_before_subscribing_to_stream(self):
         with tempfile.TemporaryDirectory() as directory:
             args = arguments(Path(directory) / 'voice.wav')
             dev = Mock(direction=42)
             trigger_count = 0
-            stream = Mock()
-            stream.__enter__ = Mock(return_value=stream)
-            stream.__exit__ = Mock(return_value=False)
-            stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), False)
+            producer = FakeProducer()
             with patch('respeaker.select_input', return_value=1), \
                     patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
-                    patch('respeaker.sd.InputStream', return_value=stream) as capture, \
+                    patch('respeaker.AudioProducer', return_value=producer) as make, \
                     patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit') as emit:
                 def trigger():
                     nonlocal trigger_count
                     trigger_count += 1
-                    capture.assert_not_called()
+                    # The stream runs continuously, but nothing records before the trigger.
+                    self.assertTrue(producer.started)
+                    self.assertEqual(producer.subscriptions, 0)
                     return trigger_count == 3
                 dev.is_voice.side_effect = trigger
                 vad.return_value.is_speech.return_value = False
                 await r.listen(args, dev)
                 self.assertEqual(trigger_count, 3)
-                capture.assert_called_once()
-                self.assertEqual(stream.read.call_count, 40)
+                self.assertEqual(make.call_args.args[1:], (1, r.RATE, r.FRAME_SAMPLES))
+                self.assertEqual(producer.subscriptions, 1)
+                self.assertEqual(producer.reads, 40)
+                self.assertTrue(producer.stopped)
                 vad.assert_called_once_with(2)
                 saved = [call.args[0] for call in emit.call_args_list if call.args[0]['status'] == 'utterance_saved'][0]
                 self.assertEqual(saved['silence_seconds'], 0.8)
                 self.assertEqual(saved['duration_seconds'], 0.8)
 
-    async def test_pause_acknowledged_only_after_stream_closes_and_clip_discarded(self):
+    async def test_recording_starts_with_preroll_from_before_the_trigger(self):
+        producer = FakeProducer()
+        before = np.arange(1, 4801, dtype=np.int16)  # 0.3 s that the hardware VAD fired during
+        producer.bus.ring.write(np.arange(-3200, 0, dtype=np.int16), 1.0, 10)
+        producer.bus.ring.write(before, 1.3, 25)
+        producer.seq = 25
+        producer.value = np.full(320, 7, np.int16)
+        realtime = Mock()
+        with patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+            vad.return_value.is_speech.return_value = False
+            event = await record(producer, realtime=realtime)
+        recorded = np.frombuffer(event['pcm'], '<i2')
+        self.assertEqual(recorded[:4800].tolist(), before.tolist())
+        self.assertTrue((recorded[4800:] == 7).all())
+        self.assertEqual(len(recorded), 4800 + 40 * 320)
+        self.assertEqual(realtime.append.call_args_list[0].args[0], before.tobytes())
+
+    async def test_preroll_length_follows_argument(self):
+        producer = FakeProducer()
+        producer.bus.ring.write(np.ones(32000, np.int16), 2.0, 100)
+        producer.seq = 100
+        with patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+            vad.return_value.is_speech.return_value = False
+            event = await record(producer, args=arguments('unused.wav', preroll_seconds=0))
+        self.assertEqual(len(event['pcm']), 40 * 640)
+
+    async def test_pause_acknowledged_only_after_recorder_unsubscribes_and_clip_discarded(self):
         state = r.Controls()
         entered = threading.Event()
         release = threading.Event()
-        closed = []
-        class Stream:
-            def __enter__(self): return self
-            def read(self, samples):
-                entered.set()
-                if not release.wait(2): raise RuntimeError('Test capture timed out')
-                return np.zeros((samples, 1), dtype=np.int16), False
-            def __exit__(self, *args): closed.append(True)
-        with patch('respeaker.sd.InputStream', return_value=Stream()), patch('respeaker.emit') as emit:
-            task = asyncio.create_task(r.record_utterance(arguments('unused.wav'), Mock(direction=20),
-                                                         1, state, None, 1, math.inf, None))
+        producer = FakeProducer()
+        def wait_for_release():
+            entered.set()
+            if not release.wait(2): raise RuntimeError('Test capture timed out')
+        producer.before_read = wait_for_release
+        with patch('respeaker.emit') as emit:
+            task = asyncio.create_task(record(producer, state))
             await asyncio.to_thread(entered.wait, 2)
             pause = asyncio.create_task(state.apply(dict(paused=True, sequence=1)))
             await asyncio.sleep(.01)
             self.assertFalse(pause.done())
-            self.assertFalse(closed)
+            self.assertTrue(producer.subscribed)
             release.set()
             self.assertIsNone(await task)
             await pause
-            self.assertTrue(closed)
+            self.assertFalse(producer.subscribed)
+            self.assertFalse(producer.stopped)  # The shared stream stays open while paused.
             self.assertTrue(state.capture_closed.is_set())
             self.assertEqual(emit.call_args.args[0], dict(status='microphone_control', paused=True, sequence=1))
 
-    async def test_overflow_and_disconnect_never_return_partial_audio(self):
-        for result in ('overflow', 'disconnect'):
+    async def test_overflow_drop_and_disconnect_never_return_partial_audio(self):
+        for result in ('overflow', 'dropped', 'disconnect'):
             with self.subTest(result=result):
-                stream = Mock()
-                stream.__enter__ = Mock(return_value=stream)
-                stream.__exit__ = Mock(return_value=False)
+                producer = FakeProducer()
                 if result == 'overflow':
-                    stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), True)
+                    producer.overflow_at = {3}
+                elif result == 'dropped':
+                    producer.gap_at = {3}
                 else:
-                    stream.read.side_effect = r.sd.PortAudioError('Lost input')
+                    def fail():
+                        if producer.reads == 2:
+                            producer.failed = r.DeviceUnavailable('ReSpeaker audio stream stopped.')
+                    producer.before_read = fail
                 state = r.Controls()
-                with patch('respeaker.sd.InputStream', return_value=stream), patch('respeaker.emit'):
-                    with self.assertRaises(r.DeviceUnavailable if result == 'disconnect' else RuntimeError):
-                        await r.record_utterance(arguments('unused.wav'), Mock(direction=20),
-                                                 1, state, None, 1, math.inf, None)
+                with patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+                    vad.return_value.is_speech.return_value = True
+                    with self.assertRaises(r.DeviceUnavailable if result == 'disconnect' else RuntimeError) as raised:
+                        await record(producer, state)
+                if result != 'disconnect':
+                    self.assertEqual(str(raised.exception), r.OVERFLOW_MESSAGE)
                 self.assertTrue(state.capture_closed.is_set())
+                self.assertFalse(producer.subscribed)
+
+    async def test_stream_failure_while_idle_is_reported_as_device_unavailable(self):
+        producer = FakeProducer()
+        dev = Mock()
+        def silent():
+            producer.failed = r.DeviceUnavailable('ReSpeaker audio stream stopped.')
+            return False
+        dev.is_voice.side_effect = silent
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('respeaker.select_input', return_value=1), \
+                patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
+                patch('respeaker.AudioProducer', return_value=producer), patch('respeaker.emit'):
+            with self.assertRaises(r.DeviceUnavailable):
+                await r.listen(arguments(Path(directory) / 'voice.wav', once=False), dev)
+        self.assertTrue(producer.stopped)
+
+    async def test_legacy_stream_opens_per_utterance_and_refuses_overflow(self):
+        stream = Mock()
+        stream.__enter__ = Mock(return_value=stream)
+        stream.__exit__ = Mock(return_value=False)
+        stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), False)
+        with patch('respeaker.sd.InputStream', return_value=stream) as capture, \
+                patch('respeaker.webrtcvad.Vad') as vad, patch('respeaker.emit'):
+            vad.return_value.is_speech.return_value = True
+            event = await record(1)
+            capture.assert_called_once_with(samplerate=16000, channels=1, dtype='int16', device=1, blocksize=320)
+            self.assertEqual(stream.read.call_count, 500)
+            self.assertEqual(len(event['pcm']) / (r.RATE * 2), 10)
+            stream.read.return_value = (np.zeros((320, 1), dtype=np.int16), True)
+            with self.assertRaises(RuntimeError):
+                await record(1)
+            stream.read.side_effect = r.sd.PortAudioError('Lost input')
+            with self.assertRaises(r.DeviceUnavailable):
+                await record(1)
+
+    async def test_legacy_flag_never_starts_the_continuous_stream(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('respeaker.select_input', return_value=1), \
+                patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
+                patch('respeaker.AudioProducer') as make, \
+                patch('respeaker.record_utterance', return_value=None) as recorder, patch('respeaker.emit'):
+            dev = Mock(); dev.is_voice.return_value = True
+            await r.listen(arguments(Path(directory) / 'voice.wav', legacy_stream=True, seconds=.2, once=False), dev)
+        make.assert_not_called()
+        self.assertEqual(recorder.call_args.args[2], 1)
 
     async def test_single_utterance_pauses_before_final_and_cannot_trigger_again(self):
         state = r.Controls()
@@ -205,12 +329,13 @@ class CaptureTest(unittest.IsolatedAsyncioTestCase):
                 patch('respeaker.Controls', return_value=state), \
                 patch('respeaker.select_input', return_value=1), \
                 patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
-                patch('respeaker.record_utterance', return_value=event) as record, \
+                patch('respeaker.AudioProducer', FakeProducer), \
+                patch('respeaker.record_utterance', return_value=event) as record_mock, \
                 patch('respeaker_stt.Transcriber') as transcriber, patch('respeaker.emit', side_effect=emit):
             transcriber.return_value.transcribe.return_value = dict(text='Hello')
             await r.listen(arguments(Path(directory) / 'voice.wav', no_stt=False,
                                      once=False, single_utterance=True, seconds=.2), dev)
-            record.assert_awaited_once()
+            record_mock.assert_awaited_once()
             self.assertTrue(finals[0]['paused_after'])
 
     async def test_pause_during_stt_suppresses_late_transcript(self):
@@ -227,6 +352,7 @@ class CaptureTest(unittest.IsolatedAsyncioTestCase):
                 patch('respeaker.Controls', return_value=state), \
                 patch('respeaker.select_input', return_value=1), \
                 patch('respeaker.sd.query_devices', return_value=dict(name='ReSpeaker')), \
+                patch('respeaker.AudioProducer', FakeProducer), \
                 patch('respeaker.record_utterance', return_value=event), \
                 patch('respeaker_stt.Transcriber') as transcriber, patch('respeaker.emit') as emit:
             transcriber.return_value.transcribe.side_effect = transcribe
