@@ -205,7 +205,7 @@ systemctl --user stop face-agent.service
 python3 scripts/install_startup.py --remove
 ```
 
-Component logs are `~/.cache/face-agent/stack-{status,camera,display,agent}.log`. Routine HTTP access logs are off in stack mode; set `DOTS_ACCESS_LOG=1` in the startup settings to enable them. Re-run the installer if you move the repository. Startup does not install missing ROS or microphone dependencies; complete setup first.
+Component logs are `~/.cache/face-agent/stack-{status,camera,display,agent}.log`. Every `*.log` in that directory is rotated by the stack supervisor (checked every minute and at startup): a file over `DOTS_LOG_MAX_MB` (default 10) keeps its newest `DOTS_LOG_MAX_MB` as `<name>.log.1`, older backups shift up to `DOTS_LOG_KEEP` (default 3), and the live file is truncated in place. Set these in the startup settings. Routine HTTP access logs are off in stack mode; set `DOTS_ACCESS_LOG=1` in the startup settings to enable them. Re-run the installer if you move the repository. Startup does not install missing ROS or microphone dependencies; complete setup first.
 
 ## ROS 2 robot status
 

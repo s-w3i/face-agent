@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import shutil
 import subprocess
 import time
 from urllib.request import urlopen
@@ -53,6 +54,29 @@ class Component:
         self.process = None
 
 
+def rotate_logs(logs, max_bytes, keep):
+    """Copy-truncate oversized *.log files; every writer opens them in append mode."""
+    for path in logs.glob('*.log'):
+        try:
+            size = path.stat().st_size
+            if size <= max_bytes:
+                continue
+            for number in range(keep, 0, -1):
+                older = path.with_name(f'{path.name}.{number}')
+                if number == keep:
+                    older.unlink(missing_ok=True)
+                elif older.exists():
+                    older.rename(path.with_name(f'{path.name}.{number + 1}'))
+            partial = path.with_name(path.name + '.1.tmp')
+            with path.open('rb') as source, partial.open('wb') as target:
+                source.seek(max(0, size - max_bytes))
+                shutil.copyfileobj(source, target)
+            partial.replace(path.with_name(path.name + '.1'))
+            os.truncate(path, 0)
+        except OSError as error:
+            print(f'Could not rotate {path.name}: {error}', flush=True)
+
+
 def display_ready(base):
     try:
         with urlopen(base + '/api/status', timeout=1) as response:
@@ -74,6 +98,11 @@ def main():
         raise SystemExit('DOTS_CAMERA_PROFILE must be rgbd or color.')
     logs = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent'
     logs.mkdir(parents=True, exist_ok=True)
+    try:
+        max_log_bytes = int(float(os.environ.get('DOTS_LOG_MAX_MB', '10')) * 1024 * 1024)
+        log_backups = max(1, int(os.environ.get('DOTS_LOG_KEEP', '3')))
+    except ValueError:
+        raise SystemExit('DOTS_LOG_MAX_MB must be a number and DOTS_LOG_KEEP an integer.')
     lock = (logs / 'stack.lock').open('w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -98,9 +127,11 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
     components = []
+    next_rotation = 0
     try:
         # Start our authority first so a fresh boot begins asleep. An existing
         # authority keeps its state and is never killed by this launcher.
+        rotate_logs(logs, max_log_bytes, log_backups)
         manager = Component('status', [str(ROOT / 'robot-status.sh'), '--initial-status',
                                       env.get('DOTS_INITIAL_STATUS', 'SLEEPING')], env, logs)
         components.append(manager)
@@ -132,6 +163,9 @@ def main():
         display.start()
         waiting = True
         while True:
+            if time.monotonic() >= next_rotation:
+                rotate_logs(logs, max_log_bytes, log_backups)
+                next_rotation = time.monotonic() + 60
             if owns_manager:
                 if manager.process is not None and manager.process.poll() == 0:
                     owns_manager = False
