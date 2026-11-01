@@ -69,6 +69,21 @@ class EndpointTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 r.save_clip(output, 1, event)
 
+    def test_doctor_aec_records_through_selected_input_and_sink(self):
+        import respeaker_aec
+        args = SimpleNamespace(command='doctor', aec=True, compare=False, device=None, sink='jieli',
+                               aec_seconds=4, playback=None, label=None)
+        with patch('respeaker.select_input', return_value=2), \
+                patch.object(respeaker_aec, 'measure', return_value=dict(echo_suppression_db=3)) as measure, \
+                patch('respeaker.emit') as emit:
+            r.run(args, Mock())
+        measure.assert_called_once_with(r.sd, 2, r.RATE, sink='jieli', seconds=4, clip=None, label=None)
+        emit.assert_called_once_with(dict(echo_suppression_db=3))
+        with patch.object(respeaker_aec, 'compare', return_value=dict(runs={})) as compare, \
+                patch('respeaker.emit') as emit:
+            r.run(SimpleNamespace(**(vars(args) | dict(aec=False, compare=True))), Mock())
+        compare.assert_called_once_with()
+
     def test_usb_disconnect_is_retryable_but_permissions_are_not(self):
         for error, retryable in ((r.USBError('No device', errno=19), True),
                                  (r.USBError('Access denied', errno=13), False),

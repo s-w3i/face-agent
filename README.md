@@ -327,6 +327,28 @@ The hardware voice flag is polled every 50 ms. Recording opens only after that t
 
 Standalone options include `--silence-seconds`, `--max-seconds`, `--device INDEX_OR_NAME`, and `--no-led`. Unique WAV files are saved under ignored `test-output/`, including the trailing silence. Local Whisper needs its model downloaded once; Realtime needs the configured API key and internet access. Playback pauses close the microphone stream before speech output resumes.
 
+### Speaker and echo cancellation
+
+The XVF3000 removes the robot's own voice from the processed microphone channel (hardware AEC) only when playback goes through the **ReSpeaker's 3.5 mm output**; that playback is its echo reference. Connect a powered speaker or small amplifier to that jack (line/headphone level), then make it the default speaker:
+
+```bash
+scripts/audio_output.sh status       # current and persisted default sink
+scripts/audio_output.sh respeaker    # ReSpeaker jack (needed for barge-in while speaking)
+scripts/audio_output.sh jieli        # back to the separate USB speaker
+```
+
+Chromium plays through the PipeWire default sink. `pactl set-default-sink` is persisted by WirePlumber in `~/.local/state/wireplumber/default-nodes`, so the choice survives a reboot. Verify the echo cancellation with the stack stopped:
+
+```bash
+systemctl --user stop face-agent.service
+.venv/bin/python scripts/respeaker.py doctor --aec --sink jieli       # reference run
+.venv/bin/python scripts/respeaker.py doctor --aec --sink respeaker   # after connecting the jack
+.venv/bin/python scripts/respeaker.py doctor --aec --compare
+systemctl --user start face-agent.service
+```
+
+Each run records 3 s of quiet and 10 s of looped speech playback on all six channels (firmware: 0 processed, 1–4 raw microphones, 5 playback reference) and saves the WAV and JSON under `test-output/aec/`. `echo_suppression_db` is how far channel 0 sits below the raw microphones during playback; `aec_reference_present` shows whether the XVF3000 actually receives the playback. With the jack, expect channel 0 to drop by at least 15 dB compared with the Jieli run. Talking over the playback should stay clearly audible in channel 0.
+
 If USB access is denied, add the device rule and your account to `plugdev`:
 
 ```bash

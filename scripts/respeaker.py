@@ -259,7 +259,13 @@ async def listen(args, dev):
 
 
 def run(args, dev):
-    if args.command == 'doctor':
+    if args.command == 'doctor' and (args.aec or args.compare):
+        import respeaker_aec
+        result = (respeaker_aec.compare() if args.compare else
+                  respeaker_aec.measure(sd, select_input(args.device), RATE, sink=args.sink,
+                                        seconds=args.aec_seconds, clip=args.playback, label=args.label))
+        emit(result)
+    elif args.command == 'doctor':
         emit({'control_version_byte': dev.version, 'usb_device_revision': hex(dev.dev.bcdDevice),
               'parameters': {name: dev.read(name) for name in PARAMETERS}})
     else:
@@ -286,6 +292,13 @@ def main():
     parser.add_argument('--stt-model', default='gpt-live-transcribe', help='Realtime gpt-live-transcribe, or a local Whisper model/directory')
     parser.add_argument('--stt-prompt', help='Optional local Whisper vocabulary hint (not sent to Realtime).')
     parser.add_argument('--language', default='en', help='Language code, or auto to detect it')
+    aec = parser.add_argument_group('doctor --aec (echo cancellation check; stop the voice stack first)')
+    aec.add_argument('--aec', action='store_true', help='Record all channels while playing speech through --sink')
+    aec.add_argument('--compare', action='store_true', help='Compare the latest saved --aec runs per label')
+    aec.add_argument('--sink', help='Playback sink: respeaker, jieli, hdmi or a full name (default sink if omitted)')
+    aec.add_argument('--aec-seconds', type=float, default=10, help='Seconds of playback to record')
+    aec.add_argument('--playback', help='WAV to loop (default: cached wake acknowledgment speech)')
+    aec.add_argument('--label', help='Run label in test-output/aec (default: sink alias)')
     args = parser.parse_args()
     DIAGNOSTICS = args.diagnostics or args.command != 'listen'
     if (not all(math.isfinite(n) for n in (args.seconds, args.silence_seconds, args.max_seconds))
