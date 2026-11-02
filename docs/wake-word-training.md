@@ -1,26 +1,43 @@
 # Training the "Hi Kuro" wake-word model
 
-Kuro's sleeping wake detection uses [openWakeWord](https://github.com/dscripka/openWakeWord) with a custom model. Training needs a GPU and several GB of public negative data, so it runs **off the Pi**, once, in Google Colab (about 1 hour on the free GPU). Until the model is installed, or whenever its name doesn't match the robot's name in the studio, the robot automatically keeps the local Whisper wake detection.
+Kuro's sleeping wake detection uses [openWakeWord](https://github.com/dscripka/openWakeWord) with a custom model. Training needs a GPU and tens of GB of public data, so it runs **off the Pi**, once, on a Linux PC with an NVIDIA GPU such as an RTX 3080. Until the model is installed, or whenever its name doesn't match the robot's name in the studio, the robot automatically keeps the local Whisper wake detection.
 
-## 1. Train in Colab
+## 1. Train on the GPU PC
 
-1. Open the openWakeWord repository, go to its README section **"Training New Models"**, and open the linked Google Colab notebook (the simple automatic training notebook). Choose **Runtime → Change runtime type → GPU**.
-2. Settings:
-   - **Target phrase:** `hi kuro`. Play the generated test sample first. If the synthetic voice mispronounces "Kuro", try a phonetic spelling such as `hi koo roh` and keep whichever sounds like the way people actually say it.
-   - **Number of examples:** at least **20000** (more is better; the default is far lower).
-   - **Training steps:** the notebook default (about 10000) is fine for a first model. Raise the **false-activation penalty** if the evaluation below shows false wakes.
-   - If the notebook offers extra phrases or spelling variants, add `hey kuro`, so both greetings wake the robot.
-3. Run all cells and download the exported **`.onnx`** file. The `.tflite` isn't needed: Python 3.12 on the Pi has no tflite runtime, so Kuro uses ONNX.
+**You need:** Linux on x86_64 (on Windows, use WSL2 and keep the work folder on the Linux disk, not `/mnt/c`), a working `nvidia-smi`, `git`, Python 3.10 or [uv](https://docs.astral.sh/uv/), about 45 GB of free disk space, and at least 16 GB of RAM. An SSD is strongly recommended because training reads a 17 GB feature file continuously.
+
+Clone this repository on the PC, or copy over `scripts/train_wake_word.py` and `requirements-wake-training.txt`, then run these from the repository folder:
+
+```bash
+python3 scripts/train_wake_word.py setup     # Python 3.10 venv and pinned upstream code, in ~/kuro-wake-training
+python3 scripts/train_wake_word.py data      # about 21 GB of downloads; resumes if interrupted
+python3 scripts/train_wake_word.py preview   # sample clips, in ~/kuro-wake-training/preview
+python3 scripts/train_wake_word.py train     # generate clips, augment, train
+```
+
+- **Check the pronunciation first.** Play the WAV files from `preview`. The default phrases are spelled `hi kuuro` and `hey kuuro` because the synthetic voice reads "kuro" as "kyoo-roh" and "kuuro" as "koo-roh". If you want a different pronunciation, pass your own spelling to both commands (the example below is the "kyoo-roh" one):
+  ```bash
+  python3 scripts/train_wake_word.py preview --phrase "hi kuro" --phrase "hey kuro"
+  python3 scripts/train_wake_word.py train   --phrase "hi kuro" --phrase "hey kuro"
+  ```
+  Words that aren't in the CMU pronouncing dictionary also need an entry in `PRONUNCIATIONS` in `scripts/train_wake_word.py`; `train` stops and says so if one is missing.
+- **Defaults:** both greetings wake the robot, with 50000 positive clips, 50000 adversarial clips and 50000 training steps. `--samples` and `--steps` change these.
+- **False wakes:** if the evaluation in section 3 shows too many, train again with a higher `--max-negative-weight` (default 1500). The generated clips are reused, so only augmentation and training run again.
+- **New phrases:** after changing the phrases, add `--fresh`. It deletes the previous run's clips and features, which belong to the old phrases.
+- **Other folder:** add `--work PATH` to every command to keep the data somewhere other than `~/kuro-wake-training`.
+
+Running a step again continues where it stopped: finished downloads and generated clips are kept, but augmentation and training start over. The result is `~/kuro-wake-training/output/hi_kuro.onnx` plus its `hi_kuro.json`. There's no `.tflite`: Python 3.12 on the Pi has no tflite runtime, so Kuro uses ONNX.
 
 ## 2. Install on the Pi
 
+From the PC:
+
 ```bash
-mkdir -p ~/.local/share/face-agent/wake
-cp ~/Downloads/hi_kuro.onnx ~/.local/share/face-agent/wake/hi_kuro.onnx      # or scp from the PC
-cat > ~/.local/share/face-agent/wake/hi_kuro.json <<'EOF'
-{"phrase": "hi kuro", "name": "Kuro", "threshold": 0.5}
-EOF
+ssh <pi> 'mkdir -p ~/.local/share/face-agent/wake'
+scp ~/kuro-wake-training/output/hi_kuro.onnx ~/kuro-wake-training/output/hi_kuro.json <pi>:~/.local/share/face-agent/wake/
 ```
+
+`hi_kuro.json` contains `{"phrase": "hi kuuro", "name": "Kuro", "threshold": 0.5}`. `phrase` shows the training spelling, which is fine because the robot only matches on `name`.
 
 - `name` must match the character name in the studio (case doesn't matter). Otherwise the robot falls back to Whisper and logs why.
 - The shared feature models (`melspectrogram.onnx`, `embedding_model.onnx`) are already in the same folder; `scripts/setup_respeaker.sh` downloads them.

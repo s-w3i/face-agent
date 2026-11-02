@@ -1,0 +1,27 @@
+# Training environment for scripts/train_wake_word.py: Python 3.10 on the GPU PC, never the Pi.
+# Pinned because openWakeWord's training code depends on old versions of these libraries.
+# TensorFlow is left out on purpose: Kuro only uses the ONNX export.
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.2+cu118
+torchaudio==2.1.2+cu118
+numpy==1.26.4
+scipy==1.11.4
+onnx==1.14.1
+onnxruntime==1.16.3
+piper-phonemize==1.1.0
+webrtcvad-wheels==2.0.14
+setuptools<70
+pyyaml==6.0.2
+tqdm==4.67.1
+requests==2.32.3
+scikit-learn==1.5.2
+mutagen==1.47.0
+torchinfo==1.8.0
+torchmetrics==1.2.0
+speechbrain==0.5.14
+audiomentations==0.33.0
+torch-audiomentations==0.11.0
+acoustics==0.2.6
+pronouncing==0.2.0
+pyarrow==17.0.0
+soundfile==0.12.1
