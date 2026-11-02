@@ -35,11 +35,22 @@ def metadata(model_path):
     return value if isinstance(value, dict) else {}
 
 
-def choose_engine(requested, model_path, name):
-    """Return (engine, threshold, reason). `requested` is auto, oww or whisper."""
+def choose_engine(requested, model_path, name, rolling_available=None):
+    """Return (engine, threshold, reason). `requested` is auto, rolling, oww or whisper.
+
+    auto prefers rolling (Hailo Whisper scores "Hi <name>": speaker-independent and works
+    for any name) whenever its model files are installed, then a matching openWakeWord model.
+    """
     requested = (requested or 'auto').strip().lower()
     if requested == 'whisper':
         return 'whisper', None, 'whisper requested'
+    if requested in ('auto', 'rolling'):
+        import rolling_wake
+        available, why = rolling_wake.available() if rolling_available is None else (rolling_available, 'not available')
+        if available:
+            return 'rolling', rolling_wake.DEFAULT_THRESHOLD, 'Hailo Whisper phrase scoring in rolling windows'
+        if requested == 'rolling':
+            return 'whisper', None, f'rolling wake unavailable ({why})'
     model_path = Path(model_path).expanduser()
     if not model_path.is_file():
         return 'whisper', None, f'no wake model at {model_path}'

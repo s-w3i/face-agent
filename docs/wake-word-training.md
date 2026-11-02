@@ -1,6 +1,8 @@
 # Training the "Hi Kuro" wake-word model
 
-Kuro's sleeping wake detection uses [openWakeWord](https://github.com/dscripka/openWakeWord) with a custom model. Training needs a GPU and tens of GB of public data, so it runs **off the Pi**, once, on a Linux PC with an NVIDIA GPU such as an RTX 3080. Until the model is installed, or whenever its name doesn't match the robot's name in the studio, the robot automatically keeps the local Whisper wake detection.
+> **Optional.** The default wake engine is now the rolling Hailo Whisper engine ([wake-word.md](wake-word.md)). It needs no training and works for any speaker. A model trained here is only used with `DOTS_WAKE_ENGINE=oww`, or when the Hailo Whisper files are missing. On the owner's real recordings, models trained only on synthetic voices missed almost every natural "Hi Kuro".
+
+Kuro's openWakeWord wake detection uses [openWakeWord](https://github.com/dscripka/openWakeWord) with a custom model. Training needs a GPU and tens of GB of public data, so it runs **off the Pi**, once, on a Linux PC with an NVIDIA GPU such as an RTX 3080. Until the model is installed, or whenever its name doesn't match the robot's name in the studio, the robot automatically keeps the local Whisper wake detection.
 
 ## 1. Train on the GPU PC
 

@@ -89,7 +89,7 @@ def arguments(directory, **changes):
                   silence_seconds=.1, sleep_silence_seconds=.1, max_seconds=10, vad_mode=2,
                   preroll_seconds=0, wake_engine='whisper', wake_model_path='hi_kuro.onnx', wake_threshold=.5,
                   wake_continuation=.16, wake_stt_model='small', initial_mode='sleep', single_utterance=True,
-                  stt_prompt=None, offline_stt='off')
+                  stt_prompt=None, offline_stt='off', wake_name='Kuro')
     return SimpleNamespace(**{**values, **changes})
 
 
@@ -274,6 +274,27 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             self.state.resume_at = 0
             await self.until(lambda: self.status('wake_detected'), timeout=5)
         self.assertFalse(self.status('wake_detected')[0]['continued'])
+
+    async def test_rolling_engine_wakes_from_continuous_noise_without_vad_segments(self):
+        scores = iter([-6.0, -5.0])
+        names = []
+        def scorer(name):
+            names.append(name)
+            return lambda audio: next(scores, -1.0)  # The phrase, after two windows of noise
+        with patch('rolling_wake.HailoPhraseScorer', side_effect=scorer):
+            self.speech = True  # TV on: never 0.4 s of silence, which stalled the Whisper path
+            await self.start(wake_engine='rolling', wake_threshold=-3.6)
+            await self.control(1, paused=False)
+            self.state.resume_at = 0
+            await self.until(lambda: self.status('wake_detected'), timeout=5)
+        hit = self.status('wake_detected')[0]
+        self.assertEqual((hit['model'], hit['score'], hit['mode']), ('rolling', -1.0, 'sleep'))
+        self.assertLess(hit['t'], hit['continue_from'])  # A follow-on capture starts at the phrase.
+        self.assertTrue(hit['continued'])
+        self.assertEqual(names, ['Kuro'])
+        self.assertEqual(self.status('listening')[0]['wake_engine'], 'rolling')
+        self.dev.is_voice.assert_not_called()  # No hardware-VAD segments while asleep.
+        self.assertEqual(self.status('utterance_started'), [])
 
     async def test_comma_pause_does_not_end_the_continuation_check(self):
         bus = ab.AudioBus()

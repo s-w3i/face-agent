@@ -408,8 +408,12 @@ def closing_message(text, name='Kuro', *, agent_requested=False):
 
 
 def wake_trigger(text, name):
-    """Match Hi plus the current name, ignoring case and greeting punctuation."""
-    return bool(re.match(r'^hi[\s,]+' + re.escape(name.strip()) + r'(?=$|[\s,.!?])', text.strip(), re.IGNORECASE))
+    """Match "Hi"/"Hey" plus the current name anywhere in the text, ignoring case and punctuation.
+
+    The Whisper fallback transcribes whole noisy segments, where the phrase is rarely first.
+    """
+    return bool(re.search(r'(?:^|[\s,.!?])(?:hi|hey)[\s,]+' + re.escape(name.strip()) + r'(?=$|[\s,.!?])',
+                          text.strip(), re.IGNORECASE))
 
 
 def spoken_reply(text):
@@ -566,8 +570,9 @@ async def main():
     parser.add_argument('--mode', choices=['words', 'voice'], default='words', help='Typed words (default) or ReSpeaker microphone input.')
     parser.add_argument('--stt-model', default='gpt-live-transcribe', choices=['gpt-live-transcribe'], help='Awake transcription through the OpenAI Realtime API.')
     parser.add_argument('--wake-model', default=os.environ.get('DOTS_WAKE_MODEL', 'small'), help='Local Whisper model/directory for the Hi {name} wake phrase.')
-    parser.add_argument('--wake-engine', choices=['auto', 'oww', 'whisper'], default=os.environ.get('DOTS_WAKE_ENGINE', 'auto'),
-                        help='auto: openWakeWord when its model matches the robot name, otherwise local Whisper.')
+    parser.add_argument('--wake-engine', choices=['auto', 'rolling', 'oww', 'whisper'], default=os.environ.get('DOTS_WAKE_ENGINE', 'auto'),
+                        help='auto: rolling (Hailo Whisper scores "Hi <name>" in rolling windows) when installed, '
+                             'else openWakeWord when its model matches the robot name, else local Whisper.')
     parser.add_argument('--barge-in', action=argparse.BooleanOptionalAction,
                         default=os.environ.get('DOTS_BARGE_IN', '1').strip().lower() not in ('0', 'false', 'no'),
                         help='Saying the wake word while Kuro is thinking interrupts the turn (default).')

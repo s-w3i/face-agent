@@ -6,6 +6,7 @@ Stop the voice stack first; recording opens the ReSpeaker's processed channel 0.
     .venv/bin/python scripts/wake_eval.py record-positive --count 20    # say "Hi Kuro" when prompted
     .venv/bin/python scripts/wake_eval.py record-negative --minutes 10  # TV/conversation, no wake phrase
     .venv/bin/python scripts/wake_eval.py evaluate                      # sweep thresholds
+    .venv/bin/python scripts/wake_eval.py evaluate-rolling --negatives  # rolling Hailo engine, with TV noise
 
 Acceptance (plans/phase-2): >= 19/20 positives and <= 1 false wake in 10 negative minutes.
 """
@@ -101,6 +102,73 @@ def evaluate(args):
     print(f'Saved {out}')
 
 
+def noisy(clip, noise, snr_db, rng, lead_seconds=3.0, tail_seconds=2.0):
+    """Room noise before, under and after `clip`, at `snr_db` against the clip's speech level.
+
+    Returns (stream, clip start in seconds). snr_db None: digital silence around the clip;
+    'room': unscaled `noise` before and after (clips recorded in that same noise).
+    """
+    lead, tail = round(lead_seconds * ww.RATE), round(tail_seconds * ww.RATE)
+    if snr_db is None:
+        return np.concatenate([np.zeros(lead, np.int16), clip, np.zeros(tail, np.int16)]), lead_seconds
+    if snr_db == 'room':
+        start = rng.integers(0, max(1, len(noise) - lead - tail))
+        return np.concatenate([noise[start:start + lead], clip, noise[start + lead:start + lead + tail]]), lead_seconds
+    clip = clip.astype(np.float32)
+    frames = clip[:len(clip) // 320 * 320].reshape(-1, 320)
+    loud = np.sort(np.sqrt((frames ** 2).mean(axis=1)))[-max(1, len(frames) // 4):]  # speech frames
+    total = lead + len(clip) + tail
+    start = rng.integers(0, max(1, len(noise) - total))
+    part = noise[start:start + total].astype(np.float32)
+    gain = loud.mean() / (np.sqrt((part ** 2).mean()) or 1.0) / 10 ** (snr_db / 20)
+    stream = part * gain
+    stream[lead:lead + len(clip)] += clip
+    return np.clip(stream, -32768, 32767).astype(np.int16), lead_seconds
+
+
+def evaluate_rolling(args):
+    """Stream clips through the deployed rolling detector (VAD gate, windows, Hailo + CPU check)."""
+    import rolling_wake as rw
+    scorer = rw.HailoPhraseScorer(args.name)
+    checks = []
+    positives = sorted((EVAL / args.positive_set).glob('*.wav'))
+    negatives = sorted((EVAL / args.negative_set).glob('*.wav'))
+    noise = read_wav(args.noise) if args.noise else (read_wav(negatives[0]) if negatives else None)
+    rng = np.random.default_rng(0)
+    rows = []
+    for snr in args.snr:
+        caught, missed = 0, []
+        for path in positives:
+            stream, start = noisy(read_wav(path), noise, snr, rng)
+            detector = rw.RollingWakeDetector(scorer, args.threshold)
+            hits = detector.feed(stream.tobytes(), 0.0)
+            checks.append(detector.verifications)
+            if any(hit['continue_from'] > start for hit in hits):
+                caught += 1
+            else:
+                missed.append(path.name)
+        rows.append(dict(snr=snr, caught=caught, positives=len(positives), missed=missed))
+        label = 'clean' if snr is None else snr if snr == 'room' else f'{snr:g} dB'
+        print(f'SNR {label}: {caught}/{len(positives)}', flush=True)
+    false = {}
+    if args.negatives:
+        for path in negatives:
+            detector = rw.RollingWakeDetector(scorer, args.threshold)
+            audio = read_wav(path)
+            false[path.name] = [dict(t=round(hit['continue_from'], 1), score=hit['score'], verified=hit['verified'])
+                                for hit in detector.feed(audio.tobytes(), 0.0)]
+            minutes = len(audio) / ww.RATE / 60
+            print(f'{path.name}: {detector.verifications / minutes:.1f} CPU checks/min '
+                  f'({detector.verify_seconds / minutes:.1f} s/min)', flush=True)
+            print(f'{path.name}: {len(false[path.name])} false wakes {false[path.name]}', flush=True)
+    print(f'CPU checks on positives: {sum(checks)}')
+    import hailo_stt
+    hailo_stt.close_shared()  # Explicitly: interpreter teardown with a live session tends to crash hailort.service.
+    out = EVAL / f"rolling-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out.write_text(json.dumps(dict(threshold=args.threshold, rows=rows, false=false, verifications=sum(checks)), indent=2))
+    print(f'Saved {out}')
+
+
 def input_device():
     import sounddevice as sd
     import respeaker
@@ -113,7 +181,7 @@ def record_positive(args):
         input(f'[{index}/{args.count}] Press Enter, then say "{args.phrase}" within {args.seconds:.0f} s… ')
         pcm = sd.rec(round(args.seconds * ww.RATE), samplerate=ww.RATE, channels=1, dtype='int16', device=device)
         sd.wait()
-        path = EVAL / 'positive' / f"{time.strftime('%Y%m%d-%H%M%S')}-{index:02d}.wav"
+        path = EVAL / args.set / f"{time.strftime('%Y%m%d-%H%M%S')}-{index:02d}.wav"
         write_wav(path, pcm[:, 0])
         print(f'  saved {path.name}')
 
@@ -123,7 +191,7 @@ def record_negative(args):
     print(f'Recording {args.minutes:g} min of normal conversation/TV without the wake phrase…')
     pcm = sd.rec(round(args.minutes * 60 * ww.RATE), samplerate=ww.RATE, channels=1, dtype='int16', device=device)
     sd.wait()
-    path = EVAL / 'negative' / f"{time.strftime('%Y%m%d-%H%M%S')}.wav"
+    path = EVAL / args.set / f"{time.strftime('%Y%m%d-%H%M%S')}.wav"
     write_wav(path, pcm[:, 0])
     print(f'Saved {path}')
 
@@ -135,14 +203,31 @@ def main():
     positive.add_argument('--count', type=int, default=20)
     positive.add_argument('--seconds', type=float, default=3)
     positive.add_argument('--phrase', default='Hi Kuro')
+    positive.add_argument('--set', default='positive', help='folder under test-output/wake-eval, e.g. positive-tv')
     negative = sub.add_parser('record-negative')
     negative.add_argument('--minutes', type=float, default=10)
+    negative.add_argument('--set', default='negative', help='folder under test-output/wake-eval, e.g. negative-tv')
     check = sub.add_parser('evaluate')
     check.add_argument('--model', type=Path, default=ww.default_model_path())
     check.add_argument('--patience', type=int, default=2)
     check.add_argument('--thresholds', type=float, nargs='+', default=[.3, .4, .5, .6, .7, .8])
+    rolling = sub.add_parser('evaluate-rolling', help='stream clips through the rolling Hailo detector')
+    rolling.add_argument('--name', default='Kuro')
+    rolling.add_argument('--threshold', type=float, default=None)
+    rolling.add_argument('--snr', type=lambda v: None if v == 'clean' else v if v == 'room' else float(v), nargs='+',
+                         default=[None, 10, 5, 0],
+                         help="'clean', 'room' (noise around clips recorded in it) or dB of noise mixed over each "
+                              "positive (default: clean 10 5 0)")
+    rolling.add_argument('--noise', type=Path, help='noise WAV for mixing (default: the first negative recording)')
+    rolling.add_argument('--negatives', action='store_true', help='also stream the negative recordings (slow)')
+    rolling.add_argument('--positive-set', default='positive', help='folder of positives, e.g. positive-tv')
+    rolling.add_argument('--negative-set', default='negative', help='folder of negatives, e.g. negative-tv')
     args = parser.parse_args()
-    {'record-positive': record_positive, 'record-negative': record_negative, 'evaluate': evaluate}[args.command](args)
+    if args.command == 'evaluate-rolling' and args.threshold is None:
+        import rolling_wake
+        args.threshold = rolling_wake.DEFAULT_THRESHOLD
+    {'record-positive': record_positive, 'record-negative': record_negative, 'evaluate': evaluate,
+     'evaluate-rolling': evaluate_rolling}[args.command](args)
 
 
 if __name__ == '__main__':

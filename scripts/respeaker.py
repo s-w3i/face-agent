@@ -24,6 +24,7 @@ from worker_threads import DropRate, Heartbeat, RestartBudget, join_all, rss_kb,
 ROOT = Path(__file__).resolve().parents[1]
 RATE = 16000
 FRAME_SAMPLES = 320  # 20 ms of mono PCM16; supported by WebRTC VAD.
+STREAMING_WAKE = ('oww', 'rolling')  # Wake engines that read the stream themselves while asleep.
 PREROLL_SECONDS = 0.3  # Audio from before the hardware VAD fired; keeps speech onsets.
 DIAGNOSTICS = False
 OVERFLOW_MESSAGE = 'Audio capture overflowed; refusing to transcribe incomplete speech.'
@@ -254,7 +255,7 @@ class CommandRecorder(threading.Thread):
 
     def listening(self):
         state = self.state
-        uses_vad = state.mode == 'awake' or (state.mode == 'sleep' and getattr(self.args, 'wake_engine', 'whisper') != 'oww')
+        uses_vad = state.mode == 'awake' or (state.mode == 'sleep' and getattr(self.args, 'wake_engine', 'whisper') not in STREAMING_WAKE)
         return uses_vad and not state.paused and not state.stopping and time.monotonic() >= state.resume_at
 
     def request(self, from_t):
@@ -394,10 +395,8 @@ def load_offline_stt(args):
     model = getattr(args, 'offline_stt_model', None)
     if args.offline_stt == 'hailo':
         try:
-            from hailo_stt import Transcriber
-            engine = Transcriber(model or 'base', args.language)
-            engine.backend_name = 'hailo'
-            return engine
+            import hailo_stt
+            return hailo_stt.SharedTranscriber(model or 'base', args.language)  # Shared with the rolling wake thread.
         except Exception as error:  # Missing HEFs or binding, service down, device busy...
             emit({'status': 'warning', 'message': f'Hailo offline STT unavailable ({error!r}); using the CPU.'})
             model = None
@@ -418,7 +417,8 @@ async def serve(args, dev):
     dev = ReSpeakerControl(dev)
     handoff = asyncio.Queue()
     stt_lock = asyncio.Lock()
-    oww = getattr(args, 'wake_engine', 'whisper') == 'oww'
+    wake_engine = getattr(args, 'wake_engine', 'whisper')
+    streaming = wake_engine in STREAMING_WAKE  # A wake thread on the stream instead of VAD segments + Whisper
     led = realtime = transcriber = wake = recorder = controller = None
     backends = {}
     clip_count = 0
@@ -508,7 +508,7 @@ async def serve(args, dev):
                 if realtime is not None:
                     await realtime.close()
                     realtime = None
-                if not oww and transcriber is None and not args.no_stt:
+                if not streaming and transcriber is None and not args.no_stt:
                     from respeaker_stt import Transcriber
                     model = getattr(args, 'wake_stt_model', 'small')
                     emit({'status': 'transcription_loading', 'model': model})
@@ -522,9 +522,14 @@ async def serve(args, dev):
         return recorder.request(from_t)
 
     async def start_wake():
-        from wake_word import WakeWordThread
-        thread = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
-                                on_detect=lambda hit: loop.call_soon_threadsafe(handoff.put_nowait, ('wake', hit)))
+        on_detect = lambda hit: loop.call_soon_threadsafe(handoff.put_nowait, ('wake', hit))
+        if wake_engine == 'rolling':
+            from rolling_wake import HailoPhraseScorer, RollingWakeThread
+            thread = RollingWakeThread(producer.bus, args.wake_threshold, lambda: HailoPhraseScorer(args.wake_name),
+                                       on_detect=on_detect, vad_mode=args.vad_mode)
+        else:
+            from wake_word import WakeWordThread
+            thread = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold, on_detect=on_detect)
         thread.start()
         await asyncio.to_thread(thread.ready.wait, 60)
         return thread
@@ -553,7 +558,7 @@ async def serve(args, dev):
         error = await set_mode(args.initial_mode)
         if error is not None:
             raise error
-        if oww:
+        if streaming:
             wake = await start_wake()
             if wake.error:
                 raise WorkerFailure(f'Wake-word model failed to load: {wake.error}', 'wake_engine')
@@ -562,8 +567,8 @@ async def serve(args, dev):
         recorder.start()
         controller = asyncio.create_task(read_controls(state)) if args.control_stdin else None
         emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
-              'trigger': 'wake_word' if oww else 'hardware_vad', 'mode': state.mode,
-              'wake_engine': 'oww' if oww else 'whisper', 'silence_seconds': args.silence_seconds,
+              'trigger': 'wake_word' if streaming else 'hardware_vad', 'mode': state.mode,
+              'wake_engine': wake_engine, 'silence_seconds': args.silence_seconds,
               'max_seconds': args.max_seconds, 'vad_mode': args.vad_mode})
         deadline = time.monotonic() + args.seconds if args.seconds else math.inf
         while not state.stopping and time.monotonic() < deadline:
@@ -707,7 +712,8 @@ async def serve(args, dev):
                         # The robot's own playback ("Say Hi Kuro…") or a closed gate.
                         emit({'status': 'wake_ignored', 'reason': 'paused', 'score': hit['score']})
                         continue
-                    hit['continued'] = await speech_continues(producer.bus, hit['t'],
+                    # Rolling hits start at the phrase; "still speaking" is checked after the window.
+                    hit['continued'] = await speech_continues(producer.bus, hit.get('continue_from', hit['t']),
                                                               getattr(args, 'wake_continuation', .16), vad_mode=args.vad_mode)
                     emit({**hit, 'mode': 'sleep'})
                     if args.once:
@@ -723,8 +729,9 @@ async def serve(args, dev):
             if task is not None and not task.done():
                 task.cancel()
         if offline_loading is not None and offline_loading.done() and not offline_loading.cancelled() \
-                and offline_loading.exception() is None and hasattr(offline_loading.result(), 'close'):
-            offline_loading.result().close()
+                and offline_loading.exception() is None and hasattr(offline_loading.result(), 'close') \
+                and getattr(offline_loading.result(), 'backend_name', None) != 'hailo':
+            offline_loading.result().close()  # The shared Hailo session closes below, after the wake thread.
         if recorder:
             recorder.stop_event.set()
         if wake:
@@ -742,6 +749,8 @@ async def serve(args, dev):
             led.off()
         producer.stop()
         emit({'status': 'capture_stats', **producer.stats()})
+        if sys.modules.get('hailo_stt') is not None and not stuck:
+            sys.modules['hailo_stt'].close_shared()
         stuck += [t.name for t in threading.enumerate() if t.name == 'audio-watchdog' and t.is_alive()]
         if stuck:
             emit({'status': 'warning', 'message': 'Threads did not stop: ' + ', '.join(stuck)})
@@ -783,8 +792,10 @@ def main():
     parser.add_argument('--language', default='en', help='Language code, or auto to detect it')
     parser.add_argument('--preroll-seconds', type=float, default=PREROLL_SECONDS,
                         help='Audio kept from before the hardware voice trigger (0-1.5 s)')
-    parser.add_argument('--wake-engine', choices=['whisper', 'oww'], default='whisper',
-                        help='oww: openWakeWord model on the continuous stream instead of hardware VAD + local Whisper')
+    parser.add_argument('--wake-engine', choices=['whisper', 'oww', 'rolling'], default='whisper',
+                        help='oww: openWakeWord model on the continuous stream; rolling: Hailo Whisper scores '
+                             '"Hi <name>" in rolling windows; whisper: hardware VAD segments + local Whisper')
+    parser.add_argument('--wake-name', default='Kuro', help='Robot name for --wake-engine rolling')
     parser.add_argument('--wake-model-path', help='openWakeWord .onnx model (default DOTS_WAKE_MODEL_PATH or '
                         '~/.local/share/face-agent/wake/hi_kuro.onnx)')
     parser.add_argument('--wake-threshold', type=float, help='Wake score threshold (default: model .json or 0.5)')
@@ -816,12 +827,18 @@ def main():
         # Standalone use: Realtime (or --no-stt) records awake; a local Whisper model or
         # the wake engine runs in sleep mode, with the requested silence timeout.
         local = args.stt_model != 'gpt-live-transcribe' and not args.no_stt
-        args.initial_mode = 'sleep' if local or args.wake_engine == 'oww' else 'awake'
+        args.initial_mode = 'sleep' if local or args.wake_engine in STREAMING_WAKE else 'awake'
         if local:
             args.wake_stt_model = args.stt_model
             args.sleep_silence_seconds = args.silence_seconds
     if not 0 < args.sleep_silence_seconds < args.max_seconds:
         parser.error('--sleep-silence-seconds must be positive and below --max-seconds.')
+    if args.wake_engine == 'rolling':
+        import rolling_wake
+        if args.wake_threshold is None:
+            args.wake_threshold = rolling_wake.DEFAULT_THRESHOLD
+        if not -20 < args.wake_threshold < 0:
+            parser.error('--wake-threshold for rolling is a mean log-probability between -20 and 0.')
     if args.wake_engine == 'oww':
         import wake_word
         args.wake_model_path = str(Path(args.wake_model_path).expanduser() if args.wake_model_path

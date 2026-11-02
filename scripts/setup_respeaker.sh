@@ -25,10 +25,13 @@ if command -v hailortcli >/dev/null 2>&1; then
   assets="https://hailo-csdata.s3.eu-west-2.amazonaws.com/resources/npy%20files/whisper/decoder_assets/base/decoder_tokenization"
   for url in "$hef_base/base-whisper-encoder-5s_h8l.hef" "$hef_base/base-whisper-decoder-fixed-sequence-matmul-split_h8l.hef" \
       "$assets/onnx_add_input_base.npy" "$assets/token_embedding_weight_base.npy"; do
-    wget -q -nc -P "$whisper_dir" "$url" || printf 'Could not download %s; offline STT uses the CPU.\n' "$url" >&2
+    wget -q -nc -P "$whisper_dir" "$url" || printf 'Could not download %s; offline STT and wake detection use the CPU.\n' "$url" >&2
   done
 fi
 printf 'ReSpeaker dependencies installed. Whisper downloads its model on first use.\n'
-if [ ! -f "$wake_dir/hi_kuro.onnx" ]; then
-  printf 'No %s yet; sleeping wake detection uses Whisper until it is trained (docs/wake-word-training.md).\n' "$wake_dir/hi_kuro.onnx"
+whisper_dir="${XDG_DATA_HOME:-$HOME/.local/share}/face-agent/whisper-hailo8l"
+if ls "$whisper_dir"/base-whisper-encoder-*_h8l.hef >/dev/null 2>&1; then
+  printf 'Wake detection: rolling Hailo Whisper (docs/wake-word.md).\n'
+elif [ ! -f "$wake_dir/hi_kuro.onnx" ]; then
+  printf 'No Hailo Whisper files or %s; sleeping wake detection uses CPU Whisper (docs/wake-word.md).\n' "$wake_dir/hi_kuro.onnx"
 fi

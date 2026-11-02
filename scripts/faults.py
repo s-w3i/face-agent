@@ -62,9 +62,9 @@ CATALOG = {
     'tracker_cpu_fallback': Fault('degraded', 30, 'chip', 'Tracking on CPU',
         'The Hailo-8L is unavailable (check hailort.service). Restart face-agent.service to retry it.'),
     'wake_whisper_fallback': Fault('degraded', 20, 'mic', 'Wake word: Whisper',
-        'openWakeWord is not in use, so Whisper listens for the wake phrase (more CPU, slower).'),
+        'Neither the rolling Hailo engine nor openWakeWord is in use, so Whisper listens for the wake phrase (more CPU, slower).'),
     'wake_model_missing': Fault('info', 0, 'mic', 'No wake model',
-        'Whisper listens for the wake phrase until an openWakeWord model is trained (docs/wake-word-training.md).'),
+        'Whisper listens for the wake phrase: no Hailo Whisper files and no openWakeWord model (docs/wake-word.md).'),
 }
 NETWORK_CODES = frozenset(('internet_down', 'openai_unreachable', 'openai_timeout', 'realtime_unavailable'))
 DETAIL_LIMIT = 4000

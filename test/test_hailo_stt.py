@@ -97,6 +97,26 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(t.decoder_run.runs, 4)
         self.assertEqual(seen[0].shape, (1, 10, 1, 4))  # (1, seq, 1, dim) like the HEF input
 
+    def test_phrase_logprob_is_mean_forced_logprob_and_reuses_shared_prefixes(self):
+        vocab, length = 60000, 10
+        t, _ = self.transcriber([], vocab=vocab, length=length)
+        t.embedding = np.repeat(np.arange(vocab, dtype=np.float32)[:, None], 4, axis=1)  # embedding = token id
+        t.prefix = (1,)  # small vocabulary: one forced prefix token
+        fed = []
+        def decode(b):
+            ids = b.input('dec/input_layer2').value[0, :, 0, 0].astype(int)
+            fed.append(ids)
+            logits = np.zeros((1, length, vocab), np.float32)
+            logits[0, :, 5] = np.log(3.0)  # token 5 three times as likely as each other token
+            b.slots['dec/conv1'].set_buffer(logits[:, :, :vocab // 2]); b.slots['dec/conv2'].set_buffer(logits[:, :, vocab // 2:])
+        t.decoder_run.on_run = decode
+        score = t.phrase_logprob(np.zeros(16000, np.float32), [[5, 2], [5, 3, 4]])
+        p5, other = np.log(3 / (vocab + 2)), np.log(1 / (vocab + 2))
+        self.assertAlmostEqual(score, max((p5 + other) / 2, (p5 + 2 * other) / 3), places=5)
+        self.assertEqual(t.encoder_run.runs, 1)
+        self.assertEqual(t.decoder_run.runs, 3)  # contexts [S,1], [S,1,5] (shared), [S,1,5,3]
+        self.assertEqual(list(fed[0][:2]), [hailo_stt.START, 1])
+
     def test_long_audio_is_split_into_model_windows(self):
         t, _ = self.transcriber([hailo_stt.END] * 8)
         t.transcribe_audio(np.zeros(16000 * 12, np.float32))  # 12 s -> three 5 s windows
@@ -108,6 +128,33 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(text.split()[0], '300')
         self.assertIn('11', text.split())  # 300 penalized (5/1.5) below the ',' runner-up
 
+
+
+class SharedSessionTest(unittest.TestCase):
+    def test_one_session_per_process_replaced_after_failure_and_followed_by_offline_stt(self):
+        from unittest.mock import patch
+        made = []
+        class Fake:
+            def __init__(self, model, language):
+                made.append(self); self.closed = False
+            def transcribe(self, path):
+                return {'text': str(len(made))}
+            def close(self):
+                self.closed = True
+        hailo_stt.close_shared()
+        with patch.object(hailo_stt, 'Transcriber', Fake):
+            first = hailo_stt.shared('base', 'en')
+            self.assertIs(hailo_stt.shared('base', 'en'), first)
+            offline = hailo_stt.SharedTranscriber('base', 'en')
+            self.assertEqual(offline.transcribe('x.wav'), {'text': '1'})
+            second = hailo_stt.replace_shared(first, delay=0)
+            self.assertTrue(first.closed)
+            self.assertIsNot(second, first)
+            self.assertEqual(offline.transcribe('x.wav'), {'text': '2'})  # Follows the new session.
+            offline.close()
+            self.assertFalse(second.closed)
+            hailo_stt.close_shared()
+            self.assertTrue(second.closed)
 
 if __name__ == '__main__':
     unittest.main()

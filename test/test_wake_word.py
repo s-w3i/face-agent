@@ -140,6 +140,20 @@ class ThreadTest(unittest.TestCase):
         self.assertEqual(bus.subscribers, ())
 
 
+class NoisyMixTest(unittest.TestCase):
+    def test_noise_level_matches_the_requested_snr_around_and_under_the_clip(self):
+        rng = np.random.default_rng(1)
+        clip = (np.sin(np.arange(16000) / 5) * 8000).astype(np.int16)
+        noise = rng.normal(0, 3000, 16000 * 20).astype(np.int16)
+        stream, start = wake_eval.noisy(clip, noise, 10, rng)
+        self.assertEqual((start, len(stream)), (3.0, 16000 * 6))
+        lead = stream[:3 * 16000].astype(np.float64)
+        speech = np.sqrt((clip.astype(np.float64) ** 2).mean())
+        self.assertAlmostEqual(20 * np.log10(speech / np.sqrt((lead ** 2).mean())), 10, delta=.5)
+        silent, _ = wake_eval.noisy(clip, noise, None, rng)
+        self.assertFalse(silent[:3 * 16000].any())
+
+
 class EngineChoiceTest(unittest.TestCase):
     def model(self, directory, **info):
         path = Path(directory) / 'hi_kuro.onnx'
@@ -151,15 +165,15 @@ class EngineChoiceTest(unittest.TestCase):
     def test_matching_name_selects_openwakeword_with_model_threshold(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.model(directory, phrase='hi kuro', name='Kuro', threshold=.42)
-            self.assertEqual(ww.choose_engine('auto', path, 'kuro')[:2], ('oww', .42))
+            self.assertEqual(ww.choose_engine('auto', path, 'kuro', rolling_available=False)[:2], ('oww', .42))
 
     def test_renamed_robot_or_missing_model_falls_back_to_whisper(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.model(directory, name='Kuro')
-            engine, _, reason = ww.choose_engine('auto', path, 'Dots')
+            engine, _, reason = ww.choose_engine('auto', path, 'Dots', rolling_available=False)
             self.assertEqual(engine, 'whisper')
             self.assertIn('Dots', reason)
-            self.assertEqual(ww.choose_engine('auto', Path(directory) / 'missing.onnx', 'Kuro')[0], 'whisper')
+            self.assertEqual(ww.choose_engine('auto', Path(directory) / 'missing.onnx', 'Kuro', rolling_available=False)[0], 'whisper')
             self.assertEqual(ww.choose_engine('whisper', path, 'Kuro')[0], 'whisper')
 
     def test_forced_engine_ignores_name_but_still_needs_the_file(self):
@@ -167,6 +181,16 @@ class EngineChoiceTest(unittest.TestCase):
             path = self.model(directory, name='Jarvis', threshold=7)
             self.assertEqual(ww.choose_engine('oww', path, 'Kuro')[:2], ('oww', ww.DEFAULT_THRESHOLD))
             self.assertEqual(ww.choose_engine('oww', Path(directory) / 'none.onnx', 'Kuro')[0], 'whisper')
+
+    def test_auto_prefers_rolling_when_hailo_whisper_is_installed(self):
+        import rolling_wake
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.model(directory, name='Kuro', threshold=.42)
+            engine, threshold, _ = ww.choose_engine('auto', path, 'Dots', rolling_available=True)
+            self.assertEqual((engine, threshold), ('rolling', rolling_wake.DEFAULT_THRESHOLD))  # Any name works.
+            self.assertEqual(ww.choose_engine('rolling', path, 'Kuro', rolling_available=False)[0], 'whisper')
+            self.assertEqual(ww.choose_engine('oww', path, 'Kuro', rolling_available=True)[0], 'oww')
+            self.assertEqual(ww.choose_engine('whisper', path, 'Kuro', rolling_available=True)[0], 'whisper')
 
 
 if __name__ == '__main__':

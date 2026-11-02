@@ -103,7 +103,7 @@ class VoiceInput:
         name = config.get('appearance', {}).get('name', 'Kuro')
         command += ['--stt-prompt', f'The robot is named {name}.']
         engine, threshold, reason = wake_word.choose_engine(self.wake_engine, self.wake_model_path, name)
-        if engine == 'oww' and self.wake_engine_failed:
+        if engine in ('oww', 'rolling') and self.wake_engine_failed:
             engine, reason = 'whisper', 'openWakeWord failed repeatedly in this session'
         if (engine, reason) != self.wake_choice:
             # One line per change, not one per sleep cycle.
@@ -113,6 +113,9 @@ class VoiceInput:
         if engine == 'oww':
             command += ['--wake-engine', 'oww', '--wake-model-path', str(self.wake_model_path),
                         '--wake-threshold', str(threshold)]
+        elif engine == 'rolling':
+            threshold = os.environ.get('DOTS_WAKE_ROLLING_THRESHOLD', '').strip() or threshold
+            command += ['--wake-engine', 'rolling', '--wake-name', name, '--wake-threshold', str(threshold)]
         if self.language:
             command += ['--language', self.language]
         self.process = await asyncio.create_subprocess_exec(*command, cwd=root,
@@ -121,7 +124,7 @@ class VoiceInput:
         await asyncio.wait_for(self.ready, 90)
 
     async def report_wake_engine(self, engine, reason):
-        if engine == 'oww' or reason == 'whisper requested':
+        if engine in ('oww', 'rolling') or reason == 'whisper requested':
             await asyncio.to_thread(self.faults.clear, 'wake_whisper_fallback')
             await asyncio.to_thread(self.faults.clear, 'wake_model_missing')
         elif reason.startswith('no wake model'):

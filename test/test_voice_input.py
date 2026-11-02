@@ -185,6 +185,44 @@ for line in sys.stdin:
                 self.assertEqual(self.server.listening_text['text'], '')
                 self.assertEqual(len(commands), 1)  # One worker across every mode switch.
 
+    async def test_rolling_engine_follows_the_robot_name_and_threshold_override(self):
+        child = Path(self.directory.name) / 'wake_microphone.py'
+        child.write_text('''import json,sys
+print(json.dumps(dict(status='listening', trigger='wake_word')), flush=True)
+for line in sys.stdin:
+    control=json.loads(line)
+    print(json.dumps(dict(status='microphone_control', **control)), flush=True)
+    if not control['paused']:
+        print(json.dumps(dict(status='wake_detected', score=-1.2, t=8.0, continue_from=9.5, continued=True, model='rolling')), flush=True)
+''')
+        original = asyncio.create_subprocess_exec
+        commands = []
+        async def spawn(*command, **options):
+            commands.append(command)
+            return await original(sys.executable, str(child), *command[2:], **options)
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        output = io.StringIO()
+        with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name, 'DOTS_WAKE_ROLLING_THRESHOLD': '-3.5'}), \
+                patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
+                patch('rolling_wake.available', return_value=(True, '')), \
+                patch('serve.Handler.log_message'), redirect_stdout(output):
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.follow_status('SLEEPING')
+                wake = await asyncio.wait_for(voice.read(), 3)
+                self.assertEqual((wake.score, wake.t, wake.continued), (-1.2, 8.0, True))
+                command = commands[-1]
+                self.assertEqual(command[command.index('--wake-engine') + 1], 'rolling')
+                self.assertEqual(command[command.index('--wake-name') + 1], 'Kuro')
+                self.assertEqual(command[command.index('--wake-threshold') + 1], '-3.5')
+                # A studio rename needs no new model: the phrase follows the name.
+                config = await asyncio.to_thread(request, self.url, 'config')
+                config['appearance']['name'] = 'Dots'
+                await asyncio.to_thread(request, self.url, 'config', config)
+                await voice.restart(awake=False)
+                self.assertEqual(commands[-1][commands[-1].index('--wake-name') + 1], 'Dots')
+        self.assertIn('Wake engine: rolling (Hailo Whisper phrase scoring in rolling windows).', output.getvalue())
+
     async def test_openwakeword_hit_wakes_without_display_text_and_name_mismatch_uses_whisper(self):
         root = Path(self.directory.name)
         model = root / 'wake/hi_kuro.onnx'
@@ -210,6 +248,7 @@ for line in sys.stdin:
         output = io.StringIO()
         with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
                 patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
+                patch('rolling_wake.available', return_value=(False, 'no Hailo in this test')), \
                 patch('serve.Handler.log_message'), redirect_stdout(output):
             async with VoiceInput(self.url, status_driven=True) as voice:
                 voice.terminal_open = False

@@ -225,6 +225,11 @@ class ChatCheck(unittest.TestCase):
         self.assertTrue(wake_trigger('Hi, Kuro! What time is it?', 'Kuro'))
         self.assertTrue(wake_trigger('hi KURO', 'Kuro'))
         self.assertFalse(wake_trigger('Hi Kuroko', 'Kuro'))
+        # Noisy-room segments: the phrase is rarely first.
+        self.assertTrue(wake_trigger('and then the weather tomorrow. Hi Kuro, are you there?', 'Kuro'))
+        self.assertTrue(wake_trigger('Hey Kuro.', 'Kuro'))
+        self.assertFalse(wake_trigger('Ishi Kuro', 'Kuro'))
+        self.assertFalse(wake_trigger('Kuro is a nice name', 'Kuro'))
         for text in ('Thank you!', 'goodbye Kuro', 'Thanks for your help', 'Thankyou', 'Bye bye', 'Goodbye and thank you', 'Thank you, that’s all for now', 'Thank you for answering my question'):
             self.assertTrue(closing_message(text), text)
         for text in ('Thank you, now tell me the time', 'Goodbye, but first move forward', 'What does goodbye mean?', 'thanks for the weather; what about tomorrow?'):

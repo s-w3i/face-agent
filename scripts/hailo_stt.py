@@ -7,6 +7,7 @@ greedy decoding with a light repetition penalty. One long-lived VDevice session 
 process: hailort.service 4.23 has crashed when sharing clients tear sessions down.
 """
 import os
+import threading
 from pathlib import Path
 import time
 import wave
@@ -101,33 +102,82 @@ class Transcriber:
             self.close()
             raise
 
+    @property
+    def lock(self):
+        """Serializes the accelerator between the wake thread and offline transcription."""
+        if '_lock' not in self.__dict__:
+            self._lock = threading.Lock()
+        return self._lock
+
     def transcribe_audio(self, audio):
         if np.max(np.abs(audio)) < .1:
             audio = audio * 10.0  # +20 dB for quiet input, as in Hailo's example
         chunks = [audio[start:start + self.seconds * RATE] for start in range(0, max(1, len(audio)), self.seconds * RATE)]
-        return ' '.join(part for part in (self._chunk(chunk) for chunk in chunks) if part).strip()
+        with self.lock:
+            return ' '.join(part for part in (self._chunk(chunk) for chunk in chunks) if part).strip()
 
-    def _chunk(self, audio):
+    def phrase_logprob(self, audio, phrases):
+        """Best mean token log-probability of any of `phrases` (token-id lists) for one window.
+
+        Forced decoding: "how likely is it that this audio says 'Hi, Kuro'?" instead of
+        transcribing and searching the text, which Whisper base gets wrong for many accents.
+        Phrases sharing a prefix reuse its decoder steps.
+        """
+        if np.max(np.abs(audio)) < .1:
+            audio = audio * 10.0
+        start = len(self.prefix)
+        with self.lock:
+            features = self._encode(audio[:self.seconds * RATE])
+            cache = {}
+            best = -np.inf
+            for phrase in phrases:
+                ids = np.zeros((1, self.length), np.int64)
+                ids[0, 0] = START
+                ids[0, 1:1 + len(self.prefix)] = self.prefix
+                total = 0.0
+                for offset, token in enumerate(phrase[:self.length - 1 - start]):
+                    step = start + offset
+                    key = tuple(ids[0, :step + 1])
+                    if key not in cache:
+                        logits = self._logits(features, ids, step, self.decoder_run.create_bindings()).astype(np.float64)
+                        top = logits.max()
+                        cache[key] = logits - (top + np.log(np.exp(logits - top).sum()))
+                    total += cache[key][token]
+                    ids[0, step + 1] = token
+                best = max(best, total / max(1, len(phrase)))
+            return float(best)
+
+    def phrase_tokens(self, text):
+        return self.tokenizer.encode(text, add_special_tokens=False).ids
+
+    def _encode(self, audio):
         mel = log_mel(audio, self.seconds, self.filters)
         mel = np.ascontiguousarray(mel.T[None, None])  # NHWC (1, 1, frames, 80)
         bindings = self.encoder_run.create_bindings()
         bindings.input().set_buffer(mel)
         bindings.output().set_buffer(np.zeros(self.encoder.output().shape, np.float32))
         self.encoder_run.run([bindings], 30000)
-        features = bindings.output().get_buffer()
+        return bindings.output().get_buffer()
+
+    def _logits(self, features, ids, step, decode):
+        """Next-token logits after position `step` of `ids` (the decoder takes the full sequence)."""
+        embedded = (self.embedding[ids] + self.positions)[:, :, None, :]  # (1, seq, 1, dim)
+        decode.input(f'{self.network}/input_layer1').set_buffer(features)
+        decode.input(f'{self.network}/input_layer2').set_buffer(np.ascontiguousarray(embedded, np.float32))
+        for name in self.outputs:
+            decode.output(name).set_buffer(np.zeros(self.decoder.output(name).shape, np.float32))
+        self.decoder_run.run([decode], 30000)
+        return np.concatenate([decode.output(name).get_buffer() for name in self.logit_outputs], axis=2)[0, step]
+
+    def _chunk(self, audio):
+        features = self._encode(audio)
         ids = np.zeros((1, self.length), np.int64)
         ids[0, 0] = START
         ids[0, 1:1 + len(self.prefix)] = self.prefix
         tokens = []
         decode = self.decoder_run.create_bindings()
         for step in range(len(self.prefix), self.length - 1):
-            embedded = (self.embedding[ids] + self.positions)[:, :, None, :]  # (1, seq, 1, dim)
-            decode.input(f'{self.network}/input_layer1').set_buffer(features)
-            decode.input(f'{self.network}/input_layer2').set_buffer(np.ascontiguousarray(embedded, np.float32))
-            for name in self.outputs:
-                decode.output(name).set_buffer(np.zeros(self.decoder.output(name).shape, np.float32))
-            self.decoder_run.run([decode], 30000)
-            logits = np.concatenate([decode.output(name).get_buffer() for name in self.logit_outputs], axis=2)[0, step]
+            logits = self._logits(features, ids, step, decode)
             for token in set(tokens[-8:]):
                 if token not in PUNCTUATION:
                     logits[token] /= 1.5
@@ -156,3 +206,62 @@ class Transcriber:
                 device.release()
             except Exception:
                 pass
+
+
+_shared = {}
+_shared_lock = threading.Lock()
+
+
+def shared(model='base', language='en'):
+    """The process's one Transcriber (one VDevice session) for `model`.
+
+    The rolling wake detector and the offline command fallback both use the 8L; a
+    second session per process, or tearing one down while another client runs, has
+    crashed hailort.service 4.23. Calls are serialized by `Transcriber.lock`.
+    """
+    with _shared_lock:
+        key = (model, language)
+        if key not in _shared:
+            _shared[key] = Transcriber(model, language)
+        return _shared[key]
+
+
+class SharedTranscriber:
+    """Offline-STT handle that always uses the current shared session (survives replace_shared)."""
+
+    backend_name = 'hailo'
+
+    def __init__(self, model='base', language='en'):
+        self.key = (model, language)
+        shared(*self.key)  # Open now: a load failure falls back to the CPU at startup.
+
+    def transcribe(self, path):
+        return shared(*self.key).transcribe(path)
+
+    def close(self):
+        pass  # close_shared() releases the session after the wake thread has stopped.
+
+
+def replace_shared(engine, delay=1.0):
+    """After a HailoRT failure (e.g. hailort.service restarted): drop `engine`, open a new session."""
+    with _shared_lock:
+        for key, value in list(_shared.items()):
+            if value is engine:
+                del _shared[key]
+                break
+        else:
+            key = ('base', 'en')
+    try:
+        engine.close()
+    except Exception:
+        pass
+    time.sleep(delay)  # Let a restarting hailort.service come back.
+    return shared(*key)
+
+
+def close_shared():
+    with _shared_lock:
+        engines = list(_shared.values())
+        _shared.clear()
+    for engine in engines:
+        engine.close()

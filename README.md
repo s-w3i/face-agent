@@ -27,7 +27,7 @@ bash scripts/setup_respeaker.sh
 bash scripts/setup_robot_status.sh
 ```
 
-The setup creates `.venv/`. Until the trained `hi_kuro.onnx` wake model is installed ([docs/wake-word-training.md](docs/wake-word-training.md)), local Whisper handles wake detection and downloads its model on first use, so the first voice launch can take longer.
+The setup creates `.venv/`. Wake detection uses Whisper base on the Hailo-8L when its model files are installed (`scripts/setup_respeaker.sh` downloads them); otherwise local Whisper on the CPU handles it and downloads its model on first use, so the first voice launch can take longer. See [docs/wake-word.md](docs/wake-word.md).
 
 Install Chromium if needed:
 
@@ -100,8 +100,8 @@ A newly started status manager begins in **IDLE**. If a manager is already runni
 
 - **IDLE:** monitors the ReSpeaker hardware voice flag. Speech starts **LISTENING** and opens recording.
 - **LISTENING:** records one utterance, ending after **2 seconds of continuous nonspeech**, then enters **THINKING**. A conversation or another ROS node can also request LISTENING directly when an answer is needed.
-- **THINKING / SPEAKING:** command capture is paused, but the wake word stays live. **Barge-in:** saying “Hi Kuro” while Kuro is **thinking** cancels that turn (its answer is never spoken or shown) and moves to LISTENING. Anything said straight after the phrase (“Hi Kuro, stop. What's the weather?”) is kept as the new request. There's no spoken acknowledgment; the LISTENING animation and the LED ring are the feedback. Interrupting **speech** as well needs the speaker on the ReSpeaker jack (hardware echo cancellation, see “Speaker and echo cancellation”), so it's off until `DOTS_BARGE_IN_SPEAKING=1` (chat `--barge-in-speaking`). After an interrupted spoken reply, the agent is told that the user interrupted it. `DOTS_BARGE_IN=0` (`--no-barge-in`) disables barge-in entirely. It needs the openWakeWord engine and isn't available in legacy `--no-robot-status` mode. After the reply finishes, Kuro returns to IDLE.
-- **SLEEPING:** a local wake-word model ([openWakeWord](docs/wake-word-training.md), about 10% of one core) listens for **“Hi Kuro”** on the continuous microphone stream. Without a trained model, or when the model's name doesn't match the configured character name, local Whisper checks transcripts for “Hi <name>” instead (`Wake engine: …` in the agent log says which one is active). Other speech is ignored. Wake detection never appears on the display, and sleeping audio is not sent to OpenAI. A command spoken in the same breath (“Hi Kuro, what time is it?”) is answered with either engine.
+- **THINKING / SPEAKING:** command capture is paused, but the wake word stays live. **Barge-in:** saying “Hi Kuro” while Kuro is **thinking** cancels that turn (its answer is never spoken or shown) and moves to LISTENING. Anything said straight after the phrase (“Hi Kuro, stop. What's the weather?”) is kept as the new request. There's no spoken acknowledgment; the LISTENING animation and the LED ring are the feedback. Interrupting **speech** as well needs the speaker on the ReSpeaker jack (hardware echo cancellation, see “Speaker and echo cancellation”), so it's off until `DOTS_BARGE_IN_SPEAKING=1` (chat `--barge-in-speaking`). After an interrupted spoken reply, the agent is told that the user interrupted it. `DOTS_BARGE_IN=0` (`--no-barge-in`) disables barge-in entirely. It needs a streaming wake engine (rolling or openWakeWord) and isn't available in legacy `--no-robot-status` mode. After the reply finishes, Kuro returns to IDLE.
+- **SLEEPING:** the **rolling** wake engine listens for **“Hi Kuro”** (or “Hey Kuro”) on the continuous microphone stream: every second, while there is speech, Whisper base on the Hailo-8L scores how likely the last 3 seconds are to contain the phrase, with a CPU Whisper tiny.en check for borderline windows ([docs/wake-word.md](docs/wake-word.md)). It works for any speaker and any character name without training, and it keeps listening through TV and conversation. Without the Hailo model files, a matching [openWakeWord](docs/wake-word-training.md) model is used, else local Whisper checks VAD segments for “Hi <name>” (`Wake engine: …` in the agent log says which one is active). Other speech is ignored. Wake detection never appears on the display, and sleeping audio is not sent to OpenAI. A command spoken in the same breath (“Hi Kuro, what time is it?”) is answered with any engine.
 - **WORKING / DETECTING / ERROR:** show their corresponding animation and pause microphone capture. The wake word is heard but never interrupts navigation or motion.
 
 Kuro sleeps after **5 seconds of inactivity** while command input is available. Recording, transcription, thinking, and speech playback do not count toward that timeout. A goodbye or thank-you without a further request produces a closing reply and then sleeps.
@@ -199,7 +199,8 @@ DOTS_CAMERA_PROFILE=rgbd  # Use color for the lower-bandwidth camera.sh profile.
 DOTS_INITIAL_STATUS=SLEEPING
 # PORT=5173
 # ROS_DOMAIN_ID=0
-# DOTS_WAKE_ENGINE=auto            # auto | oww | whisper
+# DOTS_WAKE_ENGINE=auto            # auto | rolling | oww | whisper
+# DOTS_WAKE_ROLLING_THRESHOLD=-3.3 # rolling: lower wakes more easily (and falsely)
 # DOTS_WAKE_MODEL_PATH=~/.local/share/face-agent/wake/hi_kuro.onnx
 # DOTS_BARGE_IN=1                  # 0 disables wake-word barge-in
 # DOTS_BARGE_IN_SPEAKING=0         # 1 only with the speaker on the ReSpeaker jack
@@ -261,8 +262,8 @@ Faults are recorded in `~/.cache/face-agent/faults.log`, one JSON object per lin
 | `camera_unavailable` | degraded | Camera unavailable | Vision questions cannot see. Check the Orbbec USB cable and stack-camera.log. |
 | `tracking_unavailable` | degraded | Eye tracking off | The eye tracker stopped; chat continues. See tracking-chat.log, then restart face-agent.service. |
 | `tracker_cpu_fallback` | degraded | Tracking on CPU | The Hailo-8L is unavailable (check hailort.service). Restart face-agent.service to retry it. |
-| `wake_whisper_fallback` | degraded | Wake word: Whisper | openWakeWord is not in use, so Whisper listens for the wake phrase (more CPU, slower). |
-| `wake_model_missing` | info | No wake model | Whisper listens for the wake phrase until an openWakeWord model is trained (docs/wake-word-training.md). |
+| `wake_whisper_fallback` | degraded | Wake word: Whisper | Neither the rolling Hailo engine nor openWakeWord is in use, so Whisper listens for the wake phrase (more CPU, slower). |
+| `wake_model_missing` | info | No wake model | Whisper listens for the wake phrase: no Hailo Whisper files and no openWakeWord model (docs/wake-word.md). |
 
 ## ROS 2 robot status
 
@@ -503,12 +504,12 @@ for the selected voice before the startup-ready announcement and stored under
 `~/.cache/face-agent/wake-ack/`. Waking replays this local clip while Realtime
 connects, with the microphone held closed through playback and connection. A
 bare “Hi Kuro” skips the generated greeting; a command after the wake phrase
-still reaches the agent. With openWakeWord, the worker checks whether you keep talking right after the phrase.
+still reaches the agent. With a streaming wake engine, the worker checks whether you keep talking right after the phrase.
 If you do (“Hi Kuro, what time is it?”), the spoken acknowledgment is skipped and the command is captured
-from the in-memory ring buffer starting just after the phrase, so no robot audio plays over it. Cached acknowledgment playback needs no network.
+from the in-memory ring buffer (from the phrase with the rolling engine, just after it with openWakeWord), so no robot audio plays over it. Cached acknowledgment playback needs no network.
 Changing the speech voice requires restarting the agent to prepare its clip.
-`DOTS_WAKE_ENGINE` (`auto`, `oww` or `whisper`) and `DOTS_WAKE_MODEL_PATH` choose the wake engine and model;
-see [docs/wake-word-training.md](docs/wake-word-training.md).
+`DOTS_WAKE_ENGINE` (`auto`, `rolling`, `oww` or `whisper`) and `DOTS_WAKE_MODEL_PATH` choose the wake engine and model;
+see [docs/wake-word.md](docs/wake-word.md).
 `DOTS_WAKE_MODEL` or `--wake-model` overrides the default `small` Whisper wake model. `--no-speak` also disables
 the startup announcement. An external ROS status change takes precedence.
 
