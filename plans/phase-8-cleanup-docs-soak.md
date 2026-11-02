@@ -48,4 +48,24 @@ Remove the legacy code paths that phases 1–7 kept behind flags, make sure the 
 - Don't change behavior in this phase. It covers cleanup, docs and measurement only.
 
 ## Results
-_(Fill in.)_
+Done 2026-11-02 on branch `voice/phase-8-cleanup` (from phase 7), **apart from the live soak, which is pending the owner**.
+
+**Flags (owner's decision):** removed `--legacy-stream` / `DOTS_VOICE_LEGACY_STREAM` and `--respawn-on-wake` / `DOTS_VOICE_RESPAWN`. Kept `--wake-engine whisper`, `--no-barge-in`, `--tracker-backend opencv`, `--offline-stt off`.
+
+**Removed with them:** the old worker loop `listen()`, `record_utterance`, `wake_loop`, `BusCapture`, `StreamCapture`, and the parent's respawn command line. Replacing a *dead* worker in `set_awake` stays, because recovery needs it.
+
+**Behavior note:** the plan says no behavior change in this phase. The standalone CLI had to move: `respeaker.py` now always runs the long-lived worker, starting awake for Realtime or `--no-stt`, and asleep for a local `--stt-model` or `--wake-engine oww`. The `time_limit` reason is gone: `--seconds` now ends the session after the current recording's normal endpoint.
+
+**Checks**
+- [x] `.venv` suite: 219 tests; the only errors are the cv2-only tracker files, which pass in the tracking venv. JS suite not run, no `src/` change.
+- [x] No references to the removed flags in `scripts`, `test`, `docs`, `README.md` (the plans keep them as history).
+- [~] Fresh setup: `setup_respeaker.sh` and `track.sh` pass `bash -n` and their new steps were each run by hand on this Pi; a clean-clone install wasn't tested.
+- [ ] 2 h soak: 0 unrecovered failures, ≤ 2 false wakes, no self-triggered barge-ins. **Pending the owner** (needs hi_kuro and the paid conversation mix).
+- [~] `BASELINE.md` has Before/After from each phase's measurements, labelled as such; the pending rows need the jack, hi_kuro and the soak.
+- Live: `--no-stt --once` and `--stt-model tiny.en --once` ran on the real mic from this branch, and `--legacy-stream` is rejected.
+
+**Coverage moved, not lost:** the old `CaptureTest` cases now live in `test_respeaker_worker.py`: hardware trigger before capture, pre-roll, maximum length, pause discards, overflow, single utterance, late transcript. The old "remote start failure" test became the mode-ack failure test plus `test_failed_worker_is_replaced_when_switching_modes`.
+
+## Open issues
+- Uncommitted fault-reporting work from another session sits in the main working tree on phase 7. Whichever lands second must resolve `respawn`/`faults` on the `VoiceInput` signature and `chat.py` constructor call, and keep `report_wake_engine` in `start_microphone`.
+- This branch was tested from a separate git worktree, so the running service hasn't run this code as a stack.

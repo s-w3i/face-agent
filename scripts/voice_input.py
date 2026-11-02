@@ -31,7 +31,7 @@ class WakeWord:
 
 class VoiceInput:
     def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False,
-                 wake_engine=None, wake_model_path=None, respawn=None):
+                 wake_engine=None, wake_model_path=None):
         self.url = url; self.model = model; self.language = language
         self.forward = forward; self.clockwise = clockwise
         self.wake_model = wake_model; self.awake = status_driven
@@ -39,12 +39,6 @@ class VoiceInput:
         self.wake_model_path = wake_model_path or wake_word.default_model_path()
         self.wake_choice = None
         self.wake_engine_failed = False  # openWakeWord crashed repeatedly: use Whisper from now on.
-        # Phase 3: one long-lived worker switches modes by control. DOTS_VOICE_RESPAWN=1
-        # restores the old kill-and-respawn switch (--respawn-on-wake).
-        enabled = lambda name: os.environ.get(name, '0').strip().lower() in ('1', 'true', 'yes')
-        # The legacy per-utterance stream only exists in the respawning worker.
-        self.respawn = (enabled('DOTS_VOICE_RESPAWN') or enabled('DOTS_VOICE_LEGACY_STREAM')
-                        if respawn is None else respawn)
         self.status_driven = status_driven
         self.activity = asyncio.Queue()
         self.process = self.log = None
@@ -95,39 +89,29 @@ class VoiceInput:
         self.failed = None; self.paused = True; self.accepting = False; self.sequence = 0
         self.utterance_active = False; self.turn_complete = False
         self.controls.clear()
-        if not self.respawn:
-            command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
-                       '--initial-mode', 'awake' if self.awake else 'sleep',
-                       '--silence-seconds', '0.8', '--sleep-silence-seconds', '0.4', '--max-seconds', '10',
-                       '--vad-mode', '2', '--stt-model', self.model, '--wake-stt-model', self.wake_model]
-            if self.status_driven:
-                command += ['--single-utterance']  # Applies to awake (Realtime) turns only.
-            if os.environ.get('DOTS_OFFLINE_STT'):
-                command += ['--offline-stt', os.environ['DOTS_OFFLINE_STT'].strip().lower()]
-        else:
-            command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
-                       '--silence-seconds', '0.8' if self.awake else '0.4', '--max-seconds', '10', '--vad-mode', '2',
-                       '--stt-model', self.model if self.awake else self.wake_model]
-            if self.status_driven and self.awake:
-                command += ['--single-utterance']
-        if not self.awake or not self.respawn:
-            config = await self.api('config')
-            name = config.get('appearance', {}).get('name', 'Kuro')
-            command += ['--stt-prompt', f'The robot is named {name}.']
-            engine, threshold, reason = wake_word.choose_engine(self.wake_engine, self.wake_model_path, name)
-            if engine == 'oww' and self.wake_engine_failed:
-                engine, reason = 'whisper', 'openWakeWord failed repeatedly in this session'
-            if (engine, reason) != self.wake_choice:
-                # One line per change, not one per sleep cycle.
-                print(f'Wake engine: {engine} ({reason}).', flush=True)
-                self.wake_choice = (engine, reason)
-            if engine == 'oww':
-                command += ['--wake-engine', 'oww', '--wake-model-path', str(self.wake_model_path),
-                            '--wake-threshold', str(threshold)]
+        command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
+                   '--initial-mode', 'awake' if self.awake else 'sleep',
+                   '--silence-seconds', '0.8', '--sleep-silence-seconds', '0.4', '--max-seconds', '10',
+                   '--vad-mode', '2', '--stt-model', self.model, '--wake-stt-model', self.wake_model]
+        if self.status_driven:
+            command += ['--single-utterance']  # Applies to awake (Realtime) turns only.
+        if os.environ.get('DOTS_OFFLINE_STT'):
+            command += ['--offline-stt', os.environ['DOTS_OFFLINE_STT'].strip().lower()]
+        config = await self.api('config')
+        name = config.get('appearance', {}).get('name', 'Kuro')
+        command += ['--stt-prompt', f'The robot is named {name}.']
+        engine, threshold, reason = wake_word.choose_engine(self.wake_engine, self.wake_model_path, name)
+        if engine == 'oww' and self.wake_engine_failed:
+            engine, reason = 'whisper', 'openWakeWord failed repeatedly in this session'
+        if (engine, reason) != self.wake_choice:
+            # One line per change, not one per sleep cycle.
+            print(f'Wake engine: {engine} ({reason}).', flush=True)
+            self.wake_choice = (engine, reason)
+        if engine == 'oww':
+            command += ['--wake-engine', 'oww', '--wake-model-path', str(self.wake_model_path),
+                        '--wake-threshold', str(threshold)]
         if self.language:
             command += ['--language', self.language]
-        if os.environ.get('DOTS_VOICE_LEGACY_STREAM', '0').strip().lower() in ('1', 'true', 'yes'):
-            command += ['--legacy-stream']  # Rollback: per-utterance stream, no pre-roll.
         self.process = await asyncio.create_subprocess_exec(*command, cwd=root,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log)
         self.reader = asyncio.create_task(self.receive())
@@ -372,8 +356,8 @@ class VoiceInput:
     async def start_capture(self, from_t):
         """Start a command capture from monotonic time `from_t` (shared clock with the worker)."""
         self.capture_refusal = None
-        if self.respawn or not self.awake:
-            self.capture_refusal = 'respawning worker' if self.respawn else 'asleep'
+        if not self.awake:
+            self.capture_refusal = 'asleep'
             return False
         await self.sync_playback()
         if not self.accepting:
@@ -400,8 +384,9 @@ class VoiceInput:
         """Switch STT with capture closed; sleeping audio stays local."""
         if self.awake == awake:
             return
-        if not self.respawn and not self.failed and self.process and self.process.returncode is None:
+        if not self.failed and self.process and self.process.returncode is None:
             return await self.switch_mode(awake)
+        # The worker is gone or failed: replace it in the target mode.
         guard = self.guard
         if guard:
             guard.cancel()

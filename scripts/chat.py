@@ -561,9 +561,6 @@ async def main():
     parser.add_argument('--wake-model', default=os.environ.get('DOTS_WAKE_MODEL', 'small'), help='Local Whisper model/directory for the Hi {name} wake phrase.')
     parser.add_argument('--wake-engine', choices=['auto', 'oww', 'whisper'], default=os.environ.get('DOTS_WAKE_ENGINE', 'auto'),
                         help='auto: openWakeWord when its model matches the robot name, otherwise local Whisper.')
-    parser.add_argument('--respawn-on-wake', action=argparse.BooleanOptionalAction,
-                        default=os.environ.get('DOTS_VOICE_RESPAWN', '0').strip().lower() in ('1', 'true', 'yes'),
-                        help='Rollback: restart the microphone worker on every sleep/awake switch.')
     parser.add_argument('--barge-in', action=argparse.BooleanOptionalAction,
                         default=os.environ.get('DOTS_BARGE_IN', '1').strip().lower() not in ('0', 'false', 'no'),
                         help='Saying the wake word while Kuro is thinking interrupts the turn (default).')
@@ -625,8 +622,7 @@ async def main():
             status = await stack.enter_async_context(RosStatus()) if args.robot_status else None
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
                 args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None,
-                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path,
-                respawn=args.respawn_on_wake)) if args.mode == 'voice' else None
+                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path)) if args.mode == 'voice' else None
             if status:
                 if voice:
                     if args.speak:
@@ -813,8 +809,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         # "Hi Kuro, what time is it?": the user is still talking, so skip the spoken ack
         # (no robot audio over the command, which matters without hardware AEC) and
         # capture straight from the ring buffer instead.
-        continued = (isinstance(wake, WakeWord) and wake.continued and voice is not None
-                     and getattr(voice, 'respawn', False) is not True)
+        continued = isinstance(wake, WakeWord) and wake.continued and voice is not None
         if voice:
             await gate(True)
         if args.speak and not continued:
@@ -1067,7 +1062,7 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
                     print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
                     continue
                 await voice.hold(False)
-                if text.continued and not voice.respawn:
+                if text.continued:
                     await voice.start_capture(text.t + WAKE_CAPTURE_OFFSET)
                 continue
             if isinstance(text, WakeRequest):

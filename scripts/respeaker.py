@@ -176,135 +176,6 @@ def check_controller(controller):
         controller.result()
 
 
-class BusCapture:
-    """One utterance read from the continuous stream, starting with ring-buffer pre-roll."""
-
-    def __init__(self, producer, preroll_seconds=PREROLL_SECONDS):
-        self.producer = producer
-        self.preroll_seconds = preroll_seconds
-        self.sub = None
-
-    def __enter__(self):
-        bus = self.producer.bus
-        # Subscribe before reading the ring so no block falls between them.
-        self.sub = bus.subscribe('command')
-        self.preroll, _, self.last_seq = bus.preroll(self.sub, seconds=self.preroll_seconds)
-        self.expected = self.last_seq + 1 if self.last_seq else None
-        return self
-
-    def __exit__(self, *exception):
-        self.producer.bus.unsubscribe(self.sub)
-
-    async def read(self):
-        """The next 20 ms of PCM, or None if nothing arrived (the producer watchdog handles stalls)."""
-        while True:
-            block = await asyncio.to_thread(self.sub.get, .5)
-            if self.producer.failed:
-                raise self.producer.failed
-            if block is None:
-                return None
-            if block.seq <= self.last_seq:
-                continue  # Already part of the pre-roll.
-            if block.overflow or (self.expected is not None and block.seq != self.expected):
-                raise RuntimeError(OVERFLOW_MESSAGE)  # Input overflow or a dropped block.
-            self.expected = block.seq + 1
-            return block.pcm
-
-
-class StreamCapture:
-    """Rollback path (--legacy-stream): open an InputStream per utterance, without pre-roll."""
-
-    preroll = b''
-
-    def __init__(self, device):
-        self.device = device
-
-    def __enter__(self):
-        self.context = sd.InputStream(samplerate=RATE, channels=1, dtype='int16',
-                                      device=self.device, blocksize=FRAME_SAMPLES)
-        self.stream = self.context.__enter__()
-        return self
-
-    def __exit__(self, *exception):
-        return self.context.__exit__(*exception)
-
-    async def read(self):
-        try:
-            chunk, overflow = await asyncio.to_thread(self.stream.read, FRAME_SAMPLES)
-        except sd.PortAudioError as error:
-            raise DeviceUnavailable('ReSpeaker audio stream stopped.') from error
-        if overflow:
-            raise RuntimeError(OVERFLOW_MESSAGE)
-        return chunk.astype('<i2', copy=False).tobytes()
-
-
-async def record_utterance(args, dev, capture, state, led, utterance_id, deadline, controller, realtime=None):
-    """Capture only after hardware VAD. Pausing discards the clip and releases capture.
-
-    `capture` is the running AudioProducer (continuous stream with pre-roll), or a
-    PortAudio device for the --legacy-stream per-utterance InputStream.
-    """
-    endpoint = SpeechEndpoint(args.silence_seconds)
-    vad = webrtcvad.Vad(args.vad_mode)
-    pcm = bytearray()
-    direction = dev.direction
-    next_direction = 0.0
-    generation = state.generation
-    legacy = capture is None or isinstance(capture, (int, str))
-    source = (StreamCapture(capture) if legacy else
-              BusCapture(capture, getattr(args, 'preroll_seconds', PREROLL_SECONDS)))
-    state.capture_closed.clear()
-    try:
-        with source:
-            emit({'status': 'utterance_started', 'utterance_id': utterance_id,
-                  'doa_deg': direction})
-            if realtime:
-                realtime.begin(utterance_id)
-            if led:
-                led.set_state(led.states.LISTEN)
-            if source.preroll:
-                pcm.extend(source.preroll)
-                if realtime:
-                    realtime.append(source.preroll)
-            while True:
-                check_controller(controller)
-                if state.paused or state.stopping or state.generation != generation:
-                    emit({'status': 'utterance_discarded', 'utterance_id': utterance_id})
-                    return None
-                data = await source.read()
-                if data is None:
-                    continue
-                if state.paused or state.stopping or state.generation != generation:
-                    return None
-                pcm.extend(data)
-                if realtime:
-                    realtime.append(data)
-                voiced = vad.is_speech(data, RATE)
-                finished = endpoint.update(voiced, len(data) // 2)
-                now = time.monotonic()
-                if voiced and now >= next_direction:
-                    direction = dev.direction
-                    emit({'status': 'speech_direction', 'native_doa_deg': direction,
-                          'utterance_id': utterance_id})
-                    if led:
-                        led.set_listen(direction)
-                    next_direction = now + .25
-                reason = 'silence' if finished else None
-                if not reason and len(pcm) >= round(args.max_seconds * RATE) * 2:
-                    reason = 'maximum_duration'
-                if not reason and now >= deadline:
-                    reason = 'time_limit'
-                if reason:
-                    return {'pcm': bytes(pcm), 'doa_deg': direction,
-                            'utterance_id': utterance_id, 'reason': reason,
-                            'silence_seconds': endpoint.silent_samples / RATE,
-                            'generation': generation}
-    finally:
-        # The recorder has unsubscribed (or its legacy stream has closed) before a
-        # playback-pause acknowledgment can be sent. The shared stream may stay open.
-        state.capture_closed.set()
-
-
 def save_clip(output, clip_count, event):
     path = output if clip_count == 1 else output.with_name(f'{output.stem}-{clip_count:03d}{output.suffix}')
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,140 +186,6 @@ def save_clip(output, clip_count, event):
           **{key: event[key] for key in ('doa_deg', 'utterance_id', 'reason', 'silence_seconds')},
           'duration_seconds': len(event['pcm']) / (RATE * 2)})
     return path
-
-
-async def wake_loop(args, state, controller, producer, led, device, deadline):
-    """SLEEPING with openWakeWord: T2 replaces hardware VAD -> record -> local Whisper."""
-    from wake_word import WakeWordThread
-    loop = asyncio.get_running_loop()
-    hits = asyncio.Queue()
-    wake = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold,
-                          on_detect=lambda hit: loop.call_soon_threadsafe(hits.put_nowait, hit))
-    wake.start()
-    try:
-        await asyncio.to_thread(wake.ready.wait, 60)
-        if wake.error:
-            raise wake.error
-        emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
-              'trigger': 'wake_word', 'model': Path(args.wake_model_path).name,
-              'threshold': args.wake_threshold})
-        while not state.stopping and time.monotonic() < deadline:
-            check_controller(controller)
-            if producer.failed:
-                raise producer.failed
-            if wake.error:
-                raise wake.error
-            if led:
-                led.off() if state.paused else led.set_state(led.states.IDLE)
-            try:
-                hit = await asyncio.wait_for(hits.get(), .05)
-            except TimeoutError:
-                continue
-            wake.wake_word_detected.clear()  # Consumed here; T2 only ever sets it.
-            if state.paused or time.monotonic() < state.resume_at:
-                # The robot's own playback or a closed gate: never treat it as a wake.
-                emit({'status': 'wake_ignored', 'reason': 'paused', 'score': hit['score']})
-                continue
-            emit(hit)
-            if args.once:
-                break
-    finally:
-        await asyncio.to_thread(wake.stop, 1.0)
-        emit({'status': 'wake_stats', **wake.stats()})
-
-
-async def listen(args, dev):
-    device = select_input(args.device)
-    output = Path(args.wav).resolve()
-    if output.exists():
-        raise RuntimeError(f'Recording already exists: {output}; choose another --wav path.')
-    state = Controls(paused=args.control_stdin)
-    controller = asyncio.create_task(read_controls(state)) if args.control_stdin else None
-    dev = ReSpeakerControl(dev)  # pyusb calls are serialized across capture threads.
-    led = None
-    realtime = None
-    producer = None
-    try:
-        if not getattr(args, 'legacy_stream', False):
-            # T1: one continuous stream from now on; audio stays in a 2 s in-memory ring
-            # and reaches a recorder only after the hardware trigger below.
-            producer = AudioProducer(AudioBus(), device, RATE, FRAME_SAMPLES)
-            producer.start()
-        if not args.no_led:
-            from respeaker_led import LEDController
-            led = LEDController(brightness=20)
-        if getattr(args, 'wake_engine', 'whisper') == 'oww':
-            deadline = time.monotonic() + args.seconds if args.seconds else math.inf
-            await wake_loop(args, state, controller, producer, led, device, deadline)
-            return
-        transcriber = None
-        if not args.no_stt:
-            emit({'status': 'transcription_loading', 'model': args.stt_model})
-            if args.stt_model == 'gpt-live-transcribe':
-                from respeaker_realtime import RealtimeTranscriber
-                realtime = await RealtimeTranscriber.open(emit, args.stt_model, args.language)
-            else:
-                from respeaker_stt import Transcriber
-                transcriber = await asyncio.to_thread(Transcriber, args.stt_model, args.language, getattr(args, 'stt_prompt', None))
-            emit({'status': 'transcription_ready', 'model': args.stt_model,
-                  'backend': 'realtime' if realtime else 'local'})
-        emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
-              'trigger': 'hardware_vad', 'silence_seconds': args.silence_seconds,
-              'max_seconds': args.max_seconds, 'vad_mode': args.vad_mode})
-        deadline = time.monotonic() + args.seconds if args.seconds else math.inf
-        utterance_id = clip_count = 0
-        while not state.stopping and time.monotonic() < deadline:
-            check_controller(controller)
-            if producer and producer.failed:
-                raise producer.failed
-            if led:
-                led.off() if state.paused else led.set_state(led.states.IDLE)
-            if state.paused or time.monotonic() < state.resume_at:
-                await asyncio.sleep(.05)
-                continue
-            # Firmware alone triggers capture; the recording then starts with pre-roll.
-            if not dev.is_voice():
-                await asyncio.sleep(.05)
-                continue
-            utterance_id += 1
-            event = await record_utterance(args, dev, producer or device, state, led, utterance_id,
-                                           deadline, controller, realtime)
-            if event is None:
-                if realtime:
-                    # Drop unfinished remote audio and its context before accepting a new turn.
-                    await realtime.close()
-                    if state.stopping:
-                        break
-                    realtime = await RealtimeTranscriber.open(emit, args.stt_model, args.language)
-                continue
-            clip_count += 1
-            path = save_clip(output, clip_count, event)
-            if transcriber or realtime:
-                if led:
-                    led.set_state(led.states.THINK)
-                result = await realtime.finish() if realtime else await asyncio.to_thread(transcriber.transcribe, path)
-                check_controller(controller)
-                if not state.stopping and not state.paused and state.generation == event['generation']:
-                    final_fields = {}
-                    if getattr(args, 'single_utterance', False):
-                        state.paused = True
-                        final_fields['paused_after'] = True
-                    emit({'status': 'transcript_final', 'item_id': f'local-{utterance_id}',
-                          'utterance_id': utterance_id, 'wav': str(path), 'doa_deg': event['doa_deg'],
-                          **result, **final_fields})
-            if args.once:
-                break
-    finally:
-        if realtime:
-            await realtime.close()
-        if controller:
-            controller.cancel()
-            await asyncio.gather(controller, return_exceptions=True)
-        if led:
-            led.off()
-        if producer:
-            producer.stop()
-            emit({'status': 'capture_stats', **producer.stats()})
 
 
 RING_SECONDS = 8.0  # Enough history for a wake-initiated capture after a Realtime connect.
@@ -671,7 +408,7 @@ def load_offline_stt(args):
 
 
 async def serve(args, dev):
-    """Long-lived worker: switch sleep/awake by control instead of respawning (phase 3)."""
+    """The microphone worker: T1 stream, T2 wake word, T3 recorder; sleep/awake switch by control."""
     device = select_input(args.device)
     output = Path(args.wav).resolve()
     if output.exists():
@@ -1020,10 +757,8 @@ def run(args, dev):
     elif args.command == 'doctor':
         emit({'control_version_byte': dev.version, 'usb_device_revision': hex(dev.dev.bcdDevice),
               'parameters': {name: dev.read(name) for name in PARAMETERS}})
-    elif getattr(args, 'initial_mode', None):
-        asyncio.run(serve(args, dev))
     else:
-        asyncio.run(listen(args, dev))
+        asyncio.run(serve(args, dev))
 
 
 def main():
@@ -1048,14 +783,13 @@ def main():
     parser.add_argument('--language', default='en', help='Language code, or auto to detect it')
     parser.add_argument('--preroll-seconds', type=float, default=PREROLL_SECONDS,
                         help='Audio kept from before the hardware voice trigger (0-1.5 s)')
-    parser.add_argument('--legacy-stream', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--wake-engine', choices=['whisper', 'oww'], default='whisper',
                         help='oww: openWakeWord model on the continuous stream instead of hardware VAD + local Whisper')
     parser.add_argument('--wake-model-path', help='openWakeWord .onnx model (default DOTS_WAKE_MODEL_PATH or '
                         '~/.local/share/face-agent/wake/hi_kuro.onnx)')
     parser.add_argument('--wake-threshold', type=float, help='Wake score threshold (default: model .json or 0.5)')
     parser.add_argument('--initial-mode', choices=['sleep', 'awake'],
-                        help='Long-lived worker: start in this mode and switch with {"mode": …} controls')
+                        help='Start in this mode; switch with {"mode": …} controls (default follows --stt-model)')
     parser.add_argument('--sleep-silence-seconds', type=float, default=0.4,
                         help='Endpoint silence in sleep mode with the Whisper wake engine')
     parser.add_argument('--wake-stt-model', default='small', help='Local Whisper model for sleep mode (Whisper wake engine)')
@@ -1078,16 +812,20 @@ def main():
         parser.error('Seconds must be finite: session >= 0; silence > 0; maximum > silence.')
     if not 0 <= args.preroll_seconds <= 1.5:
         parser.error('--preroll-seconds must be between 0 and 1.5.')
-    if args.initial_mode and args.legacy_stream:
-        parser.error('--initial-mode needs the continuous stream; drop --legacy-stream.')
-    if args.initial_mode and not 0 < args.sleep_silence_seconds < args.max_seconds:
+    if args.initial_mode is None:
+        # Standalone use: Realtime (or --no-stt) records awake; a local Whisper model or
+        # the wake engine runs in sleep mode, with the requested silence timeout.
+        local = args.stt_model != 'gpt-live-transcribe' and not args.no_stt
+        args.initial_mode = 'sleep' if local or args.wake_engine == 'oww' else 'awake'
+        if local:
+            args.wake_stt_model = args.stt_model
+            args.sleep_silence_seconds = args.silence_seconds
+    if not 0 < args.sleep_silence_seconds < args.max_seconds:
         parser.error('--sleep-silence-seconds must be positive and below --max-seconds.')
     if args.wake_engine == 'oww':
         import wake_word
         args.wake_model_path = str(Path(args.wake_model_path).expanduser() if args.wake_model_path
                                    else wake_word.default_model_path())
-        if args.legacy_stream:
-            parser.error('--wake-engine oww needs the continuous stream; drop --legacy-stream.')
         if not Path(args.wake_model_path).is_file():
             parser.error(f'No wake model at {args.wake_model_path}.')
         if args.wake_threshold is None:

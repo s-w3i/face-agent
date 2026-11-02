@@ -280,7 +280,7 @@ def wait_status(url, wanted, timeout):
 
 
 def wait_sleeping_ready(url, cpu, timeout=90):
-    """SLEEPING alone is not enough: the wake worker respawns and loads Whisper afterwards."""
+    """SLEEPING alone is not enough: a replaced worker may still be loading its wake model."""
     if not wait_status(url, ('SLEEPING',), timeout):
         return False
     since = time.monotonic()

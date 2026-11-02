@@ -304,6 +304,42 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.status('transcript_final'))
         self.assertEqual(len(self.status('transcript_final')), 1)
 
+    async def test_nothing_records_before_the_hardware_trigger(self):
+        await self.start(initial_mode='awake')
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        await asyncio.sleep(.2)
+        self.assertEqual(self.status('utterance_started'), [])
+        self.assertTrue(self.dev.is_voice.called)
+        self.assertEqual(self.recorder_bus().subscribers, ())
+
+    async def test_recording_starts_with_preroll(self):
+        PacedStream.period = .02
+        await self.start(initial_mode='awake', preroll_seconds=.1)
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        PacedStream.value = 5
+        await asyncio.sleep(.3)
+        PacedStream.value = 9
+        await asyncio.sleep(.04)
+        await self.speak_once()
+        await self.until(lambda: self.status('utterance_saved'))
+        audio = np.frombuffer(bytes(FakeRealtime.instances[0].audio), '<i2')
+        self.assertEqual(int(audio[0]), 5)  # Audio from before the trigger.
+        self.assertEqual(int(audio[-1]), 9)
+
+    async def test_continuous_speech_stops_at_the_maximum_length(self):
+        await self.start(initial_mode='awake', max_seconds=.5)
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        self.speech = True
+        self.voice = True
+        await self.until(lambda: self.status('utterance_saved'))
+        self.voice = False
+        saved = self.status('utterance_saved')[0]
+        self.assertEqual(saved['reason'], 'maximum_duration')
+        self.assertAlmostEqual(saved['duration_seconds'], .5, delta=.03)
+
     # ---- phase 5: fault injection -------------------------------------------------
 
     async def test_stalled_stream_reports_reconnectable_device_error(self):

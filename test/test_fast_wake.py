@@ -121,7 +121,7 @@ class WakeLoopTest(unittest.IsolatedAsyncioTestCase):
         status = Authority()
         status.current = Status(initial, 1, 'startup')
         voice = Mock(read=AsyncMock(side_effect=inputs), hold=AsyncMock(), set_awake=AsyncMock(),
-                     follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                     follow_status=AsyncMock(), activity=asyncio.Queue(),
                      start_capture=AsyncMock(return_value=True))
         def api(url, action, value=None):
             if action == 'status':
@@ -181,7 +181,7 @@ class BargeInTest(unittest.IsolatedAsyncioTestCase):
         async def read(timeout=None, notices=None):
             return await inputs.get()
         voice = Mock(read=AsyncMock(side_effect=read), hold=AsyncMock(), set_awake=AsyncMock(),
-                     follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                     follow_status=AsyncMock(), activity=asyncio.Queue(),
                      start_capture=AsyncMock(return_value=True), barge_ins=asyncio.Queue(maxsize=1))
         reached = asyncio.Event()
         finish = asyncio.Event()  # Without a barge-in the turn completes normally.
@@ -260,7 +260,7 @@ class BargeInTest(unittest.IsolatedAsyncioTestCase):
                 async def read(timeout=None, notices=None):
                     return await inputs.get()
                 voice = Mock(read=AsyncMock(side_effect=read), hold=AsyncMock(), set_awake=AsyncMock(),
-                             follow_status=AsyncMock(), activity=asyncio.Queue(), respawn=False,
+                             follow_status=AsyncMock(), activity=asyncio.Queue(),
                              start_capture=AsyncMock(), barge_ins=asyncio.Queue(maxsize=1))
                 with patch('chat.Chatbot'), patch('chat.request'), redirect_stdout(io.StringIO()):
                     task = asyncio.create_task(status_chat_loop(

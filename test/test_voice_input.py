@@ -28,9 +28,7 @@ class VoiceIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
         # Never pick up a wake model installed on this machine.
-        # These tests drive the respawn protocol (rollback path); LongLivedWorkerTest covers phase 3.
-        wake_env = patch.dict(os.environ, {'DOTS_WAKE_ENGINE': 'auto', 'DOTS_WAKE_MODEL_PATH': str(root / 'wake/hi_kuro.onnx'),
-                                           'DOTS_VOICE_RESPAWN': '1'})
+        wake_env = patch.dict(os.environ, {'DOTS_WAKE_ENGINE': 'auto', 'DOTS_WAKE_MODEL_PATH': str(root / 'wake/hi_kuro.onnx')})
         wake_env.start()
         self.addCleanup(wake_env.stop)
         config = root / 'robot-config.json'
@@ -100,7 +98,6 @@ for line in sys.stdin:
         original = asyncio.create_subprocess_exec
         async def spawn(*command, **options):
             self.assertEqual(command[command.index('--stt-model') + 1], 'gpt-live-transcribe')
-            self.assertNotIn('--stt-prompt', command)
             return await original(sys.executable, str(child), **options)
         self.server.apply_robot_status(dict(status='IDLE', revision=1, source='test'))
         with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
@@ -125,30 +122,36 @@ for line in sys.stdin:
     async def test_sleep_wake_transcripts_hidden_and_command_capture_is_one_turn(self):
         child = Path(self.directory.name) / 'mode_microphone.py'
         child.write_text('''import json,sys
-awake=sys.argv[1]=='gpt-live-transcribe'
+mode=sys.argv[sys.argv.index('--initial-mode')+1]
 print(json.dumps(dict(status='listening')), flush=True)
 started=False
 for line in sys.stdin:
     control=json.loads(line)
+    if 'mode' in control:
+        mode=control['mode']; started=False
+        print(json.dumps(dict(status='microphone_control', **control, paused=True, active_mode=mode)), flush=True)
+        continue
     print(json.dumps(dict(status='microphone_control', **control)), flush=True)
     if not control['paused'] and not started:
         started=True
+        awake=mode=='awake'
         text='What time is it?' if awake else 'Hi Kuro'
         print(json.dumps(dict(status='utterance_started', utterance_id=1)), flush=True)
         print(json.dumps(dict(status='transcript_partial', item_id='one', delta=text, utterance_id=1)), flush=True)
         print(json.dumps(dict(status='transcript_final', item_id='one', text=text, utterance_id=1, paused_after=awake)), flush=True)
 ''')
         original = asyncio.create_subprocess_exec
-        models = []
+        commands = []
         async def spawn(*command, **options):
-            model = command[command.index('--stt-model') + 1]
-            models.append(model)
-            self.assertEqual(command[command.index('--silence-seconds') + 1],
-                             '0.8' if model == 'gpt-live-transcribe' else '0.4')
+            commands.append(command)
+            self.assertEqual(command[command.index('--stt-model') + 1], 'gpt-live-transcribe')
+            self.assertEqual(command[command.index('--wake-stt-model') + 1], 'small')
+            self.assertEqual(command[command.index('--silence-seconds') + 1], '0.8')
+            self.assertEqual(command[command.index('--sleep-silence-seconds') + 1], '0.4')
             self.assertEqual(command[command.index('--max-seconds') + 1], '10')
             self.assertEqual(command[command.index('--vad-mode') + 1], '2')
-            self.assertEqual('--single-utterance' in command, model == 'gpt-live-transcribe')
-            return await original(sys.executable, str(child), model, **options)
+            self.assertIn('--single-utterance', command)
+            return await original(sys.executable, str(child), *command[2:], **options)
         self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
         with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
                 patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
@@ -180,7 +183,7 @@ for line in sys.stdin:
                 await voice.follow_status('SLEEPING')
                 self.assertEqual(await asyncio.wait_for(voice.read(), 3), 'Hi Kuro')
                 self.assertEqual(self.server.listening_text['text'], '')
-                self.assertEqual(models, ['small', 'gpt-live-transcribe', 'small'])
+                self.assertEqual(len(commands), 1)  # One worker across every mode switch.
 
     async def test_openwakeword_hit_wakes_without_display_text_and_name_mismatch_uses_whisper(self):
         root = Path(self.directory.name)
@@ -310,18 +313,18 @@ emit(dict(status='listening'))
 for line in sys.stdin:
     control = json.loads(line)
     emit(dict(status='transcript_final', item_id='late', text='Robot echo'))
-    emit(dict(status='microphone_control', **control))
+    if 'mode' in control:
+        emit(dict(status='microphone_control', **control, paused=True, active_mode=control['mode']))
+    else:
+        emit(dict(status='microphone_control', **control))
 ''')
         original = asyncio.create_subprocess_exec
         async def spawn(*command, **options):
             self.assertIn('--diagnostics', command)
             self.assertIn('--control-stdin', command)
-            self.assertIn(command[command.index('--stt-model') + 1], ('small', 'gpt-live-transcribe'))
+            self.assertEqual(command[command.index('--stt-model') + 1], 'gpt-live-transcribe')
             self.assertEqual(command[command.index('--language') + 1], 'en')
-            if command[command.index('--stt-model') + 1] == 'small':
-                self.assertEqual(command[command.index('--stt-prompt') + 1], 'The robot is named Kuro.')
-            else:
-                self.assertNotIn('--stt-prompt', command)
+            self.assertEqual(command[command.index('--stt-prompt') + 1], 'The robot is named Kuro.')
             return await original(sys.executable, str(child), **options)
         with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
                 patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
@@ -378,55 +381,6 @@ for line in sys.stdin:
             status = await asyncio.to_thread(request, self.url, 'status')
             self.assertEqual(status['inputMode'], 'words')
             self.assertIsNone(status['speechHint'])
-
-    async def test_remote_start_failure_restores_local_wake_and_next_wake_can_succeed(self):
-        child = Path(self.directory.name) / 'remote_microphone.py'
-        marker = Path(self.directory.name) / 'remote-attempted'
-        child.write_text("""import json,sys
-from pathlib import Path
-model, marker = sys.argv[1], Path(sys.argv[2])
-def emit(value):
-    print(json.dumps(value), flush=True)
-if model == 'gpt-live-transcribe' and not marker.exists():
-    marker.touch()
-    emit(dict(status='microphone_error', reconnectable=False, category='realtime_unavailable', message='Realtime connection timed out.'))
-    sys.exit(1)
-emit(dict(status='listening'))
-for line in sys.stdin:
-    emit(dict(status='microphone_control', **json.loads(line)))
-""")
-        original = asyncio.create_subprocess_exec
-        models, processes = [], []
-        async def spawn(*command, **options):
-            model = command[command.index('--stt-model') + 1]
-            models.append(model)
-            process = await original(sys.executable, str(child), model, str(marker), **options)
-            processes.append(process)
-            return process
-        with patch.dict(os.environ, {'XDG_CACHE_HOME': self.directory.name}), \
-                patch('voice_input.asyncio.create_subprocess_exec', side_effect=spawn), \
-                patch('serve.Handler.log_message'), redirect_stdout(io.StringIO()):
-            async with VoiceInput(self.url) as voice:
-                await voice.hold(True)
-                with self.assertRaisesRegex(RealtimeUnavailable, 'timed out'):
-                    await voice.set_awake(True)
-                self.assertFalse(voice.awake)
-                self.assertIsNone(voice.failed)
-                self.assertIsNone(voice.process.returncode)
-                self.assertTrue(voice.paused)
-                await voice.hold(False)
-                self.assertTrue(voice.accepting)
-                await voice.hold(True)
-                await voice.set_awake(True)
-                self.assertTrue(voice.awake)
-                self.assertIsNone(voice.failed)
-                # A later network loss must also allow switching back to local STT.
-                voice.failed = RealtimeUnavailable('Connection lost')
-                await voice.set_awake(False)
-                self.assertFalse(voice.awake)
-                self.assertIsNone(voice.failed)
-        self.assertEqual(models, ['small', 'gpt-live-transcribe', 'small', 'gpt-live-transcribe', 'small'])
-        self.assertTrue(all(process.returncode is not None for process in processes))
 
     async def test_usb_disconnect_during_pause_restarts_closed_and_preserves_playback_gate(self):
         child = Path(self.directory.name) / 'usb_microphone.py'
@@ -592,7 +546,7 @@ for line in sys.stdin:
 
 
 class LongLivedWorkerTest(VoiceIntegrationTest):
-    """Phase 3: one worker for sleep and awake; the inherited respawn tests are disabled here."""
+    """One worker for sleep and awake; the inherited tests are not repeated here."""
 
     for _name in [n for n in dir(VoiceIntegrationTest) if n.startswith('test_')]:
         locals()[_name] = None
@@ -600,9 +554,6 @@ class LongLivedWorkerTest(VoiceIntegrationTest):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        respawn = patch.dict(os.environ, {'DOTS_VOICE_RESPAWN': '0'})
-        respawn.start()
-        self.addCleanup(respawn.stop)
 
     def spawn_child(self, extra=()):
         child = Path(self.directory.name) / 'long_lived.py'
@@ -651,6 +602,23 @@ class LongLivedWorkerTest(VoiceIntegrationTest):
                 await voice.set_awake(True)  # The same worker connects on the next attempt.
                 self.assertTrue(voice.awake)
         self.assertEqual(len(self.commands), 1)
+
+    async def test_failed_worker_is_replaced_when_switching_modes(self):
+        env, exec_patch, log, out = self.patches(self.spawn_child())
+        self.server.apply_robot_status(dict(status='SLEEPING', revision=1, source='test'))
+        with env, exec_patch, log, out:
+            async with VoiceInput(self.url, status_driven=True) as voice:
+                voice.terminal_open = False
+                await voice.hold(True)
+                await voice.set_awake(True)
+                # A network loss killed the awake worker: going to sleep still has to work.
+                voice.failed = RealtimeUnavailable('Connection lost')
+                await voice.set_awake(False)
+                self.assertFalse(voice.awake)
+                self.assertIsNone(voice.failed)
+                self.assertIsNone(voice.process.returncode)
+        self.assertEqual(len(self.commands), 2)
+        self.assertEqual(self.commands[1][self.commands[1].index('--initial-mode') + 1], 'sleep')
 
     async def test_awake_wake_hit_reaches_barge_in_queue_while_paused(self):
         env, exec_patch, log, out = self.patches(self.spawn_child(extra=('--awake-hit',)))

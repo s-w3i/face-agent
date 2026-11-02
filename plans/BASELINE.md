@@ -93,3 +93,27 @@ No tuning parameters were changed (AGC, `GAMMAVAD_SR`, …).
   - `test_human_tracker` / `test_tracking_models` can't import `cv2` in `.venv`. They pass in the tracking venv (`~/.cache/face-agent/tracking-venv/bin/python`: 17 OK + 1 skip, and the tracker tests OK).
   - `test_global_status.test_sleep_repeats_local_wake_detection_and_ignores_other_speech` still expects a bare "Hi Kuro" to reach `bot.reply`. Commit `c335a56` (fast wake) changed that to the cached ack. To be fixed in phase 2, which reworks the same path.
 - ROS python: `test_camera_snapshot.py`, 8 tests OK.
+
+## Before and after (phase 8, 2026-11-02)
+
+Nothing below is a new run of the finished branch on the live stack: each "After" is the measurement from the phase that delivered it (raw data in `test-output/bench/` and each phase file). **Wake-word figures use the pre-trained `hey_jarvis` model**, because the `hi_kuro` model isn't trained yet; the speaker is still the Jieli USB device.
+
+| Metric | Before | After | Source / note |
+| --- | --- | --- | --- |
+| Wake detection, end of phrase → log (median) | 9979 ms | **432 ms** (openWakeWord); about 720–870 ms with the continuation check | Phases 2, 3. Whisper engine unchanged at ~9.2 s |
+| Ack audible (median) | 10262 ms | **630 ms**; about 900–1080 ms with the continuation check | Phases 2, 3 |
+| Wake → input ready, plain wake | 13289 ms | 3693 ms (openWakeWord), 12434 ms (Whisper) | Limited by the 3 s cached ack |
+| Wake → input ready, one breath | not applicable (ack played first) | 0.7–1.1 s after the sentence | Phase 3 |
+| Sleep ↔ awake switch | 6.06 s (respawn) | **1.92 s** | Phase 3; includes ~1 s of `ros2` CLI |
+| First word lost on commands | 2/9, all recordings start mid-speech | 0/5 standalone, 10/10 correct in stack | Phases 1, 2 |
+| Barge-in during THINKING | impossible | 2/2, LISTENING ~547 ms after the phrase | Phase 4 |
+| Barge-in during SPEAKING | impossible | **not measured** (needs the jack) | Phase 4 |
+| Worker CPU, SLEEPING quiet | 1.3% | **11.4%** with openWakeWord (regression, explained below); 0.9–1.3% with Whisper | Phases 1, 2 |
+| Worker CPU, SLEEPING during speech | ~118% | ~24% with openWakeWord (trials incl. reloads) | Phase 2 |
+| Tracker CPU, face work per frame | 3.60 ms | **0.30 ms** | Phase 6, replay |
+| Tracker CPU, total per frame | 8.44 ms | **5.14 ms** (−39%) | Phase 6, replay; awake with nobody in view stays ~13% (decode) |
+| Offline STT | none | Hailo base, 1.31 s median, 0.41 s CPU | Phase 7 |
+| ch0 echo reduction | Jieli: +20.9 dB rise, no reference | **pending the jack** | Phase 0 |
+| False wakes per hour; self-triggered barge-ins; 2 h soak | not measured | **pending the owner** | Needs hi_kuro and hands-on time |
+
+**Regressions, explained:** with openWakeWord the sleeping worker uses about 10 points more CPU in a quiet room, because the wake model always runs; in exchange it stops the ~118% Whisper burst for every sound in the room and answers 23× faster. The continuation check adds about 0.3–0.4 s to plain wakes in exchange for one-breath commands without AEC.
