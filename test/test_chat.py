@@ -13,7 +13,7 @@ import subprocess
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from chat import Chatbot, chat_loop, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement, start_tracking, closing_message
@@ -31,6 +31,12 @@ class ChatCheck(unittest.TestCase):
         url = patch.dict(os.environ, {'DOTS_URL': 'http://127.0.0.1:9'})
         url.start()
         self.addCleanup(url.stop)
+        # main() builds a fault reporter; with no service it would append to the real faults.log.
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        cached = patch.dict(os.environ, {'XDG_CACHE_HOME': cache.name})
+        cached.start()
+        self.addCleanup(cached.stop)
         tracking = patch('chat.start_tracking')
         self.tracking = tracking.start()
         self.addCleanup(tracking.stop)
@@ -53,7 +59,7 @@ class ChatCheck(unittest.TestCase):
             if flags:
                 self.tracking.assert_not_called()
             else:
-                self.tracking.assert_called_once_with('http://127.0.0.1:5174')
+                self.tracking.assert_called_once_with('http://127.0.0.1:5174', ANY)  # ANY: the fault reporter.
                 self.tracking.return_value.__exit__.assert_called_once()
 
     def test_voice_local_wake_realtime_commands_and_closing_policy(self):

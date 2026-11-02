@@ -31,6 +31,7 @@ class StartupCheck(unittest.TestCase):
             (root / '.venv/bin').mkdir(parents=True)
             (root / '.venv/bin/python').symlink_to(sys.executable)
             shutil.copy2(ROOT / 'scripts/start_stack.py', root / 'scripts/start_stack.py')
+            shutil.copy2(ROOT / 'scripts/faults.py', root / 'scripts/faults.py')
             # Stand in for ROS discovery, keeping the actual process supervision.
             (root / 'rclpy.py').write_text(
                 'def init(): pass\ndef shutdown(): pass\n'

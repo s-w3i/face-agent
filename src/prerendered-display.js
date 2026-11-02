@@ -6,6 +6,7 @@ import { SpeechPlayer } from './speech.js';
 import { SmoothGaze } from './gaze.js';
 import { gazeControls } from './gaze-controls.js';
 import { connectListeningText, listeningTop } from './listening-text.js';
+import { connectFaults } from './fault-chip.js';
 
 async function api(path, value) {
   const response = await fetch(`/api/${path}`, value === undefined ? { cache: 'no-store' } : {
@@ -21,6 +22,7 @@ export async function startBakedDisplay(config) {
     <p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>
     <p id="robot-listening-text" class="robot-listening-text" dir="auto" aria-label="Recognized speech" aria-live="polite" hidden></p>
     <div class="baked-loading" id="baked-loading" role="status">Loading saved animation pack…</div>
+    <div id="fault-chip"></div>
     <div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="device-key-open">API key</button><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="toast" class="toast" role="status"></div>
     <dialog id="device-key-dialog" class="key-dialog" aria-labelledby="device-key-title"><form id="device-key-form"><h2 id="device-key-title">Set up this device’s API key</h2><p>Each device needs its own OpenAI API key setup. The key stays in a private file on this device and is excluded from Git, character configuration and animation packs.</p><label class="field-label" for="device-key-input">OpenAI API key</label><input id="device-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p id="device-key-error" role="alert"></p><div class="speech-buttons"><button id="device-key-submit" class="outline-button" type="submit">Save API key</button><button id="device-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
   const $ = selector => document.querySelector(selector);
@@ -89,6 +91,7 @@ export async function startBakedDisplay(config) {
   await api('actions', manifest.clips.map(({ id, label }) => ({ id, label })));
   events = new EventSource('/api/events');
   connectListeningText(events, $('#robot-listening-text'), () => { drawn = ''; });
+  connectFaults(events, $('#fault-chip'));
   events.onopen = status;
   events.onerror = () => { $('#robot-connection').textContent = 'Reconnecting…'; };
   events.addEventListener('config-error', event => toast(JSON.parse(event.data).error));

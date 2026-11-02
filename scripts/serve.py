@@ -15,6 +15,7 @@ import time
 import uuid
 import wave
 from urllib.parse import urlparse
+import faults
 from prerender import RenderPacks
 from robot_states import ANIMATIONS, INPUT_STATES, normalize_status
 try:
@@ -120,7 +121,7 @@ def state_key(value):
 class RobotServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, config_file=None, static_root=None, key_file=None):
+    def __init__(self, address, config_file=None, static_root=None, key_file=None, fault_log=None):
         self.config_file = Path(config_file or os.environ.get('DOTS_CONFIG', ROOT / 'robot-config.json')).resolve()
         self.static_root = Path(static_root or ROOT / 'dist').resolve()
         packs = ROOT / 'public/prerendered'
@@ -146,6 +147,8 @@ class RobotServer(ThreadingHTTPServer):
         self.mic_forward = 0.; self.mic_clockwise = False
         self.speech_hint = None; self.speech_hint_at = 0
         self.listening_text = dict(generation=self.generation, sequence=0, text='', final=False, utterance=0)
+        # Named faults for the corner chip; fault_log=None (tests) keeps them in memory only.
+        self.fault_table = faults.FaultTable(fault_log)
         super().__init__(address, Handler)
 
     def config(self):
@@ -181,6 +184,16 @@ class RobotServer(ThreadingHTTPServer):
         self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
                             state=state, **fields)
 
+    def raise_fault(self, code, component, message='', **fields):
+        with self.changed:
+            if self.fault_table.raise_(code, component, message, **fields):
+                self.changed.notify_all()
+
+    def clear_fault(self, code=None, component=None, **fields):
+        with self.changed:
+            if self.fault_table.clear(code, component, **fields):
+                self.changed.notify_all()
+
     def apply_robot_status(self, value):
         status = normalize_status(value['status'])
         with self.changed:
@@ -188,6 +201,15 @@ class RobotServer(ThreadingHTTPServer):
             if previous and value['revision'] and value['revision'] <= previous['revision']:
                 return
             self.robot_status = dict(value, status=status)
+            source = str(value.get('source') or '')
+            if status == 'ERROR' and source == 'connection':
+                self.fault_table.raise_('ros_status_lost', 'display', 'The display lost its /robot/status subscription.')
+            elif status == 'ERROR' and not source.startswith('face-agent-'):
+                self.fault_table.raise_('external_error', 'display', 'ERROR set by ' + (source or 'an unnamed ROS node') + '.')
+            elif status != 'ERROR' and previous and previous['status'] == 'ERROR':
+                # Recovery: blocking faults belong to the episode that just ended.
+                self.fault_table.clear(where=lambda fault: fault['severity'] == 'error' and fault['autoClear'],
+                                       reason='recovered')
             animation = ANIMATIONS[status]
             # A delayed SPEAKING notification must not cancel the actual audio command.
             if self.command['state'] != animation or (self.command.get('speech') and self.command.get('statusRevision') != value['revision']):
@@ -281,6 +303,9 @@ class RobotServer(ThreadingHTTPServer):
                         yield chunk
                     elif kind == 'error':
                         code = event.get('error', {}).get('code')
+                        self.raise_fault({'invalid_api_key': 'openai_auth', 'insufficient_quota': 'openai_quota',
+                                          'rate_limit_exceeded': 'openai_rate_limit'}.get(code, 'openai_error'),
+                                         'speech', f'Speech request rejected ({code or "unknown code"}).')
                         messages = {'invalid_api_key': 'OpenAI rejected the API key. Update it in Voice settings.',
                                     'model_not_found': 'This OpenAI project cannot access ' + SPEECH_MODEL + '.',
                                     'insufficient_quota': 'OpenAI quota reached. Check your API billing.',
@@ -290,20 +315,32 @@ class RobotServer(ThreadingHTTPServer):
                         if event.get('response', {}).get('status') != 'completed':
                             raise ValueError('OpenAI did not complete the speech. Please try again.')
                         completed = bool(size); break
+                if completed:
+                    self.clear_fault(component='speech')
                 if not completed:
                     raise ValueError('OpenAI returned no complete speech clip. Please try again.')
                 yield dict(type='done', totalMs=round((time.monotonic() - started) * 1000))
             except InvalidStatus as error:
                 # Never echo provider bodies or connection headers.
+                status_code = error.response.status_code
+                self.raise_fault({401: 'openai_auth', 429: 'openai_rate_limit'}.get(status_code, 'openai_error'),
+                                 'speech', f'Speech connection refused with HTTP {status_code}.')
                 messages = {401: 'OpenAI rejected the API key. Update it in Voice settings.',
                             403: 'This OpenAI project does not have access to ' + SPEECH_MODEL + '.',
                             429: 'OpenAI quota or rate limit reached. Check API billing or try again later.'}
                 raise ValueError(messages.get(error.response.status_code, 'OpenAI Realtime could not generate speech. Please try again.')) from None
-            except (WebSocketException, TimeoutError, OSError):
+            except (WebSocketException, TimeoutError, OSError) as error:
+                self.diagnose_speech(error)
                 raise ValueError('Could not complete the OpenAI Realtime connection. Check your connection and try again.') from None
         finally:
             if not completed: self.close_speech()
             self.speech_lock.release()
+
+    def diagnose_speech(self, error):
+        # The probe takes a few seconds offline; the failed request should not wait for it.
+        message = 'Speech connection failed: ' + type(error).__name__ + '.'
+        threading.Thread(target=lambda: self.raise_fault(faults.network_code() or 'speech_failed', 'speech', message),
+                         daemon=True).start()
 
     def speech(self, value):
         pcm = bytearray()
@@ -466,7 +503,8 @@ class Handler(SimpleHTTPRequestHandler):
                                     trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping',
                                     inputMode=self.server.input_mode, micForwardDeg=self.server.mic_forward,
                                     micClockwise=self.server.mic_clockwise, speechHint=self.server.speech_hint_value(),
-                                    speechPending=self.server.speech_pending(), listeningText=self.server.listening_text))
+                                    speechPending=self.server.speech_pending(), listeningText=self.server.listening_text,
+                                    faults=self.server.fault_table.public()))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -622,6 +660,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     atomic_save(self.server.config_file, value); self.server.changed.notify_all()
                 self.reply(dict(saved=True, path=str(self.server.config_file))); return
+            if path == '/api/faults':
+                self.faults_request(value); return
             if path == '/api/actions':
                 if not isinstance(value, list) or len(value) > 100 or any(not isinstance(a, dict) or not re.fullmatch(r'[a-z0-9_:-]{1,100}', a.get('id', '')) or not isinstance(a.get('label'), str) for a in value):
                     raise ValueError('Invalid animation library.')
@@ -655,11 +695,36 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, OSError) as error:
             self.reply(dict(error=str(error)), 400)
 
+    def faults_request(self, value):
+        # Only processes on this machine report faults; the display just reads them.
+        if self.client_address[0] not in ('127.0.0.1', '::1'):
+            raise ValueError('Faults are reported from this device only.')
+        if not isinstance(value, dict) or value.get('action') not in ('raise', 'clear'):
+            raise ValueError('Send action raise or clear.')
+        component = value.get('component')
+        code = value.get('code')
+        if not isinstance(component, str) or not re.fullmatch(r'[a-z0-9_-]{1,40}', component):
+            raise ValueError('Name the reporting component.')
+        if code is not None and code not in faults.CATALOG:
+            raise ValueError('Unknown fault code.')
+        if value['action'] == 'raise':
+            if code is None or not isinstance(value.get('message', ''), str):
+                raise ValueError('A raised fault needs a code and a text message.')
+            title = value.get('title'); detail = value.get('detail')
+            self.server.raise_fault(code, component, value.get('message', ''),
+                                    title=title if isinstance(title, str) else None,
+                                    detail=detail if isinstance(detail, str) else None,
+                                    auto_clear=value.get('autoClear', True) is not False)
+        else:
+            self.server.clear_fault(code, component)
+        with self.server.changed:
+            self.reply(self.server.fault_table.public())
+
     def events(self):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1
+        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1; seen_faults = -1
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -681,12 +746,15 @@ class Handler(SimpleHTTPRequestHandler):
                     command = self.server.command.copy()
                     gaze = self.server.gaze_value()
                     transcript = self.server.listening_text.copy()
+                    fault_state = self.server.fault_table.public()
                 if command['sequence'] != seen_command:
                     self.event('command', command); seen_command = command['sequence']
                 if gaze['sequence'] != seen_gaze:
                     self.event('gaze', gaze); seen_gaze = gaze['sequence']
                 if transcript['sequence'] != seen_text:
                     self.event('listening-text', transcript); seen_text = transcript['sequence']
+                if fault_state['sequence'] != seen_faults:
+                    self.event('faults', fault_state); seen_faults = fault_state['sequence']
                 self.wfile.write(b': alive\n\n'); self.wfile.flush()
                 with self.server.changed:
                     self.server.changed.wait(timeout=1)
@@ -700,8 +768,27 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(f'event: {kind}\ndata: {json.dumps(value, allow_nan=False)}\n\n'.encode()); self.wfile.flush()
 
 
+def watch_network(server, interval):
+    """Name an internet/OpenAI outage even while Kuro sleeps; TCP only, never an API call."""
+    messages = dict(internet_down='Neither api.openai.com nor public internet hosts answer.',
+                    openai_unreachable='Public internet hosts answer, but api.openai.com:443 does not.')
+    while True:
+        code = faults.network_code()
+        if code:
+            server.raise_fault(code, 'network', messages[code], auto_clear=False)
+            server.clear_fault(component='network', where=lambda fault: fault['code'] != code, reason='network changed')
+        else:
+            server.clear_fault('internet_down', reason='network restored')
+            server.clear_fault(component='network', reason='network restored')
+        time.sleep(min(interval, 10) if code else interval)
+
+
 if __name__ == '__main__':
-    server = RobotServer((os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '5173'))))
+    server = RobotServer((os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '5173'))),
+                         fault_log=faults.log_path())
+    interval = float(os.environ.get('DOTS_NET_CHECK_SECONDS', '30') or 0)
+    if interval > 0:
+        threading.Thread(target=watch_network, args=(server, interval), daemon=True).start()
     print(f'Dots studio: http://{server.server_address[0]}:{server.server_port}/original-dots.html', flush=True)
     print(f'Robot display: http://{server.server_address[0]}:{server.server_port}/robot.html', flush=True)
     print(f'Configuration: {server.config_file}', flush=True)

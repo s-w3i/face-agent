@@ -285,6 +285,59 @@ class RobotServiceCheck(unittest.TestCase):
                 if stream: stream.close()
                 server.shutdown(); server.server_close(); server_thread.join()
 
+    def test_faults_reach_status_and_events_and_clear_on_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'faults.log'
+            server = RobotServer(('127.0.0.1', 0), config_file=Path(directory) / 'robot-config.json',
+                                 static_root=directory, fault_log=log)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True); server_thread.start()
+            base = f'http://127.0.0.1:{server.server_port}'
+            def api(route, value=None):
+                request = Request(base + '/api/' + route, data=json.dumps(value).encode() if value is not None else None,
+                                  headers={'Content-Type': 'application/json'})
+                with urlopen(request, timeout=3) as response:
+                    return json.load(response)
+            stream = None
+            try:
+                stream = urlopen(base + '/api/events', timeout=3)
+                def event(kind):
+                    while True:
+                        line = stream.readline().decode().strip()
+                        if line == 'event: ' + kind:
+                            return json.loads(stream.readline().decode().removeprefix('data: '))
+                self.assertEqual(event('faults')['faults'], [])
+                server.apply_robot_status(dict(status='IDLE', revision=1, source='face-agent-x'))
+                api('faults', dict(action='raise', code='tracker_cpu_fallback', component='tracker', message='Hailo failed'))
+                self.assertEqual([f['code'] for f in event('faults')['faults']], ['tracker_cpu_fallback'])
+                api('faults', dict(action='raise', code='internet_down', component='agent', message='offline',
+                                   detail='Traceback: secret-free but long'))
+                pushed = event('faults')['faults']
+                self.assertEqual([f['code'] for f in pushed], ['internet_down', 'tracker_cpu_fallback'])
+                self.assertEqual(pushed[0]['title'], 'No internet')
+                self.assertNotIn('detail', pushed[0])
+                self.assertEqual(api('status')['faults']['faults'][0]['hint'], pushed[0]['hint'])
+                for bad in (dict(action='raise', code='nope', component='agent'), dict(action='raise', component='agent'),
+                            dict(action='explode', component='agent'), dict(action='clear', component='Bad Name!')):
+                    with self.assertRaises(HTTPError): api('faults', bad)
+                # Our own ERROR is explained by the agent; leaving it clears blocking faults only.
+                server.apply_robot_status(dict(status='ERROR', revision=2, source='face-agent-x'))
+                server.apply_robot_status(dict(status='IDLE', revision=3, source='face-agent-x'))
+                self.assertEqual([f['code'] for f in event('faults')['faults']], ['tracker_cpu_fallback'])
+                # Another node's ERROR names that node.
+                server.apply_robot_status(dict(status='ERROR', revision=4, source='nav_bridge'))
+                external = event('faults')['faults'][0]
+                self.assertEqual((external['code'], external['message']), ('external_error', 'ERROR set by nav_bridge.'))
+                api('faults', dict(action='clear', component='tracker'))
+                self.assertEqual([f['code'] for f in event('faults')['faults']], ['external_error'])
+                events = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual([(e['event'], e['code']) for e in events],
+                                 [('raise', 'tracker_cpu_fallback'), ('raise', 'internet_down'), ('clear', 'internet_down'),
+                                  ('raise', 'external_error'), ('clear', 'tracker_cpu_fallback')])
+                self.assertEqual(events[1]['detail'], 'Traceback: secret-free but long')
+            finally:
+                if stream: stream.close()
+                server.shutdown(); server.server_close(); server_thread.join()
+
 
 if __name__ == '__main__':
     unittest.main()

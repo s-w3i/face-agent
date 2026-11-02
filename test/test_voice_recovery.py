@@ -45,6 +45,20 @@ class RecoveryCheck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(voice.restart.await_count, 3)
         self.assertTrue(all(call.kwargs['awake'] for call in voice.restart.call_args_list))
 
+    async def test_recovery_names_the_cause_follows_it_and_clears_it(self):
+        status = Authority('LISTENING')
+        reporter = Mock()
+        voice = Mock(restart=AsyncMock(side_effect=[RealtimeUnavailable('Offline'), None]))
+        probes = iter(['internet_down', None])  # Wi-Fi back, then Realtime alone was failing.
+        with patch('chat.faults.network_code', side_effect=lambda: next(probes)), \
+                patch('chat.asyncio.sleep', new_callable=AsyncMock), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertTrue(await recover_voice(status, voice, RealtimeUnavailable('Timed out'), reporter))
+        reported = [call.args[0] for call in reporter.report.call_args_list]
+        self.assertEqual(reported, ['realtime_unavailable', 'internet_down', 'realtime_unavailable'])
+        self.assertIn('RealtimeUnavailable: Timed out', reporter.report.call_args_list[0].kwargs['detail'])
+        cleared = [call.args[0] for call in reporter.clear.call_args_list]
+        self.assertEqual(cleared, ['realtime_unavailable', 'internet_down', 'realtime_unavailable'])
+
     async def test_sleep_recovery_uses_local_wake_mode(self):
         status = Authority('SLEEPING')
         voice = Mock(restart=AsyncMock())

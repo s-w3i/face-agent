@@ -10,9 +10,14 @@ import socket
 import shutil
 import subprocess
 import time
+import sys
 from urllib.request import urlopen
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # Also when loaded by path (tests).
+import faults  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
+HEALTHY_SECONDS = 30  # A restarted component running this long clears its fault.
 
 
 def stop(process, timeout=40):
@@ -28,15 +33,28 @@ def stop(process, timeout=40):
         process.wait()
 
 
+def log_tail(path, size=3000):
+    try:
+        with open(path, 'rb') as source:
+            source.seek(max(0, os.path.getsize(path) - size))
+            return source.read().decode(errors='replace')
+    except OSError:
+        return ''
+
+
 class Component:
-    def __init__(self, name, command, env, logs):
+    def __init__(self, name, command, env, logs, url=None):
         self.name, self.command, self.env = name, command, env
         self.output = (logs / f'stack-{name}.log').open('a', buffering=1)
         self.process = None
         self.next_start = 0
+        self.faults = faults.Reporter('stack-' + name, url) if url else faults.NULL
+        self.restarted = None  # monotonic start time after an unexpected exit
 
     def start(self):
         print(f'Starting {self.name}; log: {self.output.name}', flush=True)
+        if self.restarted is not None:
+            self.restarted = time.monotonic()
         self.process = subprocess.Popen(self.command, cwd=ROOT, env=self.env,
                                         stdin=subprocess.DEVNULL, stdout=self.output,
                                         stderr=subprocess.STDOUT, start_new_session=True)
@@ -44,8 +62,15 @@ class Component:
     def maintain(self):
         if self.process is not None and self.process.poll() is not None:
             print(f'{self.name} exited ({self.process.returncode}); retrying in 5 seconds.', flush=True)
+            self.faults.report('component_restarting', f'{self.name} exited with code {self.process.returncode}; '
+                               f'restarting. Log: {self.output.name}', title=f'Restarting {self.name}',
+                               detail=log_tail(self.output.name))
+            self.restarted = 0
             self.process = None
             self.next_start = time.monotonic() + 5
+        elif self.restarted and time.monotonic() - self.restarted >= HEALTHY_SECONDS:
+            self.restarted = None
+            self.faults.clear()
         if self.process is None and time.monotonic() >= self.next_start:
             self.start()
 
@@ -154,10 +179,10 @@ def main():
         if not owns_manager:
             print('Using the existing robot status manager.', flush=True)
 
-        camera = Component('camera', [str(ROOT / ('camera-rgbd.sh' if profile == 'rgbd' else 'camera.sh'))], env, logs)
-        display = Component('display', [str(ROOT / 'run.sh'), '--robot'], env, logs)
+        camera = Component('camera', [str(ROOT / ('camera-rgbd.sh' if profile == 'rgbd' else 'camera.sh'))], env, logs, base)
+        display = Component('display', [str(ROOT / 'run.sh'), '--robot'], env, logs, base)
         agent = Component('agent', [str(ROOT / '.venv/bin/python'), str(ROOT / 'scripts/chat.py'),
-                                   '--mode', 'voice', '--url', base], env, logs)
+                                   '--mode', 'voice', '--url', base], env, logs, base)
         components.extend((camera, display, agent))
         camera.start()
         display.start()

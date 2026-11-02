@@ -10,6 +10,7 @@ import sys
 import time
 
 from dotsctl import request
+from faults import NULL as NO_FAULTS
 from voice_errors import RealtimeUnavailable
 import wake_word
 
@@ -31,8 +32,9 @@ class WakeWord:
 
 class VoiceInput:
     def __init__(self, url, model='gpt-live-transcribe', language='en', forward=0, clockwise=False, wake_model='small', status_driven=False,
-                 wake_engine=None, wake_model_path=None):
+                 wake_engine=None, wake_model_path=None, faults=None):
         self.url = url; self.model = model; self.language = language
+        self.faults = faults or NO_FAULTS
         self.forward = forward; self.clockwise = clockwise
         self.wake_model = wake_model; self.awake = status_driven
         self.wake_engine = wake_engine or os.environ.get('DOTS_WAKE_ENGINE', 'auto')
@@ -107,6 +109,7 @@ class VoiceInput:
             # One line per change, not one per sleep cycle.
             print(f'Wake engine: {engine} ({reason}).', flush=True)
             self.wake_choice = (engine, reason)
+            await self.report_wake_engine(engine, reason)
         if engine == 'oww':
             command += ['--wake-engine', 'oww', '--wake-model-path', str(self.wake_model_path),
                         '--wake-threshold', str(threshold)]
@@ -116,6 +119,15 @@ class VoiceInput:
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log)
         self.reader = asyncio.create_task(self.receive())
         await asyncio.wait_for(self.ready, 90)
+
+    async def report_wake_engine(self, engine, reason):
+        if engine == 'oww' or reason == 'whisper requested':
+            await asyncio.to_thread(self.faults.clear, 'wake_whisper_fallback')
+            await asyncio.to_thread(self.faults.clear, 'wake_model_missing')
+        elif reason.startswith('no wake model'):
+            await asyncio.to_thread(self.faults.report, 'wake_model_missing', reason)
+        else:
+            await asyncio.to_thread(self.faults.report, 'wake_whisper_fallback', reason)
 
     async def stop_microphone(self):
         if self.process:
@@ -136,6 +148,9 @@ class VoiceInput:
             if not isinstance(self.failed, MicrophoneDisconnected):
                 raise self.failed
             print(f'{self.failed} Reconnecting ReSpeaker.', file=sys.stderr, flush=True)
+            reported = getattr(self.failed, 'category', None) != 'wake_engine'
+            if reported:
+                await asyncio.to_thread(self.faults.report, 'mic_disconnected', str(self.failed))
             self.accepting = False; self.hint = None; self.partials.clear()
             while not self.inputs.empty():
                 self.inputs.get_nowait()
@@ -151,8 +166,11 @@ class VoiceInput:
                     raise ValueError('Another chat selected words mode during microphone recovery.')
                 await self.api('input-mode', dict(mode='voice', micForwardDeg=self.forward, micClockwise=self.clockwise))
                 print('Microphone reconnected.', file=sys.stderr, flush=True)
+                if reported:
+                    await asyncio.to_thread(self.faults.clear, 'mic_disconnected')
                 return True
             self.failed = RuntimeError('ReSpeaker is still unavailable after five retries. Check its USB cable or hub, then restart voice chat.')
+            self.failed.fault_code = 'mic_disconnected'
             raise self.failed
 
     async def restart(self, *, awake):
@@ -209,12 +227,16 @@ class VoiceInput:
                 elif status == 'stt_fallback':
                     print(f"Realtime unavailable ({event.get('reason', '?')}); transcribing commands locally "
                           f"with {event.get('engine')} until it reconnects.", file=sys.stderr, flush=True)
+                    await asyncio.to_thread(self.faults.report, 'stt_offline',
+                        f"Realtime unavailable ({event.get('reason', '?')}); transcribing with {event.get('engine')}.")
                 elif status == 'stt_restored':
                     print('Realtime transcription reconnected.', file=sys.stderr, flush=True)
+                    await asyncio.to_thread(self.faults.clear, 'stt_offline')
                 elif status == 'transcription_retry':
                     print(f"Realtime connection attempt {event['attempt']}/{event['attempts']} failed ({event['reason']}); retrying.", file=sys.stderr, flush=True)
                 elif status == 'transcription_incomplete':
                     incomplete = RuntimeError('Microphone transcription failed; local audio remains in test-output/.')
+                    incomplete.fault_code = 'mic_worker_failed'
                     self.accepting = False
                 elif status == 'wake_detected' and event.get('mode') == 'awake':
                     # Passed through even while capture is paused: chat decides on barge-in
@@ -230,13 +252,20 @@ class VoiceInput:
                 elif status == 'microphone_error':
                     if event.get('category') == 'wake_engine':
                         self.wake_engine_failed = True
-                        raise MicrophoneDisconnected(event.get('message', 'Wake-word engine failed.'))
+                        error = MicrophoneDisconnected(event.get('message', 'Wake-word engine failed.'))
+                        error.category = 'wake_engine'  # Not a USB problem: the replacement uses Whisper.
+                        raise error
                     if event.get('category') == 'realtime_unavailable':
                         raise RealtimeUnavailable(event.get('message', 'Realtime transcription is unavailable.'),
                                                   retryable=event.get('retryable', True) is True)
                     if event.get('reconnectable') is True:
                         raise MicrophoneDisconnected(event.get('message') or 'ReSpeaker USB connection lost.')
-                    raise incomplete or RuntimeError('Microphone failed. Check ~/.cache/face-agent/microphone-chat.log.')
+                    if incomplete:
+                        raise incomplete
+                    error = RuntimeError('Microphone failed' + (': ' + event['message'] if event.get('message') else '') +
+                                         '. Check ~/.cache/face-agent/microphone-chat.log.')
+                    error.fault_code = 'mic_permission' if event.get('category') == 'usb_permission' else 'mic_worker_failed'
+                    raise error
                 elif self.accepting:
                     if status == 'wake_detected' and not self.awake:
                         # Local only: the score is logged, nothing reaches the display.

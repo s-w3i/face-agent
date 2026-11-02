@@ -108,7 +108,7 @@ Kuro sleeps after **5 seconds of inactivity** while command input is available. 
 
 Conversation input appears centered above the character; smaller reply subtitles appear below. Input text clears on entering THINKING or any other non-input state. Awake commands use GPT Realtime transcription; wake detection stays local.
 
-Temporary Realtime disconnections, transcription timeouts, audio queue overflow, an unexpected voice worker exit, or a stalled playback gate automatically restart the microphone/transcription worker. The agent shows ERROR with input paused while reconnecting, then returns to IDLE only after the replacement worker is ready. Retries wait 1, 2, 4, 8, 15, then 30 seconds between attempts, continuing at 30 seconds while unavailable. Conversation history stays intact; repeat the interrupted utterance, which is never automatically replayed. Recovery stops if another ROS node changes the status, including publishing its own ERROR. Rejected credentials, quota, or configuration need correction; after fixing them, set IDLE to retry. Other unrelated errors remain visible as ERROR.
+Temporary Realtime disconnections, transcription timeouts, audio queue overflow, an unexpected voice worker exit, or a stalled playback gate automatically restart the microphone/transcription worker. The agent shows ERROR with input paused while reconnecting, then returns to IDLE only after the replacement worker is ready. Retries wait 1, 2, 4, 8, 15, then 30 seconds between attempts, continuing at 30 seconds while unavailable. Conversation history stays intact; repeat the interrupted utterance, which is never automatically replayed. Recovery stops if another ROS node changes the status, including publishing its own ERROR. Rejected credentials, quota, or configuration need correction; after fixing them, set IDLE to retry. Other unrelated errors remain visible as ERROR. The corner chip and `./doctor.sh` name the cause in each case (see [Diagnosing problems](#diagnosing-problems)), and update it while retrying, for example from **No internet** to **OpenAI unreachable**.
 
 Inside the microphone worker, every thread is supervised:
 - Audio that overflows or drops during an utterance discards only that utterance.
@@ -221,6 +221,48 @@ python3 scripts/install_startup.py --remove
 ```
 
 Component logs are `~/.cache/face-agent/stack-{status,camera,display,agent}.log`. Every `*.log` in that directory is rotated by the stack supervisor (checked every minute and at startup): a file over `DOTS_LOG_MAX_MB` (default 10) keeps its newest `DOTS_LOG_MAX_MB` as `<name>.log.1`, older backups shift up to `DOTS_LOG_KEEP` (default 3), and the live file is truncated in place. Set these in the startup settings. Routine HTTP access logs are off in stack mode; set `DOTS_ACCESS_LOG=1` in the startup settings to enable them. Re-run the installer if you move the repository. Startup does not install missing ROS or microphone dependencies; complete setup first.
+
+## Diagnosing problems
+
+When something goes wrong, a small chip in the top-right corner of the face names it: **No internet**, **Mic disconnected**, **API key rejected**, **OpenAI unreachable** and so on. Blocking problems (Kuro shows ERROR) appear in a muted red. Problems Kuro works around (offline transcription, tracking on the CPU, camera missing) appear as a fainter grey chip while the face carries on normally. Tap the chip for the message, the fix and how long it has lasted. The chip disappears once the problem clears. If Kuro is in ERROR without a reported cause, the chip says **Error · run ./doctor.sh**; if the face loses the local service for more than 5 seconds, it says **Service offline**.
+
+On the robot, run:
+
+```bash
+./doctor.sh            # active faults, live checks, the last 24 h of faults, recent log warnings
+./doctor.sh --detail   # also tracebacks and component log tails
+./doctor.sh -f         # follow new fault events live
+./doctor.sh --since 2h --json
+```
+
+The live checks cover internet vs. OpenAI reachability (TCP only; no API request or key is sent), the ReSpeaker USB device and its permissions, the default PipeWire microphone, the Orbbec camera, Hailo-8L and `hailort.service`, `face-agent.service`, the ROS status manager, the API key file, the navigation robot from `DOTS_NAV_MCP_URL`, and disk space. The exit status is 1 while any check fails or a blocking fault is active.
+
+Faults are recorded in `~/.cache/face-agent/faults.log`, one JSON object per line: `raise`, `update` (new message) and `clear` events with the code, component, message, fix and, for errors, the traceback. Repeats during a retry loop are counted rather than logged again, and the log is rotated with the other component logs. The display service keeps the live fault table; every component reports to it and writes the file directly only while the display service is down. The display itself never receives tracebacks. The service checks the network every 30 seconds (`DOTS_NET_CHECK_SECONDS`, `0` disables), so an outage is named even while Kuro sleeps. Another ROS node's ERROR shows as **Error set externally** with that node's `source`.
+
+| Code | Severity | Chip | Fix |
+| --- | --- | --- | --- |
+| `openai_auth` | error | API key rejected | Update the key in the studio (Voice → Set up API key), then set IDLE or restart face-agent.service. |
+| `openai_quota` | error | OpenAI quota used up | Add credit or raise the limit in OpenAI billing, then set IDLE or restart face-agent.service. |
+| `internet_down` | error | No internet | Check the Wi-Fi/Ethernet link and the router. Kuro retries by itself. |
+| `mic_disconnected` | error | Mic disconnected | Replug the ReSpeaker USB cable (try another port or hub). Kuro reconnects by itself. |
+| `mic_permission` | error | Mic access denied | USB permission denied: add the udev rule and the plugdev group (README → ReSpeaker), then replug. |
+| `openai_unreachable` | error | OpenAI unreachable | The internet works but api.openai.com does not answer. Check status.openai.com, DNS or a firewall. Kuro retries by itself. |
+| `ros_status_lost` | error | ROS status lost | The ROS status bridge stopped. Check stack-status.log and ROS_DOMAIN_ID, then restart face-agent.service. |
+| `mic_worker_failed` | error | Microphone failed | The microphone worker failed. See microphone-chat.log; Kuro restarts it by itself. |
+| `realtime_unavailable` | error | Transcription down | OpenAI Realtime transcription failed although the network works. Kuro reconnects by itself. |
+| `openai_rate_limit` | error | OpenAI rate limited | Too many requests. Wait a minute; Kuro retries by itself. |
+| `openai_timeout` | error | OpenAI timed out | A slow network or a slow OpenAI response. If it keeps happening, check the connection. |
+| `openai_error` | error | OpenAI error | OpenAI returned an error. Run ./doctor.sh --detail for the message. |
+| `speech_failed` | error | Speech failed | The spoken reply could not be generated or played. Run ./doctor.sh --detail. |
+| `external_error` | error | Error set externally | Another ROS node set ERROR. Fix that node, then set IDLE. |
+| `agent_error` | error | Agent error | An unexpected error. Run ./doctor.sh --detail for the traceback. |
+| `component_restarting` | degraded | Restarting | A stack component exited and is restarting. Run ./doctor.sh --detail for its last log lines. |
+| `stt_offline` | degraded | Offline speech | OpenAI Realtime is unreachable; commands are transcribed locally until it reconnects. |
+| `camera_unavailable` | degraded | Camera unavailable | Vision questions cannot see. Check the Orbbec USB cable and stack-camera.log. |
+| `tracking_unavailable` | degraded | Eye tracking off | The eye tracker stopped; chat continues. See tracking-chat.log, then restart face-agent.service. |
+| `tracker_cpu_fallback` | degraded | Tracking on CPU | The Hailo-8L is unavailable (check hailort.service). Restart face-agent.service to retry it. |
+| `wake_whisper_fallback` | degraded | Wake word: Whisper | openWakeWord is not in use, so Whisper listens for the wake phrase (more CPU, slower). |
+| `wake_model_missing` | info | No wake model | Whisper listens for the wake phrase until an openWakeWord model is trained (docs/wake-word-training.md). |
 
 ## ROS 2 robot status
 

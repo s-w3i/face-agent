@@ -18,9 +18,18 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
+import faults
 from human_tracker import BACKEND_THRESHOLDS, PersonTracker, fall_back_to_cpu, make_backend
 from hailo_faces import HailoUnavailable
 from setup_tracking import MODEL_DIR, model_paths
+
+
+CAMERA_SILENT_SECONDS = 5  # Awake without camera frames this long names the camera on the face.
+
+
+def in_background(function, *args):
+    """Fault reports are HTTP calls; tracking must never wait on them."""
+    threading.Thread(target=function, args=args, daemon=True).start()
 
 
 def tracker_lock(url):
@@ -182,7 +191,11 @@ def main():
         if lock is None:
             print('Tracker already running for this robot service; using the existing tracker.', flush=True)
             return 0
-    vision = make_backend(args.tracker_backend, paths, args.threads, log=lambda line: print(line, flush=True))
+    fallback = []
+    def backend_log(line):
+        print(line, flush=True)
+        fallback.append(line)
+    vision = make_backend(args.tracker_backend, paths, args.threads, log=backend_log)
     if args.threshold is None:
         args.threshold = BACKEND_THRESHOLDS[vision.name]
     if args.check:
@@ -197,6 +210,10 @@ def main():
                               mirror=args.mirror, backend=vision.name, threshold=args.threshold)))
         vision.close()
         return 0
+    reporter = faults.Reporter('tracker', args.url)
+    in_background(reporter.clear)  # Faults from an earlier tracker run are stale.
+    if fallback and vision.name != 'hailo':
+        in_background(reporter.report, 'tracker_cpu_fallback', fallback[-1])
     frames = LatestFrame(); calibration = LatestFrame()
     link = RobotLink(args.url); tracker = PersonTracker(vision, args.threshold, args.mirror)
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
@@ -209,6 +226,7 @@ def main():
     executor = SingleThreadedExecutor(); executor.add_node(node)
     spin = threading.Thread(target=executor.spin, daemon=True)
     started = time.monotonic(); last_stats = started; count = 0; processing = 0; state = None; camera_error = False
+    last_frame_at = started; camera_silent = False
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -233,6 +251,15 @@ def main():
                     tracker.intrinsics = None
             value = frames.take()
             packet = dict(detected=False)
+            if value is not None:
+                last_frame_at = tick
+                if camera_silent:
+                    camera_silent = False
+                    in_background(reporter.clear, 'camera_unavailable')
+            elif fresh and tracker.awake and not camera_silent and tick - last_frame_at > CAMERA_SILENT_SECONDS:
+                camera_silent = True
+                in_background(reporter.report, 'camera_unavailable',
+                              f'No frames on {args.topic} for {CAMERA_SILENT_SECONDS} s; eye tracking is paused.')
             if fresh and tracker.awake and value is not None and tick - value[2] < .25:
                 try:
                     packet = tracker.process(decode(value[1], not args.raw), tick)
@@ -243,6 +270,7 @@ def main():
                 except HailoUnavailable as error:
                     # Tracking must never stop because of the accelerator.
                     print(f'Hailo face backend failed ({error}); switching to OpenCV on the CPU.', flush=True)
+                    in_background(reporter.report, 'tracker_cpu_fallback', f'Hailo face backend failed mid-session: {error}')
                     vision = fall_back_to_cpu(tracker, paths, args.threads)
                     args.threshold = tracker.threshold
                 except (ValueError, cv2.error) as error:

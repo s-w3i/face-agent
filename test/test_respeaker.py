@@ -85,15 +85,16 @@ class EndpointTest(unittest.TestCase):
         compare.assert_called_once_with()
 
     def test_usb_disconnect_is_retryable_but_permissions_are_not(self):
-        for error, retryable in ((r.USBError('No device', errno=19), True),
-                                 (r.USBError('Access denied', errno=13), False),
-                                 (RuntimeError('Bad configuration'), False)):
+        for error, retryable, extra in ((r.USBError('No device', errno=19), True, {}),
+                                        (r.USBError('Access denied', errno=13), False, dict(category='usb_permission')),
+                                        (RuntimeError('Bad configuration'), False, {})):
             device = Mock()
             with self.subTest(error=error), patch('sys.argv', ['respeaker.py', '--diagnostics']), \
                     patch('respeaker.find', return_value=device), patch('respeaker.run', side_effect=error), \
                     patch('respeaker.emit') as emit, patch('respeaker.DIAGNOSTICS'), redirect_stderr(io.StringIO()):
                 self.assertEqual(r.main(), 1)
-                self.assertEqual(emit.call_args.args[0], dict(status='microphone_error', reconnectable=retryable))
+                self.assertEqual(emit.call_args.args[0], dict(status='microphone_error', message=str(error),
+                                                              reconnectable=retryable, **extra))
                 device.close.assert_called_once()
         with patch('sys.argv', ['respeaker.py']), patch('respeaker.find', return_value=None), \
                 patch('respeaker.emit') as emit, redirect_stderr(io.StringIO()):

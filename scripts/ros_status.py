@@ -148,6 +148,8 @@ class DisplayStatus:
             print('Display ROS status unavailable: ' + str(error), file=sys.stderr)
             # Losing global control must stop any old playback/transcript.
             if not self.closing:
+                if hasattr(self.server, 'raise_fault'):
+                    self.server.raise_fault('ros_status_lost', 'display', 'Display ROS status unavailable: ' + str(error))
                 self.server.apply_robot_status(dict(status='ERROR', revision=0, source='connection'))
 
     def close(self):

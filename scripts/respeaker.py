@@ -841,7 +841,10 @@ def main():
     except KeyboardInterrupt:
         pass
     except Exception as error:
-        event = dict(status='microphone_error', reconnectable=isinstance(error, DeviceUnavailable) or isinstance(error, USBError) and error.errno == 19)
+        event = dict(status='microphone_error', message=str(error),
+                     reconnectable=isinstance(error, DeviceUnavailable) or isinstance(error, USBError) and error.errno == 19)
+        if isinstance(error, USBError) and error.errno == 13:
+            event.update(category='usb_permission')  # udev rule / plugdev group, not a loose cable.
         if isinstance(error, RealtimeUnavailable):
             event.update(category='realtime_unavailable', message=str(error), retryable=error.retryable)
         if isinstance(error, WorkerFailure):

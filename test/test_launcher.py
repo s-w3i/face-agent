@@ -41,7 +41,7 @@ class LauncherCheck(unittest.TestCase):
                 shutil.copy2(ROOT / name, origin / name)
             shutil.copytree(ROOT / 'dist', origin / 'dist')
             (origin / 'scripts').mkdir()
-            for name in ('serve.py', 'dotsctl.py', 'launch_robot.py', 'prerender.py', 'robot_states.py', 'ros_status.py'):
+            for name in ('serve.py', 'dotsctl.py', 'faults.py', 'launch_robot.py', 'prerender.py', 'robot_states.py', 'ros_status.py'):
                 shutil.copy2(ROOT / 'scripts' / name, origin / 'scripts' / name)
             subprocess.run(['git', 'init', '--quiet', str(origin)], check=True)
             subprocess.run(['git', '-C', str(origin), 'add', '.'], check=True)

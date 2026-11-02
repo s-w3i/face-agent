@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from agents import Agent, Runner, WebSearchTool, ToolOutputImage, ToolOutputText, function_tool, set_tracing_disabled
 from agents.mcp import MCPServerStdio, MCPServerStreamableHttp
 from dotsctl import request
+import faults
 from launch_robot import stop
 from voice_input import VoiceInput, MicrophoneDisconnected, WakeWord
 from voice_errors import RealtimeUnavailable
@@ -38,7 +39,7 @@ VOICE_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
 
 @contextmanager
-def start_tracking(url):
+def start_tracking(url, reporter=faults.NULL):
     """Own a quiet tracker without changing chat's Python/ROS environment."""
     root = Path(__file__).resolve().parents[1]
     log_path = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent/tracking-chat.log'
@@ -60,12 +61,15 @@ def start_tracking(url):
         if output:
             output.close()
         print(f'Eye tracking could not start. Check {log_path}. Chat can continue.', file=sys.stderr)
+        reporter.report('tracking_unavailable', f'Eye tracking could not start. Log: {log_path}')
         yield
         return
     closing = threading.Event()
     def watch():
-        if process.wait() != 0 and not closing.is_set():
+        code = process.wait()
+        if code != 0 and not closing.is_set():
             print(f'Eye tracking is unavailable. Check {log_path}. Chat can continue.', file=sys.stderr)
+            reporter.report('tracking_unavailable', f'The eye tracker exited with code {code}. Log: {log_path}')
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
@@ -120,6 +124,7 @@ class Chatbot:
         self.sleep_requested = False
         self.status_managed = False
         self.vision_calls = 0
+        self.faults = faults.NULL
 
         @function_tool
         async def look_at_camera(question: str, crop: list[float] | None = None):
@@ -135,10 +140,12 @@ class Chatbot:
                 frame = await capture_camera(camera_topic or DEFAULT_TOPIC, crop=crop, feed=camera_feed)
             except VisionUnavailable as error:
                 print('Vision · camera unavailable: ' + str(error), flush=True)
+                await asyncio.to_thread(self.faults.report, 'camera_unavailable', str(error))
                 return ('No visual evidence was obtained. ' + str(error) +
                         ' Tell the user briefly you cannot see the scene right now; do not guess what is visible.')
             print(f'Vision · fresh frame ready ({frame["width"]} × {frame["height"]}; '
                   f'{time.monotonic() - started:.2f}s).', flush=True)
+            await asyncio.to_thread(self.faults.clear, 'camera_unavailable')
             return [ToolOutputText(text=json.dumps(dict(
                 observation='Fresh robot camera image for this turn; use the actual pixels to answer.',
                 question=question, captured_at=frame['captured_at'], age_seconds=round(frame['age_seconds'], 3),
@@ -585,10 +592,14 @@ async def main():
             result = await server.call_tool('get_robot_pose', {})
             print(result.content[0].text, flush=True)
             return 1 if result.is_error else 0
+    # Names what went wrong on the face's corner chip and in faults.log (./doctor.sh).
+    args.faults = faults.Reporter('agent', args.url)
+    await asyncio.to_thread(args.faults.clear)  # A fresh agent: earlier faults are stale.
     try:
         load_key()
     except (ValueError, OSError) as error:
         print(str(error), file=sys.stderr)
+        await asyncio.to_thread(args.faults.report, 'openai_auth', str(error))
         return 1
     # Keep conversation text out of SDK trace uploads.
     set_tracing_disabled(True)
@@ -600,7 +611,7 @@ async def main():
     async with AsyncExitStack() as stack:
         camera_feed = await stack.enter_async_context(CameraFeed(args.camera_topic)) if args.vision else None
         if args.track:
-            stack.enter_context(start_tracking(args.url))
+            stack.enter_context(start_tracking(args.url, args.faults))
         server = None
         if args.turtlesim:
             server = await stack.enter_async_context(MCPServerStdio(
@@ -622,7 +633,8 @@ async def main():
             status = await stack.enter_async_context(RosStatus()) if args.robot_status else None
             voice = await stack.enter_async_context(VoiceInput(args.url, args.stt_model, args.language,
                 args.mic_forward_deg, args.mic_clockwise, wake_model=args.wake_model, status_driven=status is not None,
-                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path)) if args.mode == 'voice' else None
+                wake_engine=args.wake_engine, wake_model_path=args.wake_model_path,
+                faults=args.faults)) if args.mode == 'voice' else None
             if status:
                 if voice:
                     if args.speak:
@@ -643,10 +655,27 @@ async def main():
                 except (RuntimeError, OSError, TimeoutError):
                     pass
             print(str(error), file=sys.stderr)
+            await report_failure(args.faults, error)
             return 1
 
 
-async def recover_voice(status, voice, error):
+async def report_failure(reporter, error):
+    """Name the fault now; refine network-shaped ones with a TCP probe (a few seconds offline)."""
+    code = faults.classify(error)
+    if reporter is faults.NULL:
+        return code  # Nothing to tell (tests, typed chat): skip the network probe too.
+    detail = faults.detail_of(error)
+    await asyncio.to_thread(reporter.report, code, str(error), detail=detail)
+    if code in faults.NETWORK_CODES or code == 'speech_failed':
+        measured = await asyncio.to_thread(faults.network_code)
+        if measured and measured != code:
+            await asyncio.to_thread(reporter.report, measured, str(error), detail=detail)
+            await asyncio.to_thread(reporter.clear, code)
+            code = measured
+    return code
+
+
+async def recover_voice(status, voice, error, reporter=faults.NULL):
     """Reconnect only while we still own the exact ERROR revision we published."""
     current = status.current
     if current is None or current.status not in (*INPUT_STATES, 'SLEEPING'):
@@ -661,6 +690,7 @@ async def recover_voice(status, voice, error):
     def owns_error():
         return status.current == failed
 
+    code = await report_failure(reporter, error)
     if not error.retryable:
         print('Voice recovery stopped: correct the API key or configuration, then set IDLE to retry.', file=sys.stderr, flush=True)
         return False
@@ -676,6 +706,11 @@ async def recover_voice(status, voice, error):
             await voice.restart(awake=target != 'SLEEPING')
         except (RealtimeUnavailable, MicrophoneDisconnected) as retry_error:
             print('Voice recovery: ' + str(retry_error), file=sys.stderr, flush=True)
+            # The cause can change while retrying (Wi-Fi back, OpenAI still down).
+            latest = await report_failure(reporter, retry_error)
+            if latest != code:
+                await asyncio.to_thread(reporter.clear, code)
+                code = latest
             if isinstance(retry_error, RealtimeUnavailable) and not retry_error.retryable:
                 return False
             continue
@@ -683,6 +718,7 @@ async def recover_voice(status, voice, error):
             return False
         if await status.set(target, expected_revision=failed.revision):
             print(f'Voice input recovered; {target}. Please repeat the interrupted request.', flush=True)
+            await asyncio.to_thread(reporter.clear, code)
             return True
         return False
     return False
@@ -695,6 +731,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
     bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed, navigation_mcp=navigation_mcp,
                   navigation_mock=navigation_mcp and getattr(args, 'navigation_mcp_mock', False))
     bot.status_managed = True
+    reporter = getattr(args, 'faults', None) or faults.NULL
+    bot.faults = reporter
     if server:
         bot.agent.mcp_servers = [server]
     motions = queue.Queue()
@@ -952,7 +990,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 try:
                     if voice and not changed.is_set():
                         voice_restart_needed = True
-                        operation = asyncio.create_task(recover_voice(status, voice, error))
+                        operation = asyncio.create_task(recover_voice(status, voice, error, reporter))
                         recovered = await operation
                         voice_restart_needed = not recovered
                         if not recovered and not changed.is_set():
@@ -971,6 +1009,7 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                     await status.set('ERROR', expected_revision=status.current.revision)
                 if voice:
                     await gate(True)
+                await report_failure(reporter, error)
             finally:
                 operation = None
     finally:
