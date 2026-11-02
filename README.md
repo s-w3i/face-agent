@@ -374,6 +374,18 @@ sudo udevadm control --reload-rules
 
 Replug the microphone and log out/in for new group membership. If PipeWire/PulseAudio owns the hardware, make the ReSpeaker the default input. Check `pactl get-default-source`; an unrelated default source can record the wrong microphone.
 
+### Offline speech-to-text
+
+Awake commands normally use OpenAI Realtime. If Realtime is unreachable with a temporary error (no network, timeouts), commands are transcribed locally instead, and Realtime is retried in the background; the next command after it reconnects uses Realtime again. The agent log shows `transcribing commands locally with hailo` and `Realtime transcription reconnected.`.
+
+`DOTS_OFFLINE_STT` in `~/.config/face-agent/startup.env` (chat worker `--offline-stt`) chooses the engine:
+
+- `hailo` (default): Whisper base on the Hailo-8L, about 1.3 s for a short command with almost no CPU. `scripts/setup_respeaker.sh` installs the models (about 310 MB) in `~/.local/share/face-agent/whisper-hailo8l/`; `DOTS_HAILO_WHISPER_DIR` overrides the folder. It needs `hailort.service`.
+- `cpu`: faster-whisper `base.en` with 2 threads. This is also what `hailo` falls back to if the models or the accelerator aren't available.
+- `off`: no fallback; a Realtime failure shows ERROR and recovers as before.
+
+The engine loads on first need, so the first offline command takes about 2 seconds longer, and audio stays on the robot. Partial text isn't shown while offline; the whole transcript arrives at once. Local accuracy is lower than Realtime's. Rejected credentials or quota are not treated as offline: they still show ERROR. Replies still need the OpenAI agent, so while fully offline the reply fails with the usual network error; this fallback removes speech-to-text as the point of failure.
+
 ## Customize or pre-render on another computer
 
 Open [the original character studio](http://127.0.0.1:5173/original-dots.html) to change appearance, name, voice, background, motion, and renderer settings. `/robot.html` is the clean robot display; `/` is the separate procedural character playground.

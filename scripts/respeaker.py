@@ -28,6 +28,8 @@ PREROLL_SECONDS = 0.3  # Audio from before the hardware VAD fired; keeps speech 
 DIAGNOSTICS = False
 OVERFLOW_MESSAGE = 'Audio capture overflowed; refusing to transcribe incomplete speech.'
 METRICS_SECONDS = 60
+REALTIME_RETRY_DELAYS = (5, 15, 30)  # Background reconnects while commands use offline STT.
+OFFLINE_STT_DEFAULT = 'hailo'  # Chosen by the phase 7 spike; falls back to 'cpu' if it can't load (plans/phase-7-hailo-whisper-fallback.md).
 LOCAL_STT_TIMEOUT = 60  # Whisper small takes ~10 s on the Pi 5; only a hang gets this far.
 
 
@@ -650,6 +652,24 @@ class CommandRecorder(threading.Thread):
         self.join(timeout)
 
 
+def load_offline_stt(args):
+    """Local STT for awake commands while Realtime is unreachable (phase 7)."""
+    model = getattr(args, 'offline_stt_model', None)
+    if args.offline_stt == 'hailo':
+        try:
+            from hailo_stt import Transcriber
+            engine = Transcriber(model or 'base', args.language)
+            engine.backend_name = 'hailo'
+            return engine
+        except Exception as error:  # Missing HEFs or binding, service down, device busy...
+            emit({'status': 'warning', 'message': f'Hailo offline STT unavailable ({error!r}); using the CPU.'})
+            model = None
+    from respeaker_stt import Transcriber
+    engine = Transcriber(model or 'base.en', args.language, cpu_threads=2, beam_size=1)
+    engine.backend_name = 'cpu'
+    return engine
+
+
 async def serve(args, dev):
     """Long-lived worker: switch sleep/awake by control instead of respawning (phase 3)."""
     device = select_input(args.device)
@@ -666,6 +686,10 @@ async def serve(args, dev):
     backends = {}
     clip_count = 0
     led_hold = 0.0  # Keep barge-in LED feedback visible briefly.
+    offline_engine = getattr(args, 'offline_stt', 'off')
+    offline_loading = None   # Task loading the local fallback transcriber
+    offline_active = False   # Awake, but Realtime is unreachable: commands use local STT
+    reconnecting = None      # Background Realtime retry while offline
     producer = AudioProducer(AudioBus(ring_seconds=RING_SECONDS), device, RATE, FRAME_SAMPLES)
 
     async def open_realtime():
@@ -675,16 +699,75 @@ async def serve(args, dev):
         emit({'status': 'transcription_ready', 'model': args.stt_model, 'backend': 'realtime'})
         return opened
 
+    async def offline_transcriber():
+        """The local fallback engine, or None if disabled or it failed to load.
+
+        Loaded on first need: normal operation holds no extra Hailo session (hailort.service
+        4.23 has crashed when sharing clients tear sessions down) or Whisper memory.
+        """
+        nonlocal offline_loading
+        if offline_engine == 'off' or args.no_stt:
+            return None
+        if offline_loading is None:
+            offline_loading = asyncio.create_task(asyncio.to_thread(load_offline_stt, args))
+        try:
+            return await offline_loading
+        except Exception as error:
+            emit({'status': 'warning', 'message': f'Offline STT ({offline_engine}) unavailable: {error!r}'})
+            return None
+
+    def offline_name(engine):
+        name = getattr(engine, 'backend_name', None)
+        return name if isinstance(name, str) else offline_engine
+
+    async def go_offline(error):
+        """Retryable Realtime failure while awake: keep taking commands with local STT."""
+        nonlocal offline_active, reconnecting
+        if not getattr(error, 'retryable', False) or await offline_transcriber() is None:
+            return False
+        if not offline_active:
+            offline_active = True
+            emit({'status': 'stt_fallback', 'engine': offline_name(await offline_transcriber()), 'reason': str(error)})
+        if reconnecting is None or reconnecting.done():
+            reconnecting = asyncio.create_task(reconnect_realtime())
+        return True
+
+    async def reconnect_realtime():
+        """Keep retrying Realtime in the background and switch back as soon as it answers."""
+        nonlocal realtime, offline_active
+        attempt = 0
+        while offline_active and state.mode == 'awake' and not state.stopping:
+            await asyncio.sleep(REALTIME_RETRY_DELAYS[min(attempt, len(REALTIME_RETRY_DELAYS) - 1)])
+            attempt += 1
+            async with stt_lock:
+                if not offline_active or state.mode != 'awake' or realtime is not None:
+                    return
+                try:
+                    realtime = await open_realtime()
+                except RealtimeUnavailable as error:
+                    if not error.retryable:
+                        emit({'status': 'warning', 'message': f'Realtime rejected the connection: {error}'})
+                        return
+                    continue
+                offline_active = False
+                emit({'status': 'stt_restored', 'backend': 'realtime'})
+                return
+
     async def set_mode(mode):
         """Open/close Realtime for the mode; on failure keep the previous mode and report it."""
-        nonlocal realtime, transcriber
+        nonlocal realtime, transcriber, offline_active
         async with stt_lock:
             if mode == 'awake' and realtime is None and not args.no_stt:
                 try:
                     realtime = await open_realtime()
+                    offline_active = False
                 except RealtimeUnavailable as error:
-                    return error
+                    if not await go_offline(error):
+                        return error
             elif mode == 'sleep':
+                offline_active = False  # The next wake tries Realtime again.
+                if reconnecting is not None:
+                    reconnecting.cancel()
                 if realtime is not None:
                     await realtime.close()
                     realtime = None
@@ -804,10 +887,17 @@ async def serve(args, dev):
                 backend = None
                 async with stt_lock:
                     if state.mode == 'awake' and not args.no_stt and not token.cancelled:
-                        if realtime is None:
-                            realtime = await open_realtime()  # Reopened lazily after a discard.
-                        realtime.begin(utterance_id)
-                        backend = 'realtime'
+                        if realtime is None and not offline_active:
+                            try:
+                                realtime = await open_realtime()  # Reopened lazily after a discard.
+                            except RealtimeUnavailable as error:
+                                if not await go_offline(error):
+                                    raise
+                        if offline_active:
+                            backend = 'offline'
+                        else:
+                            realtime.begin(utterance_id)
+                            backend = 'realtime'
                     elif state.mode == 'sleep' and transcriber:
                         backend = 'local'
                 backends[utterance_id] = backend
@@ -833,7 +923,26 @@ async def serve(args, dev):
                     # Hold the lock: a mode switch must not close the socket mid-finish.
                     async with stt_lock:
                         if realtime is not None and realtime.turn is not None:
-                            result = await realtime.finish()
+                            try:
+                                result = await realtime.finish()
+                            except RealtimeUnavailable as error:
+                                if not error.retryable or await offline_transcriber() is None:
+                                    raise
+                                await realtime.close()
+                                realtime = None
+                                await go_offline(error)
+                                backend = 'offline'  # The saved WAV is transcribed locally below.
+                if backend == 'offline':
+                    engine = await offline_transcriber()
+                    try:
+                        result = await asyncio.wait_for(asyncio.to_thread(engine.transcribe, path), LOCAL_STT_TIMEOUT)
+                        result['backend'] = offline_name(engine)
+                    except TimeoutError:
+                        emit({'status': 'warning', 'message': f'Offline transcription took over {LOCAL_STT_TIMEOUT} s; dropped.'})
+                        result = None
+                    except Exception as error:  # e.g. hailort.service restarted: lose this utterance, not the worker.
+                        emit({'status': 'warning', 'message': f'Offline transcription failed: {error!r}'})
+                        result = None
                 elif backend == 'local':
                     try:
                         result = await asyncio.wait_for(asyncio.to_thread(transcriber.transcribe, path), LOCAL_STT_TIMEOUT)
@@ -844,12 +953,12 @@ async def serve(args, dev):
                 if (result is not None and not token.cancelled and not state.stopping and not state.paused
                         and state.generation == event['generation']):
                     final_fields = {}
-                    if getattr(args, 'single_utterance', False) and backend == 'realtime':
+                    if getattr(args, 'single_utterance', False) and backend in ('realtime', 'offline'):
                         state.paused = True
                         final_fields['paused_after'] = True
                     emit({'status': 'transcript_final', 'item_id': f'local-{event["utterance_id"]}',
                           'utterance_id': event['utterance_id'], 'wav': str(path), 'doa_deg': event['doa_deg'],
-                          'backend': backend, **result, **final_fields})
+                          'backend': backend, **result, **final_fields})  # offline: result sets backend=hailo|cpu
                 recorder.armed.set()
                 if args.once:
                     break
@@ -873,6 +982,12 @@ async def serve(args, dev):
                         led.set_state(led.states.LISTEN)
                         led_hold = time.monotonic() + 1.5
     finally:
+        for task in (reconnecting, offline_loading):
+            if task is not None and not task.done():
+                task.cancel()
+        if offline_loading is not None and offline_loading.done() and not offline_loading.cancelled() \
+                and offline_loading.exception() is None and hasattr(offline_loading.result(), 'close'):
+            offline_loading.result().close()
         if recorder:
             recorder.stop_event.set()
         if wake:
@@ -944,6 +1059,9 @@ def main():
     parser.add_argument('--sleep-silence-seconds', type=float, default=0.4,
                         help='Endpoint silence in sleep mode with the Whisper wake engine')
     parser.add_argument('--wake-stt-model', default='small', help='Local Whisper model for sleep mode (Whisper wake engine)')
+    parser.add_argument('--offline-stt', choices=['off', 'hailo', 'cpu'], default=OFFLINE_STT_DEFAULT,
+                        help='Local STT for awake commands while Realtime is unreachable')
+    parser.add_argument('--offline-stt-model', help='hailo: tiny|base; cpu: a faster-whisper model (default base.en)')
     parser.add_argument('--wake-continuation', type=float, default=0.16,
                         help='Seconds of speech right after a wake hit that mark "still speaking" (0 disables)')
     aec = parser.add_argument_group('doctor --aec (echo cancellation check; stop the voice stack first)')

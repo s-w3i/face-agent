@@ -50,6 +50,7 @@ def producer_factory(bus, device, rate, block):
 
 class FakeRealtime:
     fail = None
+    fail_finish = None
     instances = []
     finish_gate = None
 
@@ -73,6 +74,8 @@ class FakeRealtime:
     async def finish(self):
         if FakeRealtime.finish_gate:
             await FakeRealtime.finish_gate.wait()
+        if FakeRealtime.fail_finish:
+            raise FakeRealtime.fail_finish
         self.turn = None
         return dict(text='what time is it')
 
@@ -86,13 +89,13 @@ def arguments(directory, **changes):
                   silence_seconds=.1, sleep_silence_seconds=.1, max_seconds=10, vad_mode=2,
                   preroll_seconds=0, wake_engine='whisper', wake_model_path='hi_kuro.onnx', wake_threshold=.5,
                   wake_continuation=.16, wake_stt_model='small', initial_mode='sleep', single_utterance=True,
-                  stt_prompt=None)
+                  stt_prompt=None, offline_stt='off')
     return SimpleNamespace(**{**values, **changes})
 
 
 class WorkerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        FakeRealtime.fail = None; FakeRealtime.instances = []; FakeRealtime.finish_gate = None
+        FakeRealtime.fail = None; FakeRealtime.fail_finish = None; FakeRealtime.instances = []; FakeRealtime.finish_gate = None
         PacedStream.value = 0; PacedStream.period = .002
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -192,7 +195,7 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         self.state.resume_at = 0
         self.speech = True
         self.voice = True
-        await self.until(lambda: self.status('utterance_started'))
+        await self.until(lambda: FakeRealtime.instances[0].begun)  # A remote turn is open to be dropped.
         ack = await self.control(2, paused=True)
         self.assertTrue(ack['paused'])
         self.assertFalse(self.state.capturing)  # The ack waited for the recorder to let go.
@@ -449,6 +452,132 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         names = {t.name for t in threading.enumerate() if t.is_alive()}
         self.assertFalse(names & {'command-recorder', 'wake-word', 'audio-watchdog'})
         self.assertFalse([e for e in self.status('warning') if 'did not stop' in e['message']])
+
+    # ---- phase 7: offline STT fallback ------------------------------------------------
+
+    def offline(self, gate=None):
+        engine = Mock()
+        def transcribe(path):
+            if gate is not None:
+                gate.wait(3)
+            return dict(text='offline command', stt_seconds=.1)
+        engine.transcribe.side_effect = transcribe
+        loader = patch('respeaker.load_offline_stt', return_value=engine)
+        loader.start()
+        self.addCleanup(loader.stop)
+        return engine
+
+    async def speak_once(self):
+        self.speech = True
+        self.voice = True
+        await self.until(lambda: self.status('utterance_started'))
+        self.voice = False
+        self.speech = False
+
+    async def test_realtime_down_on_wake_uses_offline_stt_and_stays_awake(self):
+        engine = self.offline()
+        await self.start(offline_stt='cpu')
+        FakeRealtime.fail = RealtimeUnavailable('network down', retryable=True)
+        ack = await self.control(1, mode='awake')
+        self.assertNotIn('error', ack)
+        self.assertEqual(ack['active_mode'], 'awake')
+        self.assertEqual(self.status('stt_fallback')[0]['engine'], 'cpu')
+        await self.control(2, paused=False)
+        self.state.resume_at = 0
+        await self.speak_once()
+        await self.until(lambda: self.status('transcript_final'))
+        final = self.status('transcript_final')[0]
+        self.assertEqual((final['text'], final['backend']), ('offline command', 'cpu'))
+        self.assertTrue(final['paused_after'])
+        engine.transcribe.assert_called_once()
+
+    async def test_realtime_failure_mid_utterance_transcribes_the_saved_clip_locally(self):
+        self.offline()
+        await self.start(initial_mode='awake', offline_stt='cpu')
+        await self.control(1, paused=False)
+        self.state.resume_at = 0
+        FakeRealtime.fail_finish = RealtimeUnavailable('socket closed', retryable=True)
+        await self.speak_once()
+        await self.until(lambda: self.status('transcript_final'))
+        final = self.status('transcript_final')[0]
+        self.assertEqual(final['backend'], 'cpu')
+        self.assertTrue(Path(final['wav']).exists())
+        self.assertTrue(self.status('stt_fallback'))
+        self.assertTrue(FakeRealtime.instances[0].closed)
+
+    async def test_non_retryable_failure_keeps_the_error_path(self):
+        engine = self.offline()
+        await self.start(offline_stt='cpu')
+        FakeRealtime.fail = RealtimeUnavailable('invalid_api_key', retryable=False)
+        ack = await self.control(1, mode='awake')
+        self.assertEqual(ack['error']['category'], 'realtime_unavailable')
+        self.assertEqual(ack['active_mode'], 'sleep')
+        self.assertEqual(self.status('stt_fallback'), [])
+        engine.transcribe.assert_not_called()
+
+    async def test_offline_disabled_reports_the_failure_as_before(self):
+        await self.start()
+        FakeRealtime.fail = RealtimeUnavailable('network down', retryable=True)
+        ack = await self.control(1, mode='awake')
+        self.assertIn('error', ack)
+
+    async def test_pause_during_offline_stt_suppresses_the_result(self):
+        gate = threading.Event()
+        self.offline(gate)
+        await self.start(offline_stt='cpu')
+        FakeRealtime.fail = RealtimeUnavailable('network down', retryable=True)
+        await self.control(1, mode='awake')
+        await self.control(2, paused=False)
+        self.state.resume_at = 0
+        await self.speak_once()
+        await self.until(lambda: self.status('utterance_saved'))
+        await self.control(3, paused=True)
+        gate.set()
+        await asyncio.sleep(.3)
+        self.assertEqual(self.status('transcript_final'), [])
+
+    async def test_realtime_comes_back_and_is_used_again(self):
+        self.offline()
+        with patch('respeaker.REALTIME_RETRY_DELAYS', (.1,)):
+            await self.start(offline_stt='cpu')
+            FakeRealtime.fail = RealtimeUnavailable('network down', retryable=True)
+            await self.control(1, mode='awake')
+            FakeRealtime.fail = None  # The network is back.
+            await self.until(lambda: self.status('stt_restored'))
+            await self.control(2, paused=False)
+            self.state.resume_at = 0
+            await self.speak_once()
+            await self.until(lambda: self.status('transcript_final'))
+        self.assertEqual(self.status('transcript_final')[0]['backend'], 'realtime')
+
+    async def test_offline_engine_loads_only_when_needed(self):
+        with patch('respeaker.load_offline_stt') as loader:
+            await self.start(initial_mode='awake', offline_stt='hailo')
+            await asyncio.sleep(.1)
+            loader.assert_not_called()
+
+    async def test_offline_transcription_error_loses_the_utterance_not_the_worker(self):
+        engine = self.offline()
+        engine.transcribe.side_effect = RuntimeError('HAILO_RPC_FAILED')
+        await self.start(offline_stt='cpu')
+        FakeRealtime.fail = RealtimeUnavailable('network down', retryable=True)
+        await self.control(1, mode='awake')
+        await self.control(2, paused=False)
+        self.state.resume_at = 0
+        await self.speak_once()
+        await self.until(lambda: any('Offline transcription failed' in e['message'] for e in self.status('warning')))
+        self.assertEqual(self.status('transcript_final'), [])
+        self.assertFalse(self.task.done())
+
+    def test_hailo_load_failure_falls_back_to_cpu(self):
+        args = SimpleNamespace(offline_stt='hailo', language='en', offline_stt_model=None)
+        with patch.dict(sys.modules, {'hailo_stt': None}), patch('respeaker_stt.Transcriber') as cpu, \
+                patch('respeaker.emit') as emit:
+            engine = r.load_offline_stt(args)
+        self.assertIs(engine, cpu.return_value)
+        self.assertEqual(engine.backend_name, 'cpu')
+        cpu.assert_called_once_with('base.en', 'en', cpu_threads=2, beam_size=1)
+        self.assertIn('using the CPU', emit.call_args.args[0]['message'])
 
     def recorder_bus(self):
         recorder = next(t for t in threading.enumerate() if t.name == 'command-recorder')

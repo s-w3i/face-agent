@@ -102,6 +102,8 @@ class VoiceInput:
                        '--vad-mode', '2', '--stt-model', self.model, '--wake-stt-model', self.wake_model]
             if self.status_driven:
                 command += ['--single-utterance']  # Applies to awake (Realtime) turns only.
+            if os.environ.get('DOTS_OFFLINE_STT'):
+                command += ['--offline-stt', os.environ['DOTS_OFFLINE_STT'].strip().lower()]
         else:
             command = [sys.executable, str(root / 'scripts/respeaker.py'), '--diagnostics', '--control-stdin',
                        '--silence-seconds', '0.8' if self.awake else '0.4', '--max-seconds', '10', '--vad-mode', '2',
@@ -220,6 +222,11 @@ class VoiceInput:
                 elif status == 'listening':
                     if not self.ready.done():
                         self.ready.set_result(None)
+                elif status == 'stt_fallback':
+                    print(f"Realtime unavailable ({event.get('reason', '?')}); transcribing commands locally "
+                          f"with {event.get('engine')} until it reconnects.", file=sys.stderr, flush=True)
+                elif status == 'stt_restored':
+                    print('Realtime transcription reconnected.', file=sys.stderr, flush=True)
                 elif status == 'transcription_retry':
                     print(f"Realtime connection attempt {event['attempt']}/{event['attempts']} failed ({event['reason']}); retrying.", file=sys.stderr, flush=True)
                 elif status == 'transcription_incomplete':
