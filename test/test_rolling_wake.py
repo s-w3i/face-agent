@@ -44,22 +44,38 @@ def feed_seconds(detector, seconds, t0=0.0, chunk_blocks=1):
 class DetectorTest(unittest.TestCase):
     def test_scores_full_windows_every_hop_while_speech(self):
         scorer = ScriptedScorer()
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad())
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad())
         feed_seconds(detector, 6.0)
         # Full at 3.0 s, then every 1.0 s: 3, 4, 5, 6.
         self.assertEqual(len(scorer.windows), 4)
         self.assertTrue(all(len(w) == 3 * rw.RATE for w in scorer.windows))
 
+    def test_default_hop_keeps_every_short_phrase_whole_in_one_window(self):
+        scorer = ScriptedScorer()
+        feed_seconds(rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad()), 9.0)
+        self.assertEqual(len(scorer.windows), 5)  # 3.0, 4.5, 6.0, 7.5, 9.0
+        self.assertGreaterEqual(rw.WINDOW - rw.HOP, 1.5)
+
+    def test_lagging_thread_skips_windows_but_keeps_the_audio(self):
+        scorer = ScriptedScorer(default=.9)
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad())
+        for i in range(300):  # 6 s, all while lagging
+            self.assertEqual(detector.feed(bytes(BLOCK_BYTES), i * .02, may_score=False), [])
+        self.assertEqual((scorer.windows, detector.skipped), ([], 4))
+        hits = detector.feed(bytes(BLOCK_BYTES * 50), 6.0)  # caught up: the next window is scored
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(scorer.windows[0]), 3 * rw.RATE)
+
     def test_quiet_room_costs_nothing(self):
         scorer = ScriptedScorer(default=.9)
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad(voiced=set()))
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad(voiced=set()))
         self.assertEqual(feed_seconds(detector, 10.0), [])
         self.assertEqual(scorer.windows, [])
 
     def test_never_waits_for_silence(self):
         """Continuous noise (always 'speech') still gets windows scored, unlike VAD segments."""
         scorer = ScriptedScorer([.1, .1, .1, .1, .1, .1, .9])
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad())
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad())
         hits = feed_seconds(detector, 12.0)
         self.assertEqual(len(hits), 1)
         self.assertAlmostEqual(hits[0]['continue_from'], 9.0, places=2)
@@ -67,7 +83,7 @@ class DetectorTest(unittest.TestCase):
     def test_hit_carries_onset_and_refractory_blocks_the_same_phrase(self):
         # Speech from 4.0 s (block 200) onwards.
         scorer = ScriptedScorer(default=.9)
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad(voiced=set(range(200, 1000))))
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad(voiced=set(range(200, 1000))))
         hits = feed_seconds(detector, 9.0)
         # Window ending 5.0 s has 1.0 s of speech: hit. 6.0 s is refractory; 7.0 s hits again.
         self.assertEqual([round(h['continue_from'], 2) for h in hits], [5.0, 7.0, 9.0])
@@ -78,12 +94,12 @@ class DetectorTest(unittest.TestCase):
     def test_below_min_voiced_is_not_scored(self):
         scorer = ScriptedScorer(default=.9)
         # 0.2 s of speech (10 blocks) is under MIN_VOICED.
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad(voiced=set(range(150, 160))))
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad(voiced=set(range(150, 160))))
         self.assertEqual(feed_seconds(detector, 6.0), [])
 
     def test_uneven_chunks_keep_time(self):
         scorer = ScriptedScorer(default=.9)
-        detector = rw.RollingWakeDetector(scorer, .5, vad=ScriptedVad())
+        detector = rw.RollingWakeDetector(scorer, .5, hop=1.0, vad=ScriptedVad())
         hits = []
         t = 100.0
         for samples in [480, 1000, 320, 7] * 200:
@@ -119,7 +135,7 @@ class VerifyingScorer(ScriptedScorer):
 
 class VerificationTest(unittest.TestCase):
     def detector(self, scorer):
-        return rw.RollingWakeDetector(scorer, -3.3, verify_floor=-6.0, vad=ScriptedVad())
+        return rw.RollingWakeDetector(scorer, -3.3, hop=1.0, verify_floor=-6.0, vad=ScriptedVad())
 
     def test_confident_window_wakes_without_a_cpu_check(self):
         scorer = VerifyingScorer([-7.0, -2.0])
@@ -147,14 +163,14 @@ class VerificationTest(unittest.TestCase):
     def test_silence_after_a_candidate_still_checks_it(self):
         scorer = VerifyingScorer([-4.0], heard=[True])
         # Speech only in the first 3 s, then the window has too little speech to score.
-        detector = rw.RollingWakeDetector(scorer, -3.3, verify_floor=-6.0, vad=ScriptedVad(voiced=set(range(150))))
+        detector = rw.RollingWakeDetector(scorer, -3.3, hop=1.0, verify_floor=-6.0, vad=ScriptedVad(voiced=set(range(150))))
         hits = feed_seconds(detector, 7.0)
         self.assertEqual(len(hits), 1)
         self.assertTrue(hits[0]['verified'])
 
     def test_scorer_without_verify_never_checks(self):
         scorer = ScriptedScorer([-4.0, -4.0, -4.0], default=-4.0)
-        self.assertEqual(feed_seconds(rw.RollingWakeDetector(scorer, -3.3, vad=ScriptedVad()), 6.0), [])
+        self.assertEqual(feed_seconds(rw.RollingWakeDetector(scorer, -3.3, hop=1.0, vad=ScriptedVad()), 6.0), [])
 
 
 class ScorerTest(unittest.TestCase):
@@ -207,8 +223,9 @@ class ThreadTest(unittest.TestCase):
                                       vad=ScriptedVad())
         thread.start()
         self.assertTrue(thread.ready.wait(1))
+        t0 = time.monotonic() - 3.2  # Captured just now: the thread is not lagging.
         for i in range(160):
-            bus.publish(bytes(BLOCK_BYTES), 10.0 + i * .02, i + 1)
+            bus.publish(bytes(BLOCK_BYTES), t0 + i * .02, i + 1)
         deadline = time.monotonic() + 2
         while not events and time.monotonic() < deadline:
             time.sleep(.01)
@@ -218,6 +235,21 @@ class ThreadTest(unittest.TestCase):
         self.assertEqual(thread.stats()['detections'], 1)
         self.assertEqual(closed, [True])
         self.assertEqual(bus.subscribers, ())
+
+    def test_thread_skips_windows_for_old_audio(self):
+        bus = ab.AudioBus()
+        scorer = ScriptedScorer(default=.9)
+        thread = rw.RollingWakeThread(bus, .5, lambda: scorer, vad=ScriptedVad())
+        thread.start(); self.assertTrue(thread.ready.wait(1))
+        t0 = time.monotonic() - 60  # A minute behind, e.g. after a long stall
+        for i in range(160):
+            bus.publish(bytes(BLOCK_BYTES), t0 + i * .02, i + 1)
+        deadline = time.monotonic() + 1
+        while thread.stats()['skipped'] < 1 and time.monotonic() < deadline:
+            time.sleep(.01)
+        thread.stop()
+        self.assertEqual(scorer.windows, [])
+        self.assertEqual(thread.stats()['skipped'], 1)
 
     def test_scorer_load_error_is_kept_for_the_worker(self):
         bus = ab.AudioBus()

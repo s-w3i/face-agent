@@ -201,6 +201,7 @@ DOTS_INITIAL_STATUS=SLEEPING
 # ROS_DOMAIN_ID=0
 # DOTS_WAKE_ENGINE=auto            # auto | rolling | oww | whisper
 # DOTS_WAKE_ROLLING_THRESHOLD=-3.3 # rolling: lower wakes more easily (and falsely)
+# DOTS_WAKE_VERIFY_FLOOR=-5.5      # rolling: higher (e.g. -5.0) saves CPU in noisy rooms, misses more
 # DOTS_WAKE_MODEL_PATH=~/.local/share/face-agent/wake/hi_kuro.onnx
 # DOTS_BARGE_IN=1                  # 0 disables wake-word barge-in
 # DOTS_BARGE_IN_SPEAKING=0         # 1 only with the speaker on the ReSpeaker jack

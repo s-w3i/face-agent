@@ -13,6 +13,7 @@ speaker-independent and untrained, unlike openWakeWord's synthetic-voice models.
 look like openWakeWord's, so the worker and chat.py treat both engines the same.
 """
 from collections import deque
+import os
 import re
 import threading
 import time
@@ -23,7 +24,9 @@ import webrtcvad
 RATE = 16000
 BLOCK = 320          # 20 ms, the bus block and a WebRTC VAD frame size
 WINDOW = 3.0         # seconds scored per window: "Hi Kuro" plus slack on both sides
-HOP = 1.0            # seconds between windows; every phrase lands whole in some window
+HOP = 1.5            # seconds between windows; a phrase of up to WINDOW - HOP lands whole in one
+MAX_LAG = 2.0        # seconds behind real time after which windows are skipped (never audio)
+NICE = 10            # the wake thread and the CPU check's threads yield to audio capture and display
 MIN_VOICED = .3      # seconds of speech a window needs before it is scored
 REFRACTORY = 2.0     # seconds after a hit in which the same phrase cannot fire again
 ONSET_PAD = .2       # seconds kept before the first speech of a hit window
@@ -31,7 +34,7 @@ ONSET_PAD = .2       # seconds kept before the first speech of a hit window
 # DEFAULT_THRESHOLD wake at once; windows between VERIFY_FLOOR and it wake only if CPU Whisper
 # small (prompted with the name) also hears the phrase. Measured results: docs/wake-word.md.
 DEFAULT_THRESHOLD = -3.3
-VERIFY_FLOOR = -6.0  # Over a loud TV, 28 of 30 real "Hi Kuro"s and 11% of TV-only windows score above this.
+VERIFY_FLOOR = -5.5  # Over a loud TV: 25 of 30 real "Hi Kuro"s, 2% of TV-only windows; none caught below it.
 
 
 class RollingWakeDetector:
@@ -56,12 +59,18 @@ class RollingWakeDetector:
         self.next_eval = round(window * RATE / BLOCK)
         self.last_hit = None
         self.candidate = None     # Best borderline window of the current run, awaiting its peak
-        self.windows = self.detections = self.verifications = 0
+        self.windows = self.detections = self.verifications = self.skipped = 0
+        self.may_score = True
         self.score_seconds = self.verify_seconds = 0.0
         self.scores = deque()  # (t, score) for the last 10 s
 
-    def feed(self, pcm, t_start):
-        """Add PCM captured from monotonic `t_start`; return a list of hit dicts."""
+    def feed(self, pcm, t_start, may_score=True):
+        """Add PCM captured from monotonic `t_start`; return a list of hit dicts.
+
+        `may_score=False` keeps the audio and the clock but skips any window due now:
+        the thread uses it to catch up after a slow window instead of dropping audio.
+        """
+        self.may_score = may_score
         if not self.pending:
             self.pending_t = t_start
         self.pending += pcm
@@ -82,6 +91,9 @@ class RollingWakeDetector:
         if self.blocks_seen < self.next_eval:
             return None
         self.next_eval = self.blocks_seen + round(self.hop * RATE / BLOCK)
+        if not self.may_score:
+            self.skipped += 1
+            return None
         if self.last_hit is not None and self.blocks_seen - self.last_hit < round(self.refractory * RATE / BLOCK):
             self.candidate = None
             return None
@@ -194,7 +206,7 @@ class HailoPhraseScorer:
         return heard_phrase(self.last_text, self.name)
 
 
-def cpu_verifier(name, model='small', context_frames=1000, cpu_threads=4):
+def cpu_verifier(name, model='small', context_frames=1000, cpu_threads=3):
     """Whisper small on the CPU, prompted with the name, for windows the Hailo score is unsure of.
 
     Base-size models miss most "Hi Kuro"s over a loud TV; small hears about two thirds.
@@ -245,6 +257,12 @@ class RollingWakeThread(threading.Thread):
         # Room for ~10 s of audio: a slow window must not drop speech (drop-oldest queue).
         self.sub = self.bus.subscribe('wake', maxsize=500)
         try:
+            try:
+                # Per-thread nice on Linux; CTranslate2's worker threads, created while loading
+                # the CPU check below, inherit it.
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), NICE)
+            except (AttributeError, OSError):
+                pass
             self.scorer = self.scorer_factory()
             self.detector = RollingWakeDetector(self.scorer, self.threshold, **self.detector_options)
             self.ready.set()
@@ -255,7 +273,7 @@ class RollingWakeThread(threading.Thread):
                 if block is None:
                     continue
                 started = time.thread_time()
-                hits = self.detector.feed(block.pcm, block.t)
+                hits = self.detector.feed(block.pcm, block.t, may_score=time.monotonic() - block.t < MAX_LAG)
                 self.cpu_seconds += time.thread_time() - started
                 for hit in hits:
                     self.wake_word_detected.set()
@@ -289,4 +307,5 @@ class RollingWakeThread(threading.Thread):
                     score_seconds=round(detector.score_seconds, 3) if detector else 0.0,
                     verifications=detector.verifications if detector else 0,
                     verify_seconds=round(detector.verify_seconds, 3) if detector else 0.0,
+                    skipped=detector.skipped if detector else 0,
                     reconnects=getattr(self.scorer, 'reconnects', 0))

@@ -526,7 +526,8 @@ async def serve(args, dev):
         if wake_engine == 'rolling':
             from rolling_wake import HailoPhraseScorer, RollingWakeThread
             thread = RollingWakeThread(producer.bus, args.wake_threshold, lambda: HailoPhraseScorer(args.wake_name),
-                                       on_detect=on_detect, vad_mode=args.vad_mode)
+                                       on_detect=on_detect, vad_mode=args.vad_mode,
+                                       verify_floor=args.wake_verify_floor)
         else:
             from wake_word import WakeWordThread
             thread = WakeWordThread(producer.bus, args.wake_model_path, args.wake_threshold, on_detect=on_detect)
@@ -796,6 +797,8 @@ def main():
                         help='oww: openWakeWord model on the continuous stream; rolling: Hailo Whisper scores '
                              '"Hi <name>" in rolling windows; whisper: hardware VAD segments + local Whisper')
     parser.add_argument('--wake-name', default='Kuro', help='Robot name for --wake-engine rolling')
+    parser.add_argument('--wake-verify-floor', type=float, default=None,
+                        help='rolling: lowest Hailo score re-checked by CPU Whisper small (higher saves CPU)')
     parser.add_argument('--wake-model-path', help='openWakeWord .onnx model (default DOTS_WAKE_MODEL_PATH or '
                         '~/.local/share/face-agent/wake/hi_kuro.onnx)')
     parser.add_argument('--wake-threshold', type=float, help='Wake score threshold (default: model .json or 0.5)')
@@ -837,6 +840,8 @@ def main():
         import rolling_wake
         if args.wake_threshold is None:
             args.wake_threshold = rolling_wake.DEFAULT_THRESHOLD
+        if args.wake_verify_floor is None:
+            args.wake_verify_floor = rolling_wake.VERIFY_FLOOR
         if not -20 < args.wake_threshold < 0:
             parser.error('--wake-threshold for rolling is a mean log-probability between -20 and 0.')
     if args.wake_engine == 'oww':

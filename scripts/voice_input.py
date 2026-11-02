@@ -116,6 +116,8 @@ class VoiceInput:
         elif engine == 'rolling':
             threshold = os.environ.get('DOTS_WAKE_ROLLING_THRESHOLD', '').strip() or threshold
             command += ['--wake-engine', 'rolling', '--wake-name', name, '--wake-threshold', str(threshold)]
+            if os.environ.get('DOTS_WAKE_VERIFY_FLOOR', '').strip():
+                command += ['--wake-verify-floor', os.environ['DOTS_WAKE_VERIFY_FLOOR'].strip()]
         if self.language:
             command += ['--language', self.language]
         self.process = await asyncio.create_subprocess_exec(*command, cwd=root,
