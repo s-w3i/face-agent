@@ -296,6 +296,31 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
         self.dev.is_voice.assert_not_called()  # No hardware-VAD segments while asleep.
         self.assertEqual(self.status('utterance_started'), [])
 
+    async def test_own_playback_phrase_reported_after_the_hold_does_not_wake(self):
+        # "… Say Hi Kuro to wake me up." is scored while the mic is held; the hit lands after release.
+        released, user_speaks = threading.Event(), threading.Event()
+        calls = []
+
+        def score(audio):
+            calls.append(len(calls))
+            if len(calls) == 1:
+                released.wait(3)  # Scoring the playback window outlasts the hold.
+                return -1.0
+            return -1.0 if user_speaks.is_set() else -9.0
+        with patch('rolling_wake.HailoPhraseScorer', return_value=score):
+            self.speech = True
+            await self.start(wake_engine='rolling', wake_threshold=-3.3)
+            await self.control(1, paused=True)
+            await self.until(lambda: calls)
+            await self.control(2, paused=False)
+            self.state.resume_at = 0
+            released.set()
+            await self.until(lambda: self.status('wake_ignored'), timeout=5)
+            self.assertEqual(self.status('wake_detected'), [])
+            user_speaks.set()  # The user's own "Hi Kuro" after the announcement still wakes.
+            await self.until(lambda: self.status('wake_detected'), timeout=5)
+        self.assertGreaterEqual(self.status('wake_detected')[0]['t'], self.state.opened_at)
+
     async def test_comma_pause_does_not_end_the_continuation_check(self):
         bus = ab.AudioBus()
         bus.ring.write(np.zeros(16000, np.int16), 11.0)  # t=10 .. 11

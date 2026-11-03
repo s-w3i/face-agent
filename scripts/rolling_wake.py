@@ -27,6 +27,7 @@ WINDOW = 3.0         # seconds scored per window: "Hi Kuro" plus slack on both s
 HOP = 1.5            # seconds between windows; a phrase of up to WINDOW - HOP lands whole in one
 MAX_LAG = 2.0        # seconds behind real time after which windows are skipped (never audio)
 NICE = 10            # the wake thread and the CPU check's threads yield to audio capture and display
+VERIFY_GRACE = 30.0  # stall allowance during one CPU check: ~2 s normally, far longer at nice +10 on a loaded Pi
 MIN_VOICED = .3      # seconds of speech a window needs before it is scored
 REFRACTORY = 2.0     # seconds after a hit in which the same phrase cannot fire again
 ONSET_PAD = .2       # seconds kept before the first speech of a hit window
@@ -245,7 +246,8 @@ class RollingWakeThread(threading.Thread):
         self.ready = threading.Event()
         from worker_threads import Heartbeat
         # A window takes up to ~1 s on the Hailo-8L; a scorer stuck longer than this is a stall.
-        self.heartbeat = Heartbeat('wake-word', 5.0)
+        self.stall_limit = 5.0
+        self.heartbeat = Heartbeat('wake-word', self.stall_limit)
         self.heartbeat.paused = True  # The model load is not a stall.
         self.error = None
         self.detector = None
@@ -265,6 +267,8 @@ class RollingWakeThread(threading.Thread):
                 pass
             self.scorer = self.scorer_factory()
             self.detector = RollingWakeDetector(self.scorer, self.threshold, **self.detector_options)
+            if self.detector.verify is not None:
+                self.detector.verify = self._allow_slow(self.detector.verify)
             self.ready.set()
             self.heartbeat.paused = False
             while not self.stop_event.is_set():
@@ -290,6 +294,17 @@ class RollingWakeThread(threading.Thread):
                     close()
                 except Exception:
                     pass
+
+    def _allow_slow(self, verify):
+        """A slow CPU check under load is not a stall; restarting the worker would only drop audio."""
+        def checked(audio):
+            self.heartbeat.limit = VERIFY_GRACE
+            try:
+                return verify(audio)
+            finally:
+                self.heartbeat.limit = self.stall_limit
+                self.heartbeat.beat()
+        return checked
 
     def stop(self, timeout=1.0):
         self.stop_event.set()

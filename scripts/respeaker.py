@@ -100,6 +100,10 @@ class Controls:
         self.sequence = self.generation = 0
         self.stopping = False
         self.resume_at = 0
+        # Audio from before this moment was captured while paused (the robot's own
+        # playback). Rolling hits arrive 1.5–4 s after their audio, so arrival time
+        # alone cannot tell "Say Hi Kuro to wake me up" from the user.
+        self.opened_at = math.inf if paused else 0.0
         self.capture_closed = asyncio.Event()
         self.capture_closed.set()
         self.capturing = False  # Set by the T3 recorder thread around each subscription.
@@ -148,6 +152,10 @@ class Controls:
                 or type(value['paused']) is not bool or type(value['sequence']) is not int
                 or value['sequence'] <= self.sequence):
             raise RuntimeError('Invalid microphone capture control.')
+        if value['paused']:
+            self.opened_at = math.inf
+        elif self.paused:
+            self.opened_at = time.monotonic()
         self.paused = value['paused']
         self.sequence = value['sequence']
         self.invalidate('control')
@@ -709,8 +717,9 @@ async def serve(args, dev):
                 hit = item[1]
                 wake.wake_word_detected.clear()  # Consumed here; T2 only ever sets it.
                 if state.mode == 'sleep':
-                    if state.paused or time.monotonic() < state.resume_at:
-                        # The robot's own playback ("Say Hi Kuro…") or a closed gate.
+                    if state.paused or time.monotonic() < state.resume_at or hit.get('t', math.inf) < state.opened_at:
+                        # The robot's own playback ("Say Hi Kuro…") or a closed gate, judged by
+                        # when the phrase was heard, not when the hit arrived.
                         emit({'status': 'wake_ignored', 'reason': 'paused', 'score': hit['score']})
                         continue
                     # Rolling hits start at the phrase; "still speaking" is checked after the window.

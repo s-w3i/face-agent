@@ -251,6 +251,30 @@ class ThreadTest(unittest.TestCase):
         self.assertEqual(scorer.windows, [])
         self.assertEqual(thread.stats()['skipped'], 1)
 
+    def test_slow_cpu_check_is_not_a_stall(self):
+        bus = ab.AudioBus()
+        limits = []
+
+        class Borderline(ScriptedScorer):
+            def verify(self, audio):  # The CPU check, slow on a loaded Pi
+                limits.append(thread.heartbeat.limit)
+                return True
+        thread = rw.RollingWakeThread(bus, -3.3, lambda: Borderline(scores=[-4.0], default=-9.0),
+                                      vad=ScriptedVad(), verify_floor=-5.5)
+        events = []
+        thread.on_detect = events.append
+        thread.start(); self.assertTrue(thread.ready.wait(1))
+        t0 = time.monotonic() - 4.8
+        for i in range(240):
+            bus.publish(bytes(BLOCK_BYTES), t0 + i * .02, i + 1)
+        deadline = time.monotonic() + 2
+        while not events and time.monotonic() < deadline:
+            time.sleep(.01)
+        thread.stop()
+        self.assertEqual(limits, [rw.VERIFY_GRACE])
+        self.assertEqual(thread.heartbeat.limit, 5.0)  # Back to the normal stall limit afterwards.
+        self.assertTrue(events and events[0]['verified'])
+
     def test_scorer_load_error_is_kept_for_the_worker(self):
         bus = ab.AudioBus()
         def broken():
