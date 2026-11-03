@@ -196,6 +196,7 @@ Startup settings are in `~/.config/face-agent/startup.env`:
 DOTS_RENDERER=prerendered
 DOTS_FULLSCREEN=1
 DOTS_CAMERA_PROFILE=rgbd  # Use color for the lower-bandwidth camera.sh profile.
+# DOTS_CAMERA_USB_RESET=1  # 0 disables the automatic USB reset when the Orbbec gets stuck after a USB drop
 DOTS_INITIAL_STATUS=SLEEPING
 # PORT=5173
 # ROS_DOMAIN_ID=0

@@ -18,6 +18,14 @@ import faults  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 HEALTHY_SECONDS = 30  # A restarted component running this long clears its fault.
+CAMERA_VENDOR = '2bc5'  # Orbbec
+# orbbec_camera log lines that mean the camera is stuck, and how many within the window
+# trigger a USB reset. Neither appears while it streams normally.
+CAMERA_FAILURES = (
+    (b'Device initialization failed after', 2),  # Its 3 attempts failed (~11 s per cycle).
+    (b'Device response size(0)', 20),  # Opened, but the device answers nothing (~1 per second).
+)
+USBDEVFS_RESET = 0x5514  # _IO('U', 20); what usbreset(1) does. /dev/bus/usb is writable via the Orbbec udev rule.
 
 
 def stop(process, timeout=40):
@@ -77,6 +85,96 @@ class Component:
     def close(self):
         stop(self.process)
         self.process = None
+
+
+def reset_usb_devices(vendor, sysfs=Path('/sys/bus/usb/devices'), devfs=Path('/dev/bus/usb'), ioctl=fcntl.ioctl):
+    """USB-reset every device from `vendor`, so the kernel re-binds its drivers. Returns the ports reset."""
+    done = []
+    for device in sorted(sysfs.glob('*')):
+        try:
+            if (device / 'idVendor').read_text().strip() != vendor:
+                continue
+            node = devfs / f"{int((device / 'busnum').read_text()):03d}" / f"{int((device / 'devnum').read_text()):03d}"
+        except (OSError, ValueError):
+            continue  # Interfaces and root hubs have no idVendor.
+        try:
+            fd = os.open(node, os.O_WRONLY)
+            try:
+                ioctl(fd, USBDEVFS_RESET, 0)
+            finally:
+                os.close(fd)
+            done.append(device.name)
+        except OSError as error:
+            print(f'Could not reset USB device {device.name}: {error}', flush=True)
+    return done
+
+
+class CameraWatchdog:
+    """Reset the camera over USB when its driver keeps failing to open it.
+
+    After a USB drop the Orbbec can come back with its streaming interfaces unbound
+    ("No v4l device found", "'color sensor' not found"), or stay open but answer
+    nothing. orbbec_camera then retries or idles forever without exiting, and
+    relaunching it alone never helps; a USB reset first does.
+    """
+
+    def __init__(self, camera, failures=CAMERA_FAILURES, window=60, cooldown=300, settle=3, reset=reset_usb_devices):
+        self.camera, self.failures, self.window, self.cooldown, self.settle = camera, failures, window, cooldown, settle
+        self.reset = reset
+        self.offset = None
+        self.tail = b''
+        self.keep = max(len(marker) for marker, _ in failures) - 1
+        self.seen = {marker: [] for marker, _ in failures}  # monotonic times of recent failure lines
+        self.last_reset = None
+
+    def new_output(self, limit=4 << 20):
+        path = self.camera.output.name
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return b''
+        if self.offset is None:  # Earlier runs' failures are not ours to act on.
+            self.offset = size
+        if size < self.offset:  # Copy-truncated by rotate_logs.
+            self.offset, self.tail = 0, b''
+        self.offset = max(self.offset, size - limit)
+        try:
+            with open(path, 'rb') as source:
+                source.seek(self.offset)
+                data = source.read(size - self.offset)
+        except OSError:
+            return b''
+        self.offset += len(data)
+        return data
+
+    def poll(self, now):
+        """Check the camera log; returns True when it reset the camera."""
+        data = self.tail + self.new_output()
+        self.tail = data[-self.keep:]
+        for marker, _ in self.failures:
+            self.seen[marker] = [t for t in self.seen[marker] if now - t < self.window] + [now] * data.count(marker)
+        quiet = not any(self.seen.values())
+        if self.last_reset is not None and quiet and now - self.last_reset > self.window:
+            self.camera.faults.clear('camera_unavailable')
+            self.last_reset = None
+        stuck = [marker for marker, limit in self.failures if len(self.seen[marker]) >= limit]
+        cooled = self.last_reset is None or now - self.last_reset >= self.cooldown
+        if not stuck or not cooled or self.camera.process is None:
+            return False
+        print(f'Camera stuck ({stuck[0].decode()!r} {len(self.seen[stuck[0]])} times in {self.window} s); '
+              'resetting it over USB.', flush=True)
+        stop(self.camera.process)
+        self.camera.process = None
+        ports = self.reset(CAMERA_VENDOR)
+        self.camera.faults.report(
+            'camera_unavailable',
+            (f'The camera stopped responding; reset it over USB (port {", ".join(ports)}) and restarting it.'
+             if ports else 'The camera stopped responding and no Orbbec device is on USB; restarting it.'),
+            title='Resetting camera', detail=log_tail(self.camera.output.name))
+        self.camera.next_start = now + self.settle
+        self.seen = {marker: [] for marker, _ in self.failures}
+        self.tail, self.last_reset = b'', now
+        return True
 
 
 def rotate_logs(logs, max_bytes, keep):
@@ -184,6 +282,7 @@ def main():
         agent = Component('agent', [str(ROOT / '.venv/bin/python'), str(ROOT / 'scripts/chat.py'),
                                    '--mode', 'voice', '--url', base], env, logs, base)
         components.extend((camera, display, agent))
+        watchdog = CameraWatchdog(camera) if env.get('DOTS_CAMERA_USB_RESET', '1') != '0' else None
         camera.start()
         display.start()
         waiting = True
@@ -198,6 +297,8 @@ def main():
                 else:
                     manager.maintain()
             camera.maintain()
+            if watchdog:
+                watchdog.poll(time.monotonic())
             if display.process is not None and display.process.poll() is not None:
                 agent.close()
                 waiting = True
