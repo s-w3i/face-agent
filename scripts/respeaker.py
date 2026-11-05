@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -12,12 +13,14 @@ import threading
 import time
 import wave
 
+import numpy as np
 import sounddevice as sd
 import webrtcvad
 from usb.core import USBError
 from voice_errors import RealtimeUnavailable
 from respeaker_vendor.tuning import find, PARAMETERS
 from audio_bus import AudioBus, AudioProducer, DeviceUnavailable, ReSpeakerControl
+import respeaker_profile
 from cancel import CancelScope
 from worker_threads import DropRate, Heartbeat, RestartBudget, join_all, rss_kb, stack_of, thread_cpu
 
@@ -32,6 +35,9 @@ METRICS_SECONDS = 60
 REALTIME_RETRY_DELAYS = (5, 15, 30)  # Background reconnects while commands use offline STT.
 OFFLINE_STT_DEFAULT = 'hailo'  # Chosen by the phase 7 spike; falls back to 'cpu' if it can't load (plans/phase-7-hailo-whisper-fallback.md).
 LOCAL_STT_TIMEOUT = 60  # Whisper small takes ~10 s on the Pi 5; only a hang gets this far.
+ENERGY_GATE_DB = 8.0  # End of speech: a frame is speech only this far above the noise floor (chassis fans).
+NOISE_FLOOR_SECONDS = 4.0  # Ring history used to estimate the floor at the start of each capture.
+NOISE_FLOOR_LIMITS_DB = (-70.0, -45.0)  # Clamp: a ring full of speech or robot playback can't mute quiet speech.
 
 
 class WorkerFailure(RuntimeError):
@@ -85,6 +91,77 @@ class SpeechEndpoint:
     def update(self, voiced, samples):
         self.silent_samples = 0 if voiced else self.silent_samples + samples
         return self.silent_samples >= self.limit
+
+
+def capture_floor(pcm, calibrated_db=None):
+    """Floor for one capture: the recent ring, but never above the calibrated fan floor + 3 dB.
+
+    After a reply the ring holds the robot's own playback, which would otherwise raise the
+    floor and cut quiet words off the user's command.
+    """
+    floor = noise_floor(pcm)
+    if floor and calibrated_db is not None:
+        floor = min(floor, 32768 * 10 ** ((calibrated_db + 3) / 20))
+    return floor
+
+
+def noise_floor(pcm, percentile=15):
+    """Background level between words: a low percentile of 20 ms frame RMS, clamped."""
+    samples = np.frombuffer(pcm, '<i2').astype(np.float64)
+    frames = samples[:samples.size // FRAME_SAMPLES * FRAME_SAMPLES].reshape(-1, FRAME_SAMPLES)
+    if not len(frames):
+        return None
+    rms = np.sqrt(np.mean(frames * frames, axis=1))
+    low, high = (32768 * 10 ** (db / 20) for db in NOISE_FLOOR_LIMITS_DB)
+    return float(np.clip(np.percentile(rms, percentile), low, high))
+
+
+class SpeechGate:
+    """WebRTC VAD that also requires the frame to stand `gate_db` above the noise floor.
+
+    Steady fan hum can pass WebRTC VAD on its own, which kept the 0.8 s end-of-speech
+    silence from ever completing; the energy check makes the hum count as silence.
+    """
+
+    def __init__(self, vad, floor=None, gate_db=ENERGY_GATE_DB):
+        self.vad = vad
+        self.threshold = floor * 10 ** (gate_db / 20) if floor and gate_db > 0 else None
+
+    def is_speech(self, data, rate=RATE):
+        if not self.vad.is_speech(data, rate):
+            return False
+        if self.threshold is None:
+            return True
+        samples = np.frombuffer(data, '<i2').astype(np.float64)
+        return bool(samples.size) and math.sqrt(float(np.mean(samples * samples))) >= self.threshold
+
+
+def preroll_seconds(args, state, now=None):
+    """Pre-roll for a hardware-VAD capture, never reaching back past the moment input reopened.
+
+    A calibrated pre-roll can be ~0.8 s; just after a reply that would include the robot's
+    own last words, which were captured while the input was paused.
+    """
+    seconds = getattr(args, 'preroll_seconds', PREROLL_SECONDS)
+    opened = getattr(state, 'opened_at', 0.0)
+    if math.isfinite(opened) and opened > 0:
+        seconds = min(seconds, max(0.0, (time.monotonic() if now is None else now) - opened))
+    return seconds
+
+
+def apply_calibration(args, calibrated, environ=os.environ):
+    """Fill capture settings the command line left unset from calibrate_mic.py's result."""
+    if getattr(args, 'energy_gate_db', None) is None:
+        value = environ.get('DOTS_ENERGY_GATE_DB', '').strip()
+        # Without a calibrated fan floor the gate would guess one from the ring, which can
+        # hold the robot's own playback; stay on plain WebRTC VAD until calibrate_mic.py runs.
+        default = ENERGY_GATE_DB if calibrated.get('noise_floor_db') is not None else 0.0
+        args.energy_gate_db = float(value) if value else float(calibrated.get('energy_gate_db', default))
+    if getattr(args, 'noise_floor_db', None) is None and calibrated.get('noise_floor_db') is not None:
+        args.noise_floor_db = float(calibrated['noise_floor_db'])
+    preroll = calibrated.get('preroll_seconds')
+    if preroll and getattr(args, 'preroll_seconds', PREROLL_SECONDS) == PREROLL_SECONDS:
+        args.preroll_seconds = min(max(float(preroll), PREROLL_SECONDS), 1.0)
 
 
 class Controls:
@@ -312,7 +389,9 @@ class CommandRecorder(threading.Thread):
         args, state, bus = self.args, self.state, self.producer.bus
         awake = state.mode == 'awake'
         endpoint = SpeechEndpoint(args.silence_seconds if awake else getattr(args, 'sleep_silence_seconds', args.silence_seconds))
-        vad = webrtcvad.Vad(args.vad_mode)
+        vad = SpeechGate(webrtcvad.Vad(args.vad_mode),
+                         capture_floor(bus.ring.read_last(NOISE_FLOOR_SECONDS)[0], getattr(args, 'noise_floor_db', None)),
+                         getattr(args, 'energy_gate_db', None) or 0)
         generation = state.generation
         state.capturing = True  # Before re-checking pause, so a pause ack waits for us.
         try:
@@ -329,7 +408,7 @@ class CommandRecorder(threading.Thread):
                 if from_t is not None:
                     preroll, _, last_seq = bus.preroll(sub, since=from_t)
                 else:
-                    preroll, _, last_seq = bus.preroll(sub, seconds=getattr(args, 'preroll_seconds', PREROLL_SECONDS))
+                    preroll, _, last_seq = bus.preroll(sub, seconds=preroll_seconds(args, state))
                 expected = last_seq + 1 if last_seq else None
                 pcm = bytearray()
                 direction = self.dev.direction
@@ -365,7 +444,7 @@ class CommandRecorder(threading.Thread):
                     data = block.pcm
                     pcm.extend(data)
                     self.post('audio', data)
-                    voiced = vad.is_speech(data, RATE)
+                    voiced = vad.is_speech(data)
                     finished = endpoint.update(voiced, len(data) // 2)
                     now = time.monotonic()
                     if voiced and now >= next_direction:
@@ -422,6 +501,15 @@ async def serve(args, dev):
         raise RuntimeError(f'Recording already exists: {output}; choose another --wav path.')
     loop = asyncio.get_running_loop()
     state = Controls(paused=args.control_stdin)
+    calibrated = respeaker_profile.load_calibration()
+    apply_calibration(args, calibrated)
+    try:
+        dsp = respeaker_profile.apply(dev, PARAMETERS, calibrated=calibrated)
+        print('ReSpeaker DSP profile: ' + (json.dumps(dsp) if dsp else 'off (chip left as it was)'),
+              file=sys.stderr, flush=True)
+    except Exception as error:  # Voice still works on the chip's current settings.
+        dsp = None
+        emit({'status': 'warning', 'message': f'ReSpeaker DSP profile not applied: {error!r}'})
     dev = ReSpeakerControl(dev)
     handoff = asyncio.Queue()
     stt_lock = asyncio.Lock()
@@ -438,9 +526,10 @@ async def serve(args, dev):
     producer = AudioProducer(AudioBus(ring_seconds=RING_SECONDS), device, RATE, FRAME_SAMPLES)
 
     async def open_realtime():
-        from respeaker_realtime import RealtimeTranscriber
+        from respeaker_realtime import RealtimeTranscriber, hints_for
         emit({'status': 'transcription_loading', 'model': args.stt_model})
-        opened = await RealtimeTranscriber.open(emit, args.stt_model, args.language)
+        opened = await RealtimeTranscriber.open(emit, args.stt_model, args.language,
+                                                hints_for(getattr(args, 'wake_name', None)))
         emit({'status': 'transcription_ready', 'model': args.stt_model, 'backend': 'realtime'})
         return opened
 
@@ -577,7 +666,8 @@ async def serve(args, dev):
         controller = asyncio.create_task(read_controls(state)) if args.control_stdin else None
         emit({'status': 'listening', 'input': sd.query_devices(device, 'input')['name'],
               'trigger': 'wake_word' if streaming else 'hardware_vad', 'mode': state.mode,
-              'wake_engine': wake_engine, 'silence_seconds': args.silence_seconds,
+              'wake_engine': wake_engine, 'silence_seconds': args.silence_seconds, 'dsp_profile': dsp,
+              'energy_gate_db': getattr(args, 'energy_gate_db', None), 'calibrated': calibrated.get('time'),
               'max_seconds': args.max_seconds, 'vad_mode': args.vad_mode})
         deadline = time.monotonic() + args.seconds if args.seconds else math.inf
         while not state.stopping and time.monotonic() < deadline:
@@ -767,7 +857,15 @@ async def serve(args, dev):
 
 
 def run(args, dev):
-    if args.command == 'doctor' and (args.aec or args.compare):
+    if args.command == 'doctor' and getattr(args, 'noise', False):
+        import respeaker_noise
+        if args.compare:
+            emit(respeaker_noise.compare())
+            return
+        settings = respeaker_noise.parse_settings(args.set, PARAMETERS)
+        emit(respeaker_noise.measure(sd, select_input(args.device), RATE, dev, PARAMETERS,
+                                     seconds=args.noise_seconds, label=args.label or 'noise', settings=settings))
+    elif args.command == 'doctor' and (args.aec or args.compare):
         import respeaker_aec
         result = (respeaker_aec.compare() if args.compare else
                   respeaker_aec.measure(sd, select_input(args.device), RATE, sink=args.sink,
@@ -791,6 +889,9 @@ def main():
     parser.add_argument('--max-seconds', type=float, default=10, help='Maximum length of one utterance')
     parser.add_argument('--vad-mode', type=int, choices=range(4), default=2,
                         help='WebRTC VAD aggressiveness: 0 (least) to 3 (most)')
+    parser.add_argument('--energy-gate-db', type=float, default=None,
+                        help='End of speech: speech frames must be this many dB above the noise floor; 0 disables '
+                             '(default: DOTS_ENERGY_GATE_DB, else calibrate_mic.py result, else %(const)s)'.replace('%(const)s', str(ENERGY_GATE_DB)))
     parser.add_argument('--wav', default=str(ROOT / 'test-output' / f'respeaker-{time.time_ns()}.wav'))
     parser.add_argument('--no-stt', action='store_true', help='Save utterances without transcription')
     parser.add_argument('--no-led', action='store_true', help='Leave the LED ring alone')
@@ -798,7 +899,7 @@ def main():
     parser.add_argument('--single-utterance', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--control-stdin', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--stt-model', default='gpt-live-transcribe', help='Realtime gpt-live-transcribe, or a local Whisper model/directory')
-    parser.add_argument('--stt-prompt', help='Optional local Whisper vocabulary hint (not sent to Realtime).')
+    parser.add_argument('--stt-prompt', help='Optional local Whisper vocabulary hint (Realtime builds its own from --wake-name).')
     parser.add_argument('--language', default='en', help='Language code, or auto to detect it')
     parser.add_argument('--preroll-seconds', type=float, default=PREROLL_SECONDS,
                         help='Audio kept from before the hardware voice trigger (0-1.5 s)')
@@ -828,6 +929,11 @@ def main():
     aec.add_argument('--aec-seconds', type=float, default=10, help='Seconds of playback to record')
     aec.add_argument('--playback', help='WAV to loop (default: cached wake acknowledgment speech)')
     aec.add_argument('--label', help='Run label in test-output/aec (default: sink alias)')
+    noise = parser.add_argument_group('doctor --noise (fan/background noise check; stop the voice stack first)')
+    noise.add_argument('--noise', action='store_true', help='Record all channels and poll the hardware VAD')
+    noise.add_argument('--noise-seconds', type=float, default=20, help='Seconds to record')
+    noise.add_argument('--set', action='append', metavar='NAME=VALUE',
+                       help='Temporary XVF3000 parameter for this run (repeatable; restored afterwards)')
     args = parser.parse_args()
     DIAGNOSTICS = args.diagnostics or args.command != 'listen'
     if (not all(math.isfinite(n) for n in (args.seconds, args.silence_seconds, args.max_seconds))

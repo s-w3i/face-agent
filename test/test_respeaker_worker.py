@@ -58,7 +58,7 @@ class FakeRealtime:
         self.turn = None; self.audio = bytearray(); self.closed = False; self.begun = []
 
     @classmethod
-    async def open(cls, emit, model, language):
+    async def open(cls, emit, model, language, hints=None):
         if cls.fail:
             raise cls.fail
         instance = cls()
@@ -89,7 +89,8 @@ def arguments(directory, **changes):
                   silence_seconds=.1, sleep_silence_seconds=.1, max_seconds=10, vad_mode=2,
                   preroll_seconds=0, wake_engine='whisper', wake_model_path='hi_kuro.onnx', wake_threshold=.5,
                   wake_continuation=.16, wake_stt_model='small', initial_mode='sleep', single_utterance=True,
-                  stt_prompt=None, offline_stt='off', wake_name='Kuro', wake_verify_floor=-5.5)
+                  stt_prompt=None, offline_stt='off', wake_name='Kuro', wake_verify_floor=-5.5,
+                  energy_gate_db=0)  # Fake audio is flat; these tests drive the VAD through self.speech.
     return SimpleNamespace(**{**values, **changes})
 
 

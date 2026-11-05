@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -28,13 +29,56 @@ def load_key():
     return key
 
 
-def session_config(model=MODEL, language='en'):
-    transcription = dict(model=model, delay='low')
+NOISE_REDUCTION = ('near_field', 'far_field')
+DELAYS = ('minimal', 'low', 'medium', 'high', 'xhigh')
+# Replaying the owner's saved commands (2026-11-06, docs/fan-noise.md): near_field noise
+# reduction cut or emptied 7 of 10 transcripts; delay "high" plus a prompt and keywords got
+# all 10 right. We only use the final text after commit, so a higher delay costs nothing.
+DEFAULT_DELAY = 'high'
+DEFAULT_KEYWORDS = ('pick up', 'green bottle', 'soda can')
+
+
+def noise_reduction(environ=os.environ):
+    """OpenAI-side input noise reduction: off unless DOTS_STT_NOISE_REDUCTION asks for it."""
+    value = environ.get('DOTS_STT_NOISE_REDUCTION', 'off').strip().lower()
+    if value in ('', 'off', 'none', '0'):
+        return None
+    if value not in NOISE_REDUCTION:
+        raise RuntimeError(f'DOTS_STT_NOISE_REDUCTION must be near_field, far_field or off, not {value!r}.')
+    return value
+
+
+def stt_delay(environ=os.environ):
+    value = environ.get('DOTS_STT_DELAY', DEFAULT_DELAY).strip().lower()
+    if value not in DELAYS:
+        raise RuntimeError(f'DOTS_STT_DELAY must be one of {", ".join(DELAYS)}, not {value!r}.')
+    return value
+
+
+def hints_for(name, environ=os.environ):
+    """Prompt and keywords for gpt-live-transcribe: the robot's name and its usual commands."""
+    name = (name or 'Kuro').strip()
+    raw = environ.get('DOTS_STT_KEYWORDS')
+    keywords = [k.strip() for k in raw.split(',')] if raw is not None else [name, *DEFAULT_KEYWORDS]
+    keywords = [re.sub(r'[<>\r\n]', ' ', k).strip() for k in keywords]
+    return dict(prompt=f'Short commands and questions spoken to a home robot named {name}, '
+                       'e.g. pick up the green bottle.',
+                keywords=[k for k in dict.fromkeys(keywords) if k])
+
+
+def session_config(model=MODEL, language='en', reduction=None, delay=None, hints=None):
+    transcription = dict(model=model, delay=delay or stt_delay())
     if language and language != 'auto':
         transcription['languages'] = [language]
-    return {'type': 'session.update', 'session': {'type': 'transcription', 'audio': {'input': {
-        'format': {'type': 'audio/pcm', 'rate': 24000},
-        'transcription': transcription, 'turn_detection': None}}}}
+    for key in ('prompt', 'keywords'):
+        if hints and hints.get(key):
+            transcription[key] = hints[key]
+    audio_input = {'format': {'type': 'audio/pcm', 'rate': 24000},
+                   'transcription': transcription, 'turn_detection': None}
+    reduction = noise_reduction() if reduction is None else reduction
+    if reduction:
+        audio_input['noise_reduction'] = {'type': reduction}
+    return {'type': 'session.update', 'session': {'type': 'transcription', 'audio': {'input': audio_input}}}
 
 
 class RealtimeTranscriber:
@@ -49,14 +93,14 @@ class RealtimeTranscriber:
         self.receiver.add_done_callback(self.failed)
 
     @classmethod
-    async def open(cls, emit, model=MODEL, language='en'):
+    async def open(cls, emit, model=MODEL, language='en', hints=None):
         key = load_key()
         # Some IPv6 routes connect TCP but stall during TLS on this Pi.
         # Prefer IPv4, retaining an automatic-family fallback for IPv6-only networks.
         families = (socket.AF_INET, socket.AF_INET, socket.AF_UNSPEC)
         for attempt, family in enumerate(families, 1):
             try:
-                return await cls.open_once(emit, model, language, key, family)
+                return await cls.open_once(emit, model, language, key, family, hints)
             except RealtimeUnavailable:
                 raise
             except Exception as error:
@@ -71,14 +115,14 @@ class RealtimeTranscriber:
                 await asyncio.sleep(attempt)
 
     @classmethod
-    async def open_once(cls, emit, model, language, key, family):
+    async def open_once(cls, emit, model, language, key, family, hints=None):
         socket = await connect('wss://api.openai.com/v1/realtime?intent=transcription',
                                additional_headers={'Authorization': 'Bearer ' + key},
                                family=family, happy_eyeballs_delay=.25, interleave=1,
                                open_timeout=12, close_timeout=2, max_size=2 * 1024 * 1024,
                                compression=None)
         try:
-            await socket.send(json.dumps(session_config(model, language)))
+            await socket.send(json.dumps(session_config(model, language, hints=hints)))
             async with asyncio.timeout(8):
                 while True:
                     event = json.loads(await socket.recv())
