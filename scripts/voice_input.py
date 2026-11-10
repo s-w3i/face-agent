@@ -515,14 +515,14 @@ class VoiceInput:
         state = global_status['status']
         return not (self.awake and state in ('IDLE', 'LISTENING') or not self.awake and state == 'SLEEPING')
 
-    async def follow_status(self, state):
+    async def follow_status(self, state, *, hold_input=False):
         """Choose local wake detection or command STT with capture closed."""
         target = False if state == 'SLEEPING' else True if state in ('IDLE', 'LISTENING') else self.awake
         if self.awake != target:
             await self.hold(True)
             await self.set_awake(target)
         self.turn_complete = False
-        await self.hold(state not in ('IDLE', 'LISTENING', 'SLEEPING'))
+        await self.hold(hold_input or state not in ('IDLE', 'LISTENING', 'SLEEPING'))
 
     async def sync_playback(self):
         try:
@@ -588,6 +588,10 @@ class VoiceInput:
                     self.direction(event.get('doa_deg'), event.get('utterance_id'))
                     try:
                         await self.publish_hint(await self.api('status'))
+                    except asyncio.CancelledError:
+                        # Mission updates may interrupt the input wait after this event was dequeued.
+                        self.inputs.put_nowait(event)
+                        raise
                     except (ValueError, OSError):
                         self.inputs.put_nowait(event)
                         await self.control(True)

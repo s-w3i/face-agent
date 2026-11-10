@@ -140,6 +140,8 @@ class RobotServer(ThreadingHTTPServer):
         self.generation = uuid.uuid4().hex
         self.command = dict(generation=self.generation, sequence=0, state='sleeping', level=None)
         self.robot_status = None
+        self.pick_visual=dict(generation=self.generation,sequence=0,mission_id=None,active=False)
+        self.pick_visual_until=0.;self.pick_visual_retired=set()
         self.wake_session = 0
         self.actions = []; self.ack = None; self.displays = 0
         self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
@@ -216,6 +218,27 @@ class RobotServer(ThreadingHTTPServer):
                 self.change_command(animation, level=None)
                 self.ack = None
             self.changed.notify_all()
+
+    def pick_visual_value(self):
+        remaining=max(0.,self.pick_visual_until-time.monotonic())
+        if self.pick_visual['active'] and remaining==0:
+            self.pick_visual=dict(self.pick_visual,active=False,sequence=self.pick_visual['sequence']+1)
+        return dict(self.pick_visual,ttl_ms=round(remaining*1000))
+
+    def update_pick_visual(self,mission_id,active):
+        current=self.pick_visual['mission_id']
+        if active:
+            if mission_id in self.pick_visual_retired:return False
+            if current and current!=mission_id:self.pick_visual_retired.add(current)
+            self.pick_visual_until=time.monotonic()+10.
+        else:
+            self.pick_visual_retired.add(mission_id)
+            if mission_id!=current:return False
+            self.pick_visual_until=0.
+        self.pick_visual=dict(generation=self.generation,sequence=self.pick_visual['sequence']+1,
+                              mission_id=mission_id,active=active)
+        self.changed.notify_all()
+        return True
 
     def api_key(self):
         key = os.environ.get('OPENAI_API_KEY', '').strip()
@@ -363,6 +386,12 @@ class RobotServer(ThreadingHTTPServer):
         return self.cached_announcement(self.startup_ready_text(sleeping=sleeping),
                                         'startup-ready', prepare=prepare)
 
+    def pick_announcement(self, text):
+        """Return a complete WAV; generate once per text/voice/model before playback."""
+        if not isinstance(text, str) or not 0 < len(text.strip()) <= 4096:
+            raise ValueError('Supply 1–4096 characters of picking announcement text.')
+        return self.cached_announcement(text.strip(), 'pick-announcements', prepare=True)
+
     def cached_announcement(self, text, cache_name, *, prepare=False):
         """Generate once per voice/text; cached playback never contacts the cloud."""
         voice = self.config()['settings'].get('ttsVoice', 'marin')
@@ -499,6 +528,7 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
                                     displays=self.server.displays, command=self.server.command, robotStatus=self.server.robot_status,
+                                    pickVisual=self.server.pick_visual_value(),
                                     acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value(),
                                     trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping',
                                     inputMode=self.server.input_mode, micForwardDeg=self.server.mic_forward,
@@ -531,6 +561,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.server.render_packs.upload(*upload.groups(), self.rfile.read(size))
                 self.reply(dict(saved=True)); return
             value = self.body()
+            if path == '/api/pick-visual':
+                self.local_voice()
+                if (not isinstance(value,dict) or set(value)!={'mission_id','active'} or
+                        not isinstance(value.get('mission_id'),str) or
+                        not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',value['mission_id']) or type(value.get('active')) is not bool):
+                    raise ValueError('Supply a mission_id and boolean active state.')
+                with self.server.changed:
+                    accepted=self.server.update_pick_visual(value['mission_id'],value['active'])
+                    self.reply(dict(accepted=accepted,visual=self.server.pick_visual_value()))
+                return
             if path == '/api/input-mode':
                 self.local_voice()
                 if not isinstance(value, dict) or set(value) - {'mode', 'micForwardDeg', 'micClockwise'} or value.get('mode') not in ('words', 'voice'):
@@ -611,8 +651,17 @@ class Handler(SimpleHTTPRequestHandler):
                 self.reply(dict(configured=True)); return
             if path == '/api/speech-stream':
                 self.local_voice(); self.stream_reply(self.server.speech_events(value)); return
-            if path in ('/api/speech', '/api/say', '/api/wake-ack', '/api/startup-ready'):
+            if path in ('/api/speech', '/api/say', '/api/wake-ack', '/api/startup-ready', '/api/pick-announcement'):
                 self.local_voice()
+                if path == '/api/pick-announcement':
+                    if (not isinstance(value, dict) or set(value) - {'text', 'prepare', 'statusRevision'}
+                            or type(value.get('prepare', False)) is not bool):
+                        raise ValueError('Supply picking text, prepare, or a robot status revision.')
+                    if value.get('prepare'):
+                        self.server.pick_announcement(value.get('text'))
+                        self.reply(dict(ready=True)); return
+                    if not isinstance(value.get('text'), str) or not 0 < len(value['text'].strip()) <= 4096:
+                        raise ValueError('Supply 1–4096 characters of picking announcement text.')
                 if path == '/api/wake-ack':
                     if not isinstance(value, dict) or set(value) - {'prepare', 'statusRevision'} or type(value.get('prepare', False)) is not bool:
                         raise ValueError('Supply prepare or a robot status revision for wake acknowledgment.')
@@ -639,7 +688,8 @@ class Handler(SimpleHTTPRequestHandler):
                     previous_sequence = self.server.command['sequence']
                 streaming = path == '/api/say' and isinstance(value, dict) and value.get('stream') is True
                 events = self.server.speech_events(value) if streaming else None
-                audio = (self.server.wake_ack() if path == '/api/wake-ack' else
+                audio = (self.server.pick_announcement(value['text']) if path == '/api/pick-announcement' else
+                         self.server.wake_ack() if path == '/api/wake-ack' else
                          self.server.startup_ready(sleeping=sleeping) if path == '/api/startup-ready' else
                          SpeechClip(next(events)) if streaming else self.server.speech(value))
                 if path == '/api/speech':
@@ -724,7 +774,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1; seen_faults = -1
+        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1; seen_faults = -1; seen_visual = -1
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -747,8 +797,11 @@ class Handler(SimpleHTTPRequestHandler):
                     gaze = self.server.gaze_value()
                     transcript = self.server.listening_text.copy()
                     fault_state = self.server.fault_table.public()
+                    pick_visual = self.server.pick_visual_value()
                 if command['sequence'] != seen_command:
                     self.event('command', command); seen_command = command['sequence']
+                if pick_visual['sequence'] != seen_visual:
+                    self.event('pick-visual',pick_visual);seen_visual=pick_visual['sequence']
                 if gaze['sequence'] != seen_gaze:
                     self.event('gaze', gaze); seen_gaze = gaze['sequence']
                 if transcript['sequence'] != seen_text:

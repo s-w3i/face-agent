@@ -25,7 +25,7 @@ class OnDemandCheck(unittest.IsolatedAsyncioTestCase):
         await server.list_tools()
         await server.cleanup()
         self.assertEqual({tool.name for tool in tools},
-                         {'navigate_to_region','get_robot_pose','cancel_navigation','navigate_to_pose','approach_object'})
+                         {'navigate_to_region','get_robot_pose','cancel_navigation','navigate_to_pose','approach_object','get_follow_target','follow_person','get_following_status','remember_person','find_person'})
         connector.assert_not_awaited()
         self.assertEqual((await server.list_prompts()).prompts,[])
 

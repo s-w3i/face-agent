@@ -68,7 +68,8 @@ def hints_for(name, environ=os.environ):
 
 def session_config(model=MODEL, language='en', reduction=None, delay=None, hints=None):
     transcription = dict(model=model, delay=delay or stt_delay())
-    if language and language != 'auto':
+    language = language or 'en'  # Never fall back to open-ended detection; only an explicit 'auto' opts out.
+    if language != 'auto':
         transcription['languages'] = [language]
     for key in ('prompt', 'keywords'):
         if hints and hints.get(key):

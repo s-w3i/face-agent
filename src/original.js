@@ -1,3 +1,4 @@
+import { PickVisual } from './pick-visual.js';
 import './style.css';
 import { attachVoiceMotion, voiceMotionPose } from './native-voice.js';
 import { REST_POSE } from './motion.js';
@@ -63,6 +64,8 @@ const framing = robotView ? new NativeFraming() : null;
 let configLoaded = false, fileConfig, saveQueued = null, saving = false, events, commandLevel = null, desiredState = 'idle', lastCommand = -1;
 let saveAfter = 0;
 let commandGeneration = '';
+const pickVisual = new PickVisual();
+let planningOverlay = false;
 const speech = new SpeechPlayer(text => {
   const subtitles = $('#robot-subtitles');
   if (subtitles) { subtitles.textContent = text; subtitles.hidden = !text; }
@@ -138,6 +141,7 @@ async function persistConfig(value) {
 }
 function connectRobot() {
   events = new EventSource('/api/events');
+  events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
   if (robotView) connectListeningText(events, $('#robot-listening-text'), () => framing?.reset());
   if (robotView) connectFaults(events, $('#fault-chip'));
   events.onopen = () => { $('#robot-connection').textContent = 'Connected'; api('actions', actions.map(({ id, label }) => ({ id, label }))).catch(error => toast(error.message)); };
@@ -165,7 +169,10 @@ function connectRobot() {
     else if (command.state === 'signature' && !signatureAvailable) error = 'Your customized outfit has no original signature. Use a named signature preview or wave.';
     else {
       desiredState = command.state;
-      playAction(command.speech ? 'idle' : command.state, false); commandLevel = command.level;
+      const target = command.speech ? 'idle' : pickVisual.state(command.state, performance.now());
+      const overlay = !command.speech && target !== command.state;
+      if (!(overlay && planningOverlay)) playAction(target, false);
+      planningOverlay = overlay; commandLevel = command.level;
       if (command.speech) {
         pendingSpeech = command;
         resumeRobotVoice();
@@ -392,7 +399,7 @@ function playAction(id, manual = true, keepSpeech = false) {
   const definition = actions.find(action => action.id === id); if (!definition) return;
   framing?.reset();
   if (!keepSpeech) stopSpeech();
-  if (manual) stopTour();
+  if (manual) { desiredState = id; stopTour(); }
   commandLevel = null;
   interruptAction();
   try {
@@ -406,7 +413,7 @@ function playAction(id, manual = true, keepSpeech = false) {
     } else startActivity(definition.activity || 7);
     if (definition.kind === 'voice') { voiceState = id; voiceTime = 0; voicePaused = false; }
     if (definition.duration) {
-      const action = activeAction = { definition, elapsed: 0, started: false, cue: 0, released: false, stopped: false };
+      const action = activeAction = { definition, manual, elapsed: 0, started: false, cue: 0, released: false, stopped: false };
       character.onFirstFrame(() => {
         if (activeAction !== action) return;
         $('#native-loading').hidden = true; syncVoiceControls();
@@ -474,6 +481,12 @@ function frame(now) {
     if (tourIndex >= 0 && !activeAction && now >= nextTourAt) { tourIndex++; stepTour(now); }
     try {
       const dt = Math.min(0.05, Math.max(0, (now - voiceNow) / 1000)); voiceNow = now;
+      const overlay = pickVisual.state(desiredState, now, !!pendingSpeech || !!activeAction?.manual || tourIndex >= 0) !== desiredState;
+      if (overlay && !planningOverlay) { planningOverlay = true; playAction('thinking', false, true); }
+      else if (!overlay && planningOverlay) {
+        planningOverlay = false;
+        if (current === 5 && !activeAction && !voiceState) playAction(desiredState, false, true);
+      }
       tickAction(dt, now / 1000);
       const randomAction = idleMovements.tick(dt, { idle: idleEligible() && !pointerInside,
         enabled: $('#native-auto').checked, reduced: $('#native-reduced').checked, signatureAvailable });

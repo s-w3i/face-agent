@@ -79,5 +79,78 @@
       "properties": {},
       "required": []
     }
+  },
+  {
+    "name": "get_follow_target",
+    "description": "Read the nearest fresh unambiguous depth-valid person; identity_id is null for an unknown person. No movement. This is proximity selection, not speaker identification.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "follow_person",
+    "description": "Start real continuous person following. Supply a freshly resolved enrolled identity_id to follow directly without enrollment. Omit identity_id to enroll the nearest unknown person without a name, confirm recognition, then follow. enabled=false stops and confirms termination. Success means started, not completed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "identity_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 999999999
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_following_status",
+    "description": "Read selected identity, operation ID, current following state and latest error. No movement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "remember_person",
+    "description": "Enroll the single visible person with their stated name and confirm face recognition; never automatically retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "find_person",
+    "description": "Find a previously enrolled person by name in the current camera view.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    }
   }
 ]

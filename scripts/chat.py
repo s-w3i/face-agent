@@ -29,8 +29,11 @@ from ros_wake import RosWake, WakeRequest
 from ros_status import RosStatus
 from robot_states import INPUT_STATES
 from navigation_mcp import OnDemandNavigationMCP
+from vision_mcp import OnDemandVisionMCP, VISION_INSTRUCTIONS
+from mission_client import MissionClient
 from camera_vision import CameraFeed, capture_camera, VisionUnavailable, without_camera_images
 from camera_snapshot import DEFAULT_TOPIC
+from face_task_session import TaskSession, TaskMCP, serve as serve_face_tasks, SOCKET as FACE_TASK_SOCKET, TERMINAL as TASK_TERMINAL
 
 IDLE_SECONDS = 5.0
 WAKE_CAPTURE_OFFSET = 0.05  # Seconds after the wake hit where a follow-on command capture starts.
@@ -116,8 +119,24 @@ def robot_name(url):
     return name if isinstance(name, str) and name.strip() else 'Robot companion'
 
 
+def pick_submission_reply(submission):
+    if submission.get('accepted') or submission.get('code') == 'ACCEPTED':
+        return ''
+    return {
+        'OBJECT_REQUIRED':"Which object would you like me to pick up?",
+        'UNKNOWN':"I couldn't confirm the picking request. Please check the robot.",
+        'STARTUP_NOT_READY':"The arm and base startup checks are not ready yet. Please check NovaZone.",
+        'PICKING_NOT_READY':"NovaZone is still loading or busy. Please wait until it is ready.",
+        'STARTUP_VERIFICATION_REQUIRED':"The controllers restarted. Please verify the empty gripper and stopped robot in NovaZone before I pick.",
+        'PICK_RECOVERY_REQUIRED':"The previous pick still needs recovery. Please check the arm and base feedback.",
+        'NAV_STATE_UNCERTAIN':"The previous motion needs a safety check before I can pick again.",
+        'MISSION_BUSY':"I am still working on the previous task.",
+        'UNAVAILABLE':"The picking planner is unavailable right now.",
+    }.get(submission.get('code'), "I can't start picking right now.")
+
+
 class Chatbot:
-    def __init__(self, url, model=None, *, vision=True, camera_topic=None, camera_feed=None, navigation_mcp=False, navigation_mock=False):
+    def __init__(self, url, model=None, *, vision=True, camera_topic=None, camera_feed=None, navigation_mcp=False, navigation_mock=False, vision_mcp=False):
         self.url = url
         self.history = []
         self.animated = False
@@ -125,6 +144,7 @@ class Chatbot:
         self.status_managed = False
         self.vision_calls = 0
         self.faults = faults.NULL
+        self.face_task = None
 
         @function_tool
         async def look_at_camera(question: str, crop: list[float] | None = None):
@@ -162,6 +182,49 @@ class Chatbot:
             """End the conversation when the user says goodbye or thanks with no further request. Sleep happens after your closing reply finishes."""
             self.sleep_requested = True
             return 'Give a brief natural closing reply. The runtime will then put the robot to sleep.'
+
+        @function_tool
+        def task_progress(state: str, message: str) -> str:
+            """Record task progress: running, waiting, completed, or blocked, with a concise factual message."""
+            if self.face_task is None:
+                return 'There is no active task.'
+            return self.face_task.progress(state, message)
+
+        async def ros_read(arguments):
+            process = await asyncio.create_subprocess_exec(
+                '/bin/bash', '-c', 'source /opt/ros/jazzy/setup.bash; exec ros2 "$@"',
+                'face_task_ros_read', *arguments,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, err = await asyncio.wait_for(process.communicate(), 12)
+            except (asyncio.CancelledError, TimeoutError):
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                raise
+            if process.returncode:
+                return 'ROS read unavailable: ' + (err or out).decode('utf-8', 'replace')[:2000]
+            return out.decode('utf-8', 'replace')[:12000] or 'No data received.'
+
+        @function_tool
+        async def list_ros_topics() -> str:
+            """List discoverable ROS topic names without publishing or changing robot state."""
+            return await ros_read(['topic', 'list'])
+
+        @function_tool
+        async def read_ros_topic(topic: str, field: str = '') -> str:
+            """Read one message from a ROS topic, optionally a dot-separated field; never publish. Arrays are omitted unless a field is selected."""
+            if not re.fullmatch(r'/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*', topic):
+                return 'Provide an absolute ROS topic name.'
+            if field and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*', field):
+                return 'Provide a dot-separated message field name.'
+            arguments = ['topic', 'echo', '--once', '--timeout', '7', '--truncate-length', '32']
+            arguments += ['--field', field] if field else ['--no-arr']
+            return await ros_read(arguments + [topic])
+
+        self.task_progress_tool = task_progress
+        self.task_ros_tools = [list_ros_topics, read_ros_topic]
+        self.task_observation_tools = ([look_at_camera] if vision else []) + self.task_ros_tools + [task_progress]
 
         @function_tool
         def animate(state: str) -> str:
@@ -240,6 +303,7 @@ class Chatbot:
                     'announcing routing, camera tools, image metadata, or a separate vision analysis. '
                     if vision else 'Camera vision is disabled. Do not claim to see the user or their surroundings. '
                 ) +
+                (VISION_INSTRUCTIONS if vision_mcp else '') +
                 'Use animation tools when asked to move or express an emotion. '
                 'Never claim an animation succeeded unless the tool confirms it. '
                 'Use current_datetime for the current date/time and before looking up time-sensitive facts. '
@@ -273,6 +337,17 @@ class Chatbot:
                     'Do not call turtlesim tools or any real robot endpoint. '
                     if navigation_mock else
                     'Robot navigation MCP tools control the real robot through Nav2. '
+                    'When the user introduces their own name or asks to be remembered by name, call remember_person with that name to enroll the single visible person. Self-introductions such as "My name is Furia", "I am Furia", and "Call me Furia" require enrollment even without the word remember. A greeting without a self-introduction does not require enrollment. Reuse an already confirmed identity rather than creating a duplicate for a repeated introduction. Do not merely promise to remember them in conversation. Report success only if the tool confirms enrollment; otherwise explain the failure and do not automatically retry. Never assert the visible person is the speaker when multiple people are visible. '
+                    'When asked to find or recognize an enrolled person by name, call find_person and report only its confirmed result. '
+                    'For an explicit follow-me request, first call get_follow_target for fresh nearest-person evidence. '
+                    'If its person.identity_id is a valid enrolled ID, call follow_person with that identity_id directly; never enroll them again. '
+                    'If identity_id is null, call follow_person without an ID; the backend enrolls the nearest unknown person without a name, '
+                    'waits for recognition, then starts following. Do not ask for a name or invent an identity. '
+                    'Nearest selection can choose someone other than the speaker. Do not claim speaker identification. '
+                    'Only report following started after success=true and following=true; following continues until explicitly stopped. '
+                    'For following status call get_following_status; for an explicit stop call cancel_navigation and require cancellation_confirmed=true. '
+                    'Do not automatically replay enrollment or following after errors, or cancel following on goodbye/sleep. '
+
                     'The remote server is contacted only when you call a navigation tool. '
                     'Do not call navigation tools for greetings, wake-up, or ordinary conversation. '
                     'If navigation is unavailable, explain that and continue chatting; never invent success. '
@@ -315,20 +390,53 @@ class Chatbot:
         except (ValueError, OSError):
             pass  # Chat still works with the display closed or service offline.
 
-    async def reply(self, text, *, motion_update=False):
+    async def reply(self, text, *, motion_update=False, task_tick=False):
         """Accept typed or transcribed text with the same history and tools."""
         if not isinstance(text, str) or not text.strip() or len(text) > 12000:
             raise ValueError('Enter between 1 and 12000 characters.')
         self.animated = False
         self.sleep_requested = False
         self.vision_calls = 0
+        self._pick_submission_result = None
         if not self.status_managed:
             self.show_state('thinking')
         succeeded = False
         try:
-            agent = self.agent.clone(tools=[], mcp_servers=[]) if motion_update else self.agent
+            pick_client = getattr(self, 'pick_mission_client', None)
+            command = text.strip()
+            if pick_client is not None and not motion_update and not (self.face_task and self.face_task.active):
+                if command.lower().startswith('hi '):
+                    command = re.sub(r'^hi\s+' + re.escape(robot_name(self.url)) + r'(?=$|[\s,.!?])[\s,.!?]*', '', command, count=1, flags=re.I)
+                if re.match(r'^(?:(?:please|can you|could you|would you|i want you to|i would like you to)\s+)*(?:pick\s*up|grasp)\b', command, re.I):
+                    # The gripper-camera planner owns pickup perception, not head-camera chat.
+                    submission = await pick_client.submit(command)
+                    answer = pick_submission_reply(submission)
+                    self.history += [{'role':'user','content':text.strip()}, {'role':'assistant','content':answer or 'Pickup request accepted for interpretation; completion is unconfirmed.'}]
+                    succeeded = True
+                    return answer
+            if self.face_task is not None and self.face_task.active and not motion_update:
+                original_instructions = self.agent.instructions
+                def task_instructions(context, agent):
+                    base = original_instructions(context, agent) if callable(original_instructions) else original_instructions
+                    extra = ('\nThis is an observation-only check. Do not command movement, change state on external services, '
+                             'enroll identities, or claim an event without evidence. If nothing requires action, '
+                             'respond exactly TASK_WAIT. If an event requires further action, record running '
+                             'with task_progress and briefly describe the evidence.' if task_tick else '')
+                    return base + self.face_task.guidance() + extra
+                tools = self.task_observation_tools if task_tick else self.agent.tools + self.task_ros_tools + [self.task_progress_tool]
+                servers = [TaskMCP(server, self.face_task, read_only=task_tick) for server in self.agent.mcp_servers]
+                agent = self.agent.clone(instructions=task_instructions, tools=tools, mcp_servers=servers)
+            else:
+                agent = self.agent.clone(tools=[], mcp_servers=[]) if motion_update else self.agent
             result = await Runner.run(agent, self.history + [{'role': 'user', 'content': text.strip()}])
-            self.history = without_camera_images(result.to_input_list())
+            if not (task_tick and str(result.final_output).strip() == 'TASK_WAIT' and
+                    self.face_task and self.face_task.state == 'waiting'):
+                self.history = without_camera_images(result.to_input_list())
+            submission = getattr(self, '_pick_submission_result', None)
+            self._pick_submission_result = None
+            if submission is not None:
+                succeeded = True
+                return pick_submission_reply(submission)
             succeeded = True
             return spoken_reply(str(result.final_output))
         finally:
@@ -544,6 +652,7 @@ async def connect_navigation_mcp(stack, endpoint, *, require_mock=False):
 
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--pick-missions', action=argparse.BooleanOptionalAction, default=os.environ.get('DOTS_PICK_MISSIONS', '1') == '1')
     parser.add_argument('--url', default=os.environ.get('DOTS_URL', 'http://127.0.0.1:5173'))
     parser.add_argument('--model', default=os.environ.get('OPENAI_CHAT_MODEL'), help='Override the default gpt-6-luna model.')
     parser.add_argument('--speak', action=argparse.BooleanOptionalAction, default=True,
@@ -555,6 +664,8 @@ async def main():
     parser.add_argument('--navigation-mcp-mock', action=argparse.BooleanOptionalAction,
                         default=os.environ.get('DOTS_NAV_MCP_MOCK', '0').strip().lower() in ('1', 'true', 'yes'),
                         help='Require a mock-only endpoint and describe every arrival as simulated.')
+    parser.add_argument('--vision-mcp-url', default=os.environ.get('DOTS_VISION_MCP_URL', 'http://192.168.10.13:8001/mcp'),
+                        help='Separate Jetson vision MCP; empty string disables it. Connects only on tool calls.')
     parser.add_argument('--check-navigation-mcp', action='store_true',
                         help='Check remote tools and pose, then exit without starting voice or requesting movement.')
     parser.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
@@ -614,6 +725,7 @@ async def main():
         except (ValueError, OSError):
             pass  # Typed chat remains available with the display service offline.
     async with AsyncExitStack() as stack:
+        args.mission_client = await stack.enter_async_context(MissionClient(speech_required=args.speak,visual_url=args.url)) if args.pick_missions else None
         camera_feed = await stack.enter_async_context(CameraFeed(args.camera_topic)) if args.vision else None
         if args.track:
             stack.enter_context(start_tracking(args.url, args.faults))
@@ -729,24 +841,85 @@ async def recover_voice(status, voice, error, reporter=faults.NULL):
     return False
 
 
+async def mission_input(read, client):
+    if client is None:
+        return await read
+    reading = asyncio.create_task(read)
+    announcement = asyncio.create_task(client.announcements.get())
+    activity = asyncio.create_task(client.state_changed.wait())
+    try:
+        done, _ = await asyncio.wait({reading, announcement, activity}, return_when=asyncio.FIRST_COMPLETED)
+        if reading in done:
+            if announcement in done:
+                client.announcements.put_nowait(announcement.result())
+            return reading.result()
+        if announcement in done:
+            return announcement.result()
+        client.state_changed.clear()
+        return {'_mission_state_changed': True}
+    finally:
+        for task in (reading, announcement, activity):
+            if not task.done():task.cancel()
+        await asyncio.gather(reading, announcement, activity, return_exceptions=True)
+
+
 async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed=None):
     """The global topic owns input permission; external changes interrupt a turn."""
     navigation_mcp = bool(getattr(args, 'navigation_mcp_url', '') and not getattr(args, 'turtlesim', False))
     simulation_server = None if navigation_mcp else server
     bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed, navigation_mcp=navigation_mcp,
-                  navigation_mock=navigation_mcp and getattr(args, 'navigation_mcp_mock', False))
+                  navigation_mock=navigation_mcp and getattr(args, 'navigation_mcp_mock', False),
+                  vision_mcp=bool(getattr(args, 'vision_mcp_url', '') and getattr(args, 'vision', True)))
     bot.status_managed = True
     reporter = getattr(args, 'faults', None) or faults.NULL
     bot.faults = reporter
-    if server:
-        bot.agent.mcp_servers = [server]
+    bot.agent.mcp_servers = [server] if server else []
+    if getattr(args, 'vision_mcp_url', '') and getattr(args, 'vision', True):
+        bot.agent.mcp_servers.append(OnDemandVisionMCP(args.vision_mcp_url))
     motions = queue.Queue()
+    if getattr(args, "mission_client", None):
+        args.mission_client.attach(bot, motions)
     shutdown = threading.Event()
     operation = None
+    task_turn_active = False
+    task_interrupted = False
+    task_listening = False
     voice_restart_needed = False
     barge = None  # (interrupted status, WakeWord) after a deliberate barge-in
     barge_states = ('THINKING', 'SPEAKING') if getattr(args, 'barge_in_speaking', False) else ('THINKING',)
     changed = asyncio.Event()
+
+    async def cancel_face_task():
+        nonlocal task_interrupted
+        if task_turn_active and operation and not operation.done():
+            task_interrupted = True
+            operation.cancel()
+        if not face_task.motion_requested:
+            return True, 'Task stopped. No task navigation was requested.'
+        navigation = next((server for server in bot.agent.mcp_servers if isinstance(server, OnDemandNavigationMCP)), None)
+        if navigation is None:
+            return False, 'Task interrupted; navigation cancellation is unconfirmed. Check the robot before another task.'
+        try:
+            result = await asyncio.wait_for(navigation.call_tool('cancel_navigation', {}), 45)
+            payload = getattr(result, 'structured_content', None)
+            if not isinstance(payload, dict):
+                payload = json.loads(next(part.text for part in result.content if part.type == 'text'))
+            if payload.get('success') is True and payload.get('cancellation_confirmed') is True:
+                return True, 'Task stopped and navigation cancellation confirmed.'
+        except Exception:
+            pass
+        return False, 'Task interrupted; navigation cancellation is unconfirmed. Check the robot before another task.'
+
+    face_task = TaskSession(motions,
+        lambda: bool(status.current and status.current.status in ('IDLE', 'SLEEPING') and
+                     not changed.is_set() and not getattr(getattr(args, 'mission_client', None), 'active', False)),
+        cancel_face_task)
+    bot.face_task = face_task
+    try:
+        task_server = await serve_face_tasks(face_task)
+    except (OSError, RuntimeError) as error:
+        task_server = None
+        print('Task control unavailable: ' + str(error), file=sys.stderr, flush=True)
     # The initial retained sample was already consumed by RosStatus.__aenter__.
     while not status.events.empty():
         status.events.get_nowait()
@@ -765,6 +938,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         nonlocal barge
         while True:
             wake = await voice.barge_ins.get()
+            if face_task.active:
+                continue
             current = status.current
             if not getattr(args, 'barge_in', True) or current is None or current.status not in barge_states:
                 print(f'Wake word heard during {current.status if current else "?"}; no barge-in.', flush=True)
@@ -829,13 +1004,59 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         finally:
             stopped.set()
 
-    async def turn(text, motion_update=False):
+    async def sleeping_input_or_task(read):
+        reading = asyncio.create_task(mission_input(read, getattr(args, 'mission_client', None)))
+        waking = asyncio.create_task(face_task.wake_event.wait())
+        try:
+            done, _ = await asyncio.wait((reading, waking), return_when=asyncio.FIRST_COMPLETED)
+            if reading in done:
+                return reading.result()
+            return {'_face_task': 'wake'}
+        finally:
+            for task in (reading, waking):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(reading, waking, return_exceptions=True)
+
+    async def paused_task_input():
+        # VoiceInput.read only drains notices and advances its timeout when capture is open.
+        reading = asyncio.create_task(voice.read(None))
+        deadline = time.monotonic() + 12.0
+        try:
+            while True:
+                if reading.done():
+                    return reading.result()
+                try:
+                    return motions.get_nowait()
+                except queue.Empty:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                await asyncio.sleep(.05)
+        finally:
+            reading.cancel()
+            await asyncio.gather(reading, return_exceptions=True)
+
+    async def wake_for_task():
+        if voice:
+            await gate(True)
+            await microphone_action(voice.set_awake(True))
+        await set_state('IDLE')
+
+    async def turn(text, motion_update=False, task_tick=False):
+        nonlocal task_listening
         if voice:
             await gate(True)
         await set_state('THINKING')
-        answer = await bot.reply(text, motion_update=motion_update)
-        closing = not motion_update and closing_message(text, robot_name(args.url),
+        answer = (await bot.reply(text, motion_update=motion_update, task_tick=True) if task_tick
+                  else await bot.reply(text, motion_update=motion_update))
+        closing = not face_task.active and not motion_update and closing_message(text, robot_name(args.url),
                                                         agent_requested=bot.sleep_requested is True)
+        if not answer or (task_tick and answer.strip() == 'TASK_WAIT'):
+            await set_state('IDLE')
+            return
+        if face_task.active:
+            task_listening = '?' in answer or '？' in answer
         print('robot> ' + answer, flush=True)
         speech = None
         if args.speak:
@@ -847,6 +1068,28 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
         if args.speak and speech and not await wait_for_speech(speech, args.url):
             raise RuntimeError('Speech playback failed or was interrupted.')
         await set_state('SLEEPING' if closing else 'IDLE')
+
+    async def speak_pick(event):
+        client = args.mission_client
+        if not client.current_announcement(event):return
+        previous = status.current.status
+        played = False
+        try:
+            if voice:await gate(True)
+            await set_state('SPEAKING')
+            await wait_display(status.current.revision)
+            print('robot> ' + event['_speech_text'], flush=True)
+            if args.speak:
+                async with asyncio.timeout(20):
+                    speech = await asyncio.to_thread(request, args.url, 'pick-announcement', dict(
+                        text=event['_speech_text'], statusRevision=status.current.revision))
+                    played = await wait_for_speech(speech, args.url)
+        except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+            print('Picking speech failed: ' + str(error), file=sys.stderr)
+        finally:
+            await asyncio.shield(client.acknowledge(event, played))
+            if not changed.is_set():
+                await set_state(previous if previous in (*INPUT_STATES, 'SLEEPING') else 'IDLE')
 
     async def wake_up(wake=None):
         # "Hi Kuro, what time is it?": the user is still talking, so skip the spoken ack
@@ -888,9 +1131,9 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 print('Follow-on command capture was not accepted (' + str(getattr(voice, 'capture_refusal', None)) +
                       '); listening normally.', flush=True)
 
-    async def run_turn(text, motion_update):
+    async def run_turn(text, motion_update, task_tick=False):
         try:
-            await turn(text, motion_update)
+            await turn(text, motion_update, task_tick)
         except TimeoutError as error:
             raise RuntimeError('Robot reply, status update or playback timed out.') from error
 
@@ -917,7 +1160,8 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                         operation = asyncio.create_task(voice.restart(awake=current.status != 'SLEEPING'))
                         await operation
                         voice_restart_needed = False
-                    operation = asyncio.create_task(microphone_action(voice.follow_status(current.status)))
+                    operation = asyncio.create_task(microphone_action(voice.follow_status(
+                        current.status, hold_input=face_task.active and not task_listening)))
                     await operation
                     if barge is not None:
                         interrupted, wake = barge
@@ -928,15 +1172,46 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                             # Keep what was said straight after "Hi Kuro" ("…stop, what's the weather?").
                             operation = asyncio.create_task(microphone_action(voice.start_capture(wake.t + WAKE_CAPTURE_OFFSET)))
                             await operation
+                input_timeout = (12.0 if face_task.active else
+                                 None if getattr(getattr(args,'mission_client',None),'active',False) else IDLE_SECONDS)
                 if not accepting:
                     # Voice.read keeps /quit usable even while microphone capture is paused.
-                    operation = asyncio.create_task(voice.read(None) if voice else terminal_read(None))
+                    read = voice.read(None) if voice else terminal_read(None)
+                    operation = asyncio.create_task(sleeping_input_or_task(read) if current.status == 'SLEEPING'
+                                                    else mission_input(read, getattr(args,'mission_client',None)))
                 elif voice:
-                    operation = asyncio.create_task(voice.read(IDLE_SECONDS, notices=motions))
+                    read = paused_task_input() if face_task.active and not task_listening else voice.read(input_timeout, notices=motions)
+                    operation = asyncio.create_task(mission_input(read, getattr(args,'mission_client',None)))
                 else:
-                    operation = asyncio.create_task(terminal_read(IDLE_SECONDS))
+                    operation = asyncio.create_task(mission_input(terminal_read(input_timeout), getattr(args,'mission_client',None)))
                 text = await operation
                 operation = None
+                if isinstance(text, dict) and text.get('_mission_state_changed'):
+                    continue
+                if isinstance(text, dict) and text.get('_face_task') == 'wake':
+                    face_task.wake_event.clear()
+                    if face_task.state == 'queued' and current.status == 'SLEEPING':
+                        operation = asyncio.create_task(wake_for_task())
+                        await operation
+                    continue
+                if isinstance(text, dict) and text.get('_pick_announcement'):
+                    operation = asyncio.create_task(speak_pick(text))
+                    await operation
+                    continue
+                if isinstance(text, dict) and text.get('_face_task') == 'ended':
+                    if text.get('generation') != face_task.generation:
+                        continue
+                    if face_task.saved_history is not None:
+                        bot.history, face_task.saved_history = face_task.saved_history, None
+                    continue
+                if isinstance(text, dict) and text.get('_face_task') == 'start':
+                    if face_task.state != 'queued' or text.get('generation') != face_task.generation:
+                        continue
+                    face_task.wake_event.clear()
+                    face_task.saved_history, bot.history = bot.history, list(bot.history)
+                    task_listening = False
+                    face_task.state, face_task.message = 'running', 'Starting task.'
+                    text = 'Start the active task. Examine its steps and available tools, then begin.'
                 if text == '/quit':
                     break
                 if text == '/reset':
@@ -968,18 +1243,72 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                         continue
                 elif not accepting:
                     continue
+                if face_task.active and isinstance(text, str) and not text.startswith('/'):
+                    task_listening = False
                 motion_update = isinstance(text, dict)
                 if motion_update:
                     text = ('Runtime motion event (not a new user command): ' + json.dumps(text) +
-                            '. Tell the user naturally that movement finished or failed. Do not start another motion or call tools.')
+                            '. Tell the user the actual reported mission phase or terminal outcome, including any verification limits. Do not start another motion or call tools.')
+                task_turn_active = face_task.active
                 operation = asyncio.create_task(run_turn(text, motion_update))
                 await operation
+                task_turn_active = False
+                if face_task.state in TASK_TERMINAL and face_task.saved_history is not None:
+                    bot.history, face_task.saved_history = face_task.saved_history, None
+                elif face_task.state == 'running':
+                    face_task.progress('waiting', 'Waiting for the next event or response.')
             except asyncio.CancelledError:
+                task_turn_active = False
+                if task_interrupted:
+                    task_interrupted = False
+                    if status.current and status.current.status in ('THINKING', 'SPEAKING') and not changed.is_set():
+                        await status.set('IDLE', expected_revision=status.current.revision)
+                    continue
                 if barge is None and not changed.is_set():
                     raise
+                if face_task.active:
+                    face_task.safety_blocked = face_task.motion_requested
+                    face_task.progress('blocked', 'Task interrupted; verify any requested robot motion before restarting.')
+                    if face_task.saved_history is not None:
+                        bot.history, face_task.saved_history = face_task.saved_history, None
                 # Do not publish an old turn's result after a barge-in or another node takes control.
                 continue
             except TimeoutError:
+                if face_task.active and face_task.state == 'waiting' and not changed.is_set():
+                    task_turn_active = True
+                    operation = asyncio.create_task(run_turn('Check whether the task can progress using read-only observation. If nothing changed, return TASK_WAIT.', False, True))
+                    try:
+                        await operation
+                        if face_task.state == 'running':
+                            operation = asyncio.create_task(run_turn('An observed event may allow the task to continue. Use the evidence and proceed only as warranted.', False))
+                            await operation
+                        if face_task.state == 'running':
+                            face_task.progress('waiting', 'Waiting for the next event or response.')
+                        elif face_task.state in TASK_TERMINAL and face_task.saved_history is not None:
+                            bot.history, face_task.saved_history = face_task.saved_history, None
+                    except asyncio.CancelledError:
+                        if task_interrupted:
+                            task_interrupted = False
+                            if status.current and status.current.status in ('THINKING', 'SPEAKING') and not changed.is_set():
+                                await status.set('IDLE', expected_revision=status.current.revision)
+                        elif barge is None and not changed.is_set():
+                            raise
+                        elif face_task.active:
+                            face_task.safety_blocked = face_task.motion_requested
+                            face_task.progress('blocked', 'Task interrupted; verify any requested robot motion before restarting.')
+                            if face_task.saved_history is not None:
+                                bot.history, face_task.saved_history = face_task.saved_history, None
+                    except Exception as error:
+                        face_task.safety_blocked = face_task.motion_requested
+                        face_task.progress('blocked', 'Task observation failed: ' + str(error)[:400])
+                        if face_task.saved_history is not None:
+                            bot.history, face_task.saved_history = face_task.saved_history, None
+                        print('Task observation failed: ' + str(error), file=sys.stderr, flush=True)
+                    finally:
+                        task_turn_active = False
+                    continue
+                if getattr(getattr(args,'mission_client',None),'active',False):
+                    continue
                 if not changed.is_set():
                     operation = asyncio.create_task(set_state('SLEEPING'))
                     try:
@@ -1009,6 +1338,11 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
             except Exception as error:
                 if barge is not None:
                     continue  # Playback stopped by our own barge-in: not an error.
+                if face_task.active:
+                    face_task.safety_blocked = face_task.motion_requested
+                    face_task.progress('blocked', 'Task execution failed: ' + str(error)[:400])
+                    if face_task.saved_history is not None:
+                        bot.history, face_task.saved_history = face_task.saved_history, None
                 print('Robot error: ' + str(error), file=sys.stderr)
                 if status.current and not changed.is_set():
                     await status.set('ERROR', expected_revision=status.current.revision)
@@ -1019,6 +1353,10 @@ async def status_chat_loop(args, status, server=None, voice=None, *, camera_feed
                 operation = None
     finally:
         shutdown.set()
+        if task_server is not None:
+            task_server.close()
+            await task_server.wait_closed()
+            FACE_TASK_SOCKET.unlink(missing_ok=True)
         if voice:
             try:
                 await gate(True)
@@ -1035,10 +1373,14 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
     navigation_mcp = bool(getattr(args, 'navigation_mcp_url', '') and not getattr(args, 'turtlesim', False))
     simulation_server = None if navigation_mcp else server
     bot = Chatbot(args.url, args.model, vision=getattr(args, 'vision', True), camera_topic=getattr(args, 'camera_topic', None), camera_feed=camera_feed, navigation_mcp=navigation_mcp,
-                  navigation_mock=navigation_mcp and getattr(args, 'navigation_mcp_mock', False))
-    if server:
-        bot.agent.mcp_servers = [server]
-    notices = wake.requests if wake else queue.Queue() if simulation_server else None
+                  navigation_mock=navigation_mcp and getattr(args, 'navigation_mcp_mock', False),
+                  vision_mcp=bool(getattr(args, 'vision_mcp_url', '') and getattr(args, 'vision', True)))
+    bot.agent.mcp_servers = [server] if server else []
+    if getattr(args, 'vision_mcp_url', '') and getattr(args, 'vision', True):
+        bot.agent.mcp_servers.append(OnDemandVisionMCP(args.vision_mcp_url))
+    notices = wake.requests if wake else queue.Queue() if simulation_server or getattr(args, 'mission_client', None) else None
+    if getattr(args, 'mission_client', None):
+        args.mission_client.attach(bot, notices)
     shutdown = threading.Event()
     watcher = asyncio.create_task(watch_motion(simulation_server, notices)) if simulation_server else None
     awake = False
@@ -1071,14 +1413,22 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
             conversation_closed = False
             bot.show_state('listening')
 
+    async def terminal_read(timeout):
+        stopped = threading.Event()
+        try:
+            return await asyncio.to_thread(read_terminal, timeout, speech=speech_command,
+                url=args.url, notices=notices, shutdown=stopped)
+        finally:
+            stopped.set()
+
     try:
         while True:
             try:
+                input_timeout = IDLE_SECONDS if awake and not getattr(getattr(args,'mission_client',None),'active',False) else None
                 if voice:
-                    text = await voice.read(IDLE_SECONDS if awake else None, notices=notices)
-                elif server or wake:
-                    text = await asyncio.to_thread(read_terminal, IDLE_SECONDS if awake else None,
-                                                   speech=speech_command, url=args.url, notices=notices, shutdown=shutdown)
+                    text = await mission_input(voice.read(input_timeout, notices=notices), getattr(args,'mission_client',None))
+                elif server or wake or getattr(args, "mission_client", None):
+                    text = await mission_input(terminal_read(input_timeout), getattr(args,'mission_client',None))
                 else:
                     text = read_terminal(IDLE_SECONDS if awake else None, speech=speech_command, url=args.url)
                 speech_command = None
@@ -1088,6 +1438,8 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
                 print('Kuro is asleep with local wake detection. Say "Hi Kuro" to retry.', flush=True)
                 continue
             except TimeoutError:
+                if getattr(getattr(args,'mission_client',None),'active',False):
+                    continue
                 speech_command = None
                 await finish_turn(True)
                 print('Kuro is asleep after 5 seconds of inactivity.', flush=True)
@@ -1095,6 +1447,24 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
+            if isinstance(text, dict) and text.get('_mission_state_changed'):
+                continue
+            if isinstance(text, dict) and text.get('_pick_announcement'):
+                client = args.mission_client
+                if not client.current_announcement(text):continue
+                played = False
+                try:
+                    if voice:await voice.hold(True)
+                    print('robot> ' + text['_speech_text'], flush=True)
+                    if args.speak:
+                        async with asyncio.timeout(20):
+                            speech = await asyncio.to_thread(request, args.url, 'pick-announcement', {'text':text['_speech_text']})
+                            played = await wait_for_speech(speech,args.url)
+                finally:
+                    await asyncio.shield(client.acknowledge(text,played))
+                    await finish_turn(False)
+                    if not awake:bot.show_state('sleeping')
+                continue
             if isinstance(text, WakeWord):
                 if awake:
                     continue
@@ -1173,6 +1543,9 @@ async def chat_loop(args, server=None, voice=None, wake=None, *, camera_feed=Non
                 continue
             closing_turn = closing_turn or (not motion_update and closing_message(
                 text, robot_name(args.url), agent_requested=bot.sleep_requested is True))
+            if not answer:
+                await finish_turn(False)
+                continue
             print('robot> ' + answer)
             if args.speak:
                 try:

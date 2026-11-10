@@ -1,3 +1,4 @@
+import { PickVisual } from './pick-visual.js';
 import './style.css';
 import { BakedRenderer, bakedFrame, matchingBake } from './prerendered.js';
 import { IdleMovements } from './native-actions.js';
@@ -35,6 +36,8 @@ export async function startBakedDisplay(config) {
   const canvas = $('#original-character'), renderer = new BakedRenderer(canvas, manifest);
   const clips = new Map(manifest.clips.map(clip => [clip.id, clip]));
   const idle = new IdleMovements(); idle.reset(config.settings.idleInterval);
+  const pickVisual = new PickVisual();
+  let desiredState = 'idle', planningOverlay = false;
   let active, elapsed = 0, started = 0, commandLevel = null, smoothedLevel = 0, lastFrame = 0, drawn = '';
   let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision;
   const speech = new SpeechPlayer(text => { $('#robot-subtitles').textContent = text; $('#robot-subtitles').hidden = !text; drawn = ''; });
@@ -90,6 +93,7 @@ export async function startBakedDisplay(config) {
   renderer.prepare(clips.get('speaking')).catch(error => toast(error.message));
   await api('actions', manifest.clips.map(({ id, label }) => ({ id, label })));
   events = new EventSource('/api/events');
+  events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
   connectListeningText(events, $('#robot-listening-text'), () => { drawn = ''; });
   connectFaults(events, $('#fault-chip'));
   events.onopen = status;
@@ -110,9 +114,13 @@ export async function startBakedDisplay(config) {
     const command = JSON.parse(event.data);
     if (command.generation === generation && command.sequence <= lastCommand) return;
     generation = command.generation; lastCommand = command.sequence;
+    desiredState = command.state;
     let error = '';
     try {
-      await play(command.speech ? 'idle' : command.state);
+      const target = command.speech ? 'idle' : pickVisual.state(command.state, performance.now());
+      const overlay = !command.speech && target !== command.state;
+      if (!(overlay && planningOverlay)) await play(target);
+      planningOverlay = overlay;
       if (command.generation !== generation || command.sequence !== lastCommand) return;
       commandLevel = command.level;
       if (command.speech) {
@@ -126,8 +134,15 @@ export async function startBakedDisplay(config) {
   function frame(now) {
     if (!document.hidden && active && now - lastFrame >= 1000 / 30) {
       const dt = Math.min(.1, (now - lastFrame) / 1000); lastFrame = now;
+      const overlay = pickVisual.state(desiredState, now, !!pendingSpeech) !== desiredState;
+      if (overlay && !planningOverlay) {
+        planningOverlay = true; play('thinking', true).catch(error => toast(error.message));
+      } else if (!overlay && planningOverlay) {
+        planningOverlay = false;
+        play(desiredState, true).catch(error => toast(error.message));
+      }
       elapsed = (now - started) / 1000;
-      if (active.id !== 'speaking' && active.loopStart === null && elapsed >= active.count / manifest.fps) play('idle').catch(error => toast(error.message));
+      if (active.id !== 'speaking' && active.loopStart === null && elapsed >= active.count / manifest.fps) { desiredState = 'idle'; play('idle').catch(error => toast(error.message)); }
       const random = idle.tick(dt, { idle: active.id === 'idle', enabled: config.settings.autoIdle,
         reduced: config.settings.reducedMotion, signatureAvailable: clips.has('signature') });
       if (random && !(gaze.tracking && random.startsWith('look-'))) play(random).catch(error => toast(error.message));
