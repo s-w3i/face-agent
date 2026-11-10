@@ -108,6 +108,33 @@ export class SpeechPlayer {
     }
   }
 
+  // A short rising two-note cue: "the microphone is open now". Played after a
+  // reply and before the display acknowledges it, so the voice agent keeps the
+  // microphone held until the cue has finished. stop() (barge-in) cuts it short.
+  async chime() {
+    const context = this.context;
+    if (!context || context.state !== 'running') return;
+    const generation = this.generation, start = context.currentTime + .01;
+    const notes = [[660, start, .09], [990, start + .09, .11]];
+    let resolveChime; const done = new Promise(resolve => { resolveChime = resolve; });
+    this.finishPlayback = resolveChime;
+    notes.forEach(([frequency, at, duration], index) => {
+      const oscillator = context.createOscillator(), gain = context.createGain();
+      oscillator.type = 'sine'; oscillator.frequency.setValueAtTime(frequency, at);
+      gain.gain.setValueAtTime(0, at);
+      gain.gain.linearRampToValueAtTime(.16, at + .012);
+      gain.gain.exponentialRampToValueAtTime(.001, at + duration);
+      oscillator.connect(gain); gain.connect(context.destination);
+      this.sources.add(oscillator);
+      oscillator.onended = () => {
+        this.sources.delete(oscillator); oscillator.disconnect(); gain.disconnect();
+        if (index === notes.length - 1 && generation === this.generation) { this.finishPlayback = null; resolveChime(); }
+      };
+      oscillator.start(at); oscillator.stop(at + duration);
+    });
+    await done;
+  }
+
   level() {
     if (!this.source) return null;
     this.analyser.getFloatTimeDomainData(this.samples);

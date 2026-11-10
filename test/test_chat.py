@@ -18,6 +18,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from chat import Chatbot, chat_loop, current_datetime, current_location, main, robot_name, wake_trigger, read_terminal, spoken_reply, watch_motion, start_after_announcement, start_tracking, closing_message
 from ros_wake import WakeRequest
+from robot_states import IDLE_SECONDS
 from voice_errors import RealtimeUnavailable
 from agents import WebSearchTool
 from agents.tool_context import ToolContext
@@ -85,7 +86,7 @@ class ChatCheck(unittest.TestCase):
                 self.assertEqual(events[:5], ['pause', 'realtime', 'infer', 'playback ended', 'resume'])
                 self.assertEqual(events[-5:], ['pause', 'infer', 'playback ended', 'local', 'resume'])
                 self.assertEqual(bot.show_state.call_args_list[0].args, ('sleeping',))
-                self.assertEqual([call.args[0] for call in voice.read.call_args_list], [None, None, 5, 5, None, None, 5, 5, None, None])
+                self.assertEqual([call.args[0] for call in voice.read.call_args_list], [None, None, IDLE_SECONDS, IDLE_SECONDS, None, None, IDLE_SECONDS, IDLE_SECONDS, None, None])
         asyncio.run(check())
 
     def test_agent_closing_intent_handles_transcribed_names_and_courtesy(self):
@@ -241,7 +242,7 @@ class ChatCheck(unittest.TestCase):
             self.assertEqual(asyncio.run(main()), 0)
             self.assertEqual([call.args[0] for call in bot.return_value.reply.call_args_list], ['Hi Kuro', 'question', 'Hi Kuro', 'Goodbye', 'Hi Kuro'])
             self.assertEqual([call.args[0] for call in bot.return_value.show_state.call_args_list], ['sleeping', 'listening', 'sleeping', 'listening', 'sleeping', 'listening'])
-            self.assertEqual([call.args[0] for call in terminal.call_args_list], [None, None, 5, 5, None, None, 5, None, None, 5])
+            self.assertEqual([call.args[0] for call in terminal.call_args_list], [None, None, IDLE_SECONDS, IDLE_SECONDS, None, None, IDLE_SECONDS, None, None, IDLE_SECONDS])
 
     def test_service_wake_without_greeting_and_failure_acknowledgment(self):
         async def check(failure):

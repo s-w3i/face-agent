@@ -17,7 +17,7 @@ import wave
 from urllib.parse import urlparse
 import faults
 from prerender import RenderPacks
-from robot_states import ANIMATIONS, INPUT_STATES, normalize_status
+from robot_states import ANIMATIONS, IDLE_SECONDS, INPUT_STATES, normalize_status
 try:
     from websockets.sync.client import connect
     from websockets.exceptions import InvalidStatus, WebSocketException
@@ -149,6 +149,8 @@ class RobotServer(ThreadingHTTPServer):
         self.mic_forward = 0.; self.mic_clockwise = False
         self.speech_hint = None; self.speech_hint_at = 0
         self.listening_text = dict(generation=self.generation, sequence=0, text='', final=False, utterance=0)
+        # The voice agent's current idle window (None: it never sleeps, e.g. during a mission).
+        self.listen_seconds = IDLE_SECONDS
         # Named faults for the corner chip; fault_log=None (tests) keeps them in memory only.
         self.fault_table = faults.FaultTable(fault_log)
         super().__init__(address, Handler)
@@ -186,6 +188,23 @@ class RobotServer(ThreadingHTTPServer):
         self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
                             state=state, **fields)
 
+    def change_animation(self, animation):
+        # An awake idle display in voice mode shows "Listening…" with a bar that drains
+        # over the idle window. Typed chat and manual animation commands show nothing.
+        if animation == 'idle' and self.input_mode == 'voice':
+            self.change_command(animation, level=None, listenSeconds=self.listen_seconds)
+        else:
+            self.change_command(animation, level=None)
+
+    def set_listen_seconds(self, seconds):
+        with self.changed:
+            if seconds == self.listen_seconds:
+                return
+            self.listen_seconds = seconds
+            if self.command['state'] == 'idle' and not self.command.get('speech'):
+                self.change_animation('idle'); self.ack = None
+            self.changed.notify_all()
+
     def raise_fault(self, code, component, message='', **fields):
         with self.changed:
             if self.fault_table.raise_(code, component, message, **fields):
@@ -215,7 +234,7 @@ class RobotServer(ThreadingHTTPServer):
             animation = ANIMATIONS[status]
             # A delayed SPEAKING notification must not cancel the actual audio command.
             if self.command['state'] != animation or (self.command.get('speech') and self.command.get('statusRevision') != value['revision']):
-                self.change_command(animation, level=None)
+                self.change_animation(animation)
                 self.ack = None
             self.changed.notify_all()
 
@@ -589,6 +608,14 @@ class Handler(SimpleHTTPRequestHandler):
                     self.server.gaze_at = time.monotonic()
                     self.server.changed.notify_all(); self.reply(dict(mode=self.server.input_mode))
                 return
+            if path == '/api/listen-window':
+                self.local_voice()
+                seconds = value.get('seconds', False) if isinstance(value, dict) else False
+                if (not isinstance(value, dict) or set(value) != {'seconds'} or not (seconds is None or
+                        type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 600)):
+                    raise ValueError('Supply the idle listening window in seconds (0–600), or null.')
+                self.server.set_listen_seconds(seconds)
+                self.reply(dict(seconds=seconds)); return
             if path == '/api/listening-text':
                 self.local_voice()
                 if (not isinstance(value, dict) or set(value) != {'session', 'text', 'final', 'utterance'}
@@ -653,6 +680,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.local_voice(); self.stream_reply(self.server.speech_events(value)); return
             if path in ('/api/speech', '/api/say', '/api/wake-ack', '/api/startup-ready', '/api/pick-announcement'):
                 self.local_voice()
+                # "listen": after the reply, the display chimes before acknowledging, while the mic is still held.
+                cue = value.get('cue') if isinstance(value, dict) and path == '/api/say' else None
+                if cue not in (None, 'listen'):
+                    raise ValueError('The only speech cue is "listen".')
                 if path == '/api/pick-announcement':
                     if (not isinstance(value, dict) or set(value) - {'text', 'prepare', 'statusRevision'}
                             or type(value.get('prepare', False)) is not bool):
@@ -700,7 +731,8 @@ class Handler(SimpleHTTPRequestHandler):
                         self.reply(dict(error='Speech cancelled by a newer animation command.'), 409); return
                     identifier = uuid.uuid4().hex
                     self.server.audio = (identifier, audio)
-                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip(), statusRevision=expected_status)
+                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip(),
+                                               statusRevision=expected_status, **(dict(cue=cue) if cue else {}))
                     self.server.ack = None; self.server.changed.notify_all()
                     if streaming:
                         threading.Thread(target=self.server.finish_clip, args=(audio, events, self.server.command['sequence']), daemon=True).start()

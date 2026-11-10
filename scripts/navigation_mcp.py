@@ -1,6 +1,7 @@
 """Expose local tool definitions; connect to the remote robot only on a tool call."""
 from contextlib import AsyncExitStack
 import json
+import re
 from pathlib import Path
 
 from agents.mcp import MCPServer
@@ -50,6 +51,26 @@ class OnDemandNavigationMCP(MCPServer):
             isError=True, content=[dict(type='text', text=json.dumps(payload))],
             structuredContent=payload))
 
+    @staticmethod
+    def enrollment_result(result):
+        payload = getattr(result, 'structured_content', None)
+        if not isinstance(payload, dict):
+            try:
+                payload = json.loads(next(part.text for part in result.content if part.type == 'text'))
+            except (StopIteration, ValueError, AttributeError, TypeError):
+                payload = {}
+        if not isinstance(payload, dict): payload = {}
+        error = payload.get('error')
+        code = error.get('code') if isinstance(error, dict) else error
+        if payload.get('success') is True:
+            status = 'confirmed'
+        elif isinstance(code, str) and re.fullmatch(r'[A-Z_]{1,64}', code):
+            status = code
+        else:
+            status = 'unconfirmed'
+        print('Enrollment MCP result: ' + status, flush=True)
+        return result
+
     async def call_tool(self, tool_name, arguments, meta=None):
         if tool_name not in {tool.name for tool in self._tools}:
             return self.error('TOOL_NOT_AVAILABLE', 'This navigation tool is not configured.')
@@ -62,16 +83,18 @@ class OnDemandNavigationMCP(MCPServer):
                 remote = await self.connector(stack, self.endpoint, require_mock=self.require_mock)
                 sent = True
                 result = await remote.call_tool(tool_name, arguments or {}, meta=meta)
-            return result
+            return self.enrollment_result(result) if tool_name == 'remember_person' else result
         except Exception:
             if result is not None:
-                return result  # A received terminal result survives a cleanup failure.
+                return self.enrollment_result(result) if tool_name == 'remember_person' else result
             if sent:
-                return self.error('NAVIGATION_RESULT_UNKNOWN',
+                failure = self.error('NAVIGATION_RESULT_UNKNOWN',
                     'The connection failed during the request. Its outcome is unconfirmed. '
                     'Do not claim arrival or automatically repeat movement; check the robot first.',
                     request_sent=True)
-            return self.error('NAVIGATION_SERVER_UNAVAILABLE',
+                return self.enrollment_result(failure) if tool_name == 'remember_person' else failure
+            failure = self.error('NAVIGATION_SERVER_UNAVAILABLE',
                 'The remote navigation server is unavailable. No navigation command was sent. '
                 'Tell the user navigation is unavailable; normal conversation can continue. '
                 'A later explicit navigation request can try connecting again.')
+            return self.enrollment_result(failure) if tool_name == 'remember_person' else failure

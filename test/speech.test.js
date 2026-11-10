@@ -123,3 +123,37 @@ test('streaming starts before completion, schedules PCM in order, and cancels qu
     assert.equal(sources[3].stopped, true); assert.equal(ended, 1); assert.equal(player.level(), null);
   } finally { player.dispose(); globalThis.AudioContext = savedContext; }
 });
+
+test('the listening chime plays two short notes, resolves when they end, and stops on barge-in', async () => {
+  const oscillators = [];
+  const savedContext = globalThis.AudioContext;
+  const param = () => ({ setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} });
+  globalThis.AudioContext = class {
+    state = 'suspended'; currentTime = 1; destination = {};
+    async resume() { this.state = 'running'; }
+    createOscillator() {
+      const oscillator = { frequency: param(), connect() {}, disconnect() {}, start(at) { this.at = at; },
+                           stop(at) { this.stoppedAt = at; this.stopped = true; } };
+      oscillators.push(oscillator); return oscillator;
+    }
+    createGain() { return { gain: param(), connect() {}, disconnect() {} }; }
+    close() {}
+  };
+  const player = new SpeechPlayer();
+  try {
+    await new SpeechPlayer().chime();  // No audio context yet: nothing to play, resolves at once.
+    await player.enable();
+    let finished = false;
+    const chiming = player.chime().then(() => { finished = true; });
+    assert.equal(oscillators.length, 2);
+    assert.ok(oscillators[1].at > oscillators[0].at);
+    assert.ok(oscillators[1].stoppedAt - oscillators[0].at < .25, 'the chime stays short');
+    oscillators[0].onended(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(finished, false);
+    oscillators[1].onended(); await chiming;
+    assert.equal(finished, true); assert.equal(player.sources.size, 0);
+    const interrupted = player.chime();
+    player.stop(); await interrupted;
+    assert.equal(oscillators[2].stopped, true); assert.equal(player.sources.size, 0);
+  } finally { player.dispose(); globalThis.AudioContext = savedContext; }
+});

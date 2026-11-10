@@ -282,3 +282,43 @@ class BargeInTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ListeningCueTest(unittest.IsolatedAsyncioTestCase):
+    """After a reply the display chimes while the mic is held, then shows the listening countdown."""
+
+    async def run_inputs(self, inputs, *, initial='IDLE', mission=None):
+        status = Authority()
+        status.current = Status(initial, 1, 'startup')
+        voice = Mock(read=AsyncMock(side_effect=inputs), hold=AsyncMock(), set_awake=AsyncMock(),
+                     follow_status=AsyncMock(), activity=asyncio.Queue(),
+                     start_capture=AsyncMock(return_value=True))
+        calls = []
+        def api(url, action, value=None):
+            if action == 'status':
+                return dict(robotStatus=dict(revision=status.current.revision))
+            calls.append((action, value))
+            return dict(displays=1, generation='g', sequence=1)
+        bot = Mock(reply=AsyncMock(return_value='It is noon.'), sleep_requested=False, history=[])
+        async def playback(speech, url):
+            return True
+        args = SimpleNamespace(url='local', model=None, speak=True, mission_client=mission)
+        with patch('chat.Chatbot', return_value=bot), patch('chat.robot_name', return_value='Kuro'), \
+                patch('chat.request', side_effect=api), patch('chat.wait_for_speech', side_effect=playback), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(await asyncio.wait_for(status_chat_loop(args, status, voice=voice), 3), 0)
+        return status, calls
+
+    async def test_replies_cue_the_chime_but_closing_replies_and_the_wake_ack_do_not(self):
+        status, calls = await self.run_inputs([WakeWord(.9, 10.0), 'What time is it?', 'Thank you, goodbye', '/quit'],
+                                              initial='SLEEPING')
+        says = [(action, value.get('cue')) for action, value in calls if action in ('say', 'wake-ack')]
+        self.assertEqual(says, [('wake-ack', None), ('say', 'listen'), ('say', None)])
+        self.assertEqual(status.transitions[-1], 'SLEEPING')
+        self.assertNotIn('listen-window', [action for action, _ in calls])  # The default window needs no update.
+
+    async def test_a_mission_without_a_sleep_timer_clears_the_countdown_once(self):
+        mission = SimpleNamespace(active=True, attach=Mock(), announcements=asyncio.Queue(),
+                                  state_changed=asyncio.Event())
+        _, calls = await self.run_inputs([TimeoutError(), TimeoutError(), '/quit'], mission=mission)
+        self.assertEqual([value for action, value in calls if action == 'listen-window'], [dict(seconds=None)])

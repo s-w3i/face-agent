@@ -131,6 +131,7 @@ class MissionLifetime(IsolatedAsyncioTestCase):
     async def test_pending_mission_stays_awake_then_silent_completion_restores_idle_timeout(self):
         from unittest.mock import AsyncMock,Mock,patch
         from chat import status_chat_loop
+        from robot_states import IDLE_SECONDS
         class Status:
             source='test'
             def __init__(self):self.events=asyncio.Queue();self.current=SimpleNamespace(status='IDLE',revision=1,source='test')
@@ -143,7 +144,7 @@ class MissionLifetime(IsolatedAsyncioTestCase):
             if len(timeouts)==1:
                 self.assertIsNone(timeout);waiting.set();await asyncio.Event().wait()
             if status.current.status=='IDLE':
-                self.assertEqual(timeout,5);raise TimeoutError
+                self.assertEqual(timeout,IDLE_SECONDS);raise TimeoutError
             return '/quit'
         voice=SimpleNamespace(read=read,hold=AsyncMock(),follow_status=AsyncMock(),activity=asyncio.Queue())
         args=SimpleNamespace(url='http://unused',model=None,speak=False,mission_client=client)
@@ -156,7 +157,7 @@ class MissionLifetime(IsolatedAsyncioTestCase):
                 client.latest={'state':'completed'};client.state_changed.set()
                 self.assertEqual(await asyncio.wait_for(task,2),0)
                 self.assertEqual(status.current.status,'SLEEPING');bot.reply.assert_not_awaited()
-                self.assertEqual(timeouts,[None,5,None])
+                self.assertEqual(timeouts,[None,IDLE_SECONDS,None])
             finally:
                 if not task.done():task.cancel();await asyncio.gather(task,return_exceptions=True)
 

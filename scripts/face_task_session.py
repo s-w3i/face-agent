@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from agents.mcp import MCPServer
 from mcp import types
@@ -57,10 +58,14 @@ class TaskSession:
             'Never generate or execute code, shell commands, new tools or publish ROS topics. '
             'Use task_progress to record running, waiting, completed or blocked with a brief '
             'accurate explanation. Keep the task active across spoken responses. When a user '
-            'answer is needed, ask one clear question and set waiting. For an event that may '
+            'answer is needed, ask one clear question and set waiting. '
             'Whenever you need a spoken answer, end the spoken question with ? or ？; '
             'the microphone opens for one answer only after a question. '
-            'occur later, set waiting and observe only through available read-only tools. '
+            'For an event that may occur later, set waiting and observe only through available read-only tools. '
+            'Use recent evidence already obtained when it remains valid; refresh it when an action '
+            'requires a current observation. Run independent read-only investigations in parallel '
+            'when useful, and keep dependent actions ordered. Avoid redundant questions when the '
+            'answer is already clear, but ask when identity, intent or required information is uncertain. '
             'Do not invent people, identity, sensor observations, tool availability or completion. '
             'During a task, if the task requests enrollment of the nearest person when several '
             'people are visible, use get_follow_target to get a fresh nearest depth-valid '
@@ -149,7 +154,12 @@ class TaskMCP(MCPServer):
         prior_motion = self.session.motion_requested
         if tool_name in self.MOTION:
             self.session.motion_requested = True
-        result = await self.delegate.call_tool(tool_name, arguments, meta=meta)
+        started = time.monotonic()
+        try:
+            result = await self.delegate.call_tool(tool_name, arguments, meta=meta)
+        finally:
+            label = tool_name if isinstance(tool_name, str) and tool_name.isidentifier() and len(tool_name) <= 64 else 'unknown'
+            print(f'Task timing · MCP {label}: {time.monotonic() - started:.2f}s', flush=True)
         if tool_name in self.MOTION:
             payload = getattr(result, 'structured_content', None)
             if not isinstance(payload, dict):

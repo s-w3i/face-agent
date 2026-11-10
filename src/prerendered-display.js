@@ -39,7 +39,7 @@ export async function startBakedDisplay(config) {
   const pickVisual = new PickVisual();
   let desiredState = 'idle', planningOverlay = false;
   let active, elapsed = 0, started = 0, commandLevel = null, smoothedLevel = 0, lastFrame = 0, drawn = '';
-  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision;
+  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision, listening;
   const speech = new SpeechPlayer(text => { $('#robot-subtitles').textContent = text; $('#robot-subtitles').hidden = !text; drawn = ''; });
   const toast = message => { $('#toast').textContent = message; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 6000); };
   const gaze = new SmoothGaze(), controls = gazeControls(api, toast);
@@ -83,6 +83,8 @@ export async function startBakedDisplay(config) {
       const onEnd = () => { play('idle').catch(failure => toast(failure.message)); };
       if (response.headers.get('Content-Type')?.includes('application/x-ndjson')) await speech.stream(response, onStart, onEnd, () => {}, command.text || '');
       else await speech.play(await response.blob(), onStart, onEnd, command.text || '');
+      // The voice agent keeps the microphone held until this ack, so the chime marks the moment it reopens.
+      if (command.cue === 'listen' && token === request) await speech.chime();
     } catch (failure) {
       if (failure.name === 'AbortError' || (token !== undefined && token !== request)) return;
       error = failure.message; toast(error); play('idle').catch(() => {});
@@ -94,7 +96,7 @@ export async function startBakedDisplay(config) {
   await api('actions', manifest.clips.map(({ id, label }) => ({ id, label })));
   events = new EventSource('/api/events');
   events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
-  connectListeningText(events, $('#robot-listening-text'), () => { drawn = ''; });
+  listening = connectListeningText(events, $('#robot-listening-text'), () => { drawn = ''; });
   connectFaults(events, $('#fault-chip'));
   events.onopen = status;
   events.onerror = () => { $('#robot-connection').textContent = 'Reconnecting…'; };
@@ -114,7 +116,7 @@ export async function startBakedDisplay(config) {
     const command = JSON.parse(event.data);
     if (command.generation === generation && command.sequence <= lastCommand) return;
     generation = command.generation; lastCommand = command.sequence;
-    desiredState = command.state;
+    desiredState = command.state; listening.command(command);
     let error = '';
     try {
       const target = command.speech ? 'idle' : pickVisual.state(command.state, performance.now());

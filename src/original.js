@@ -70,7 +70,7 @@ const speech = new SpeechPlayer(text => {
   const subtitles = $('#robot-subtitles');
   if (subtitles) { subtitles.textContent = text; subtitles.hidden = !text; }
 });
-let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch = null;
+let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch = null, listening = null;
 let voiceInfo = null;
 let voiceMigrationNote = '';
 let toastTimer;
@@ -142,7 +142,7 @@ async function persistConfig(value) {
 function connectRobot() {
   events = new EventSource('/api/events');
   events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
-  if (robotView) connectListeningText(events, $('#robot-listening-text'), () => framing?.reset());
+  if (robotView) listening = connectListeningText(events, $('#robot-listening-text'), () => framing?.reset());
   if (robotView) connectFaults(events, $('#fault-chip'));
   events.onopen = () => { $('#robot-connection').textContent = 'Connected'; api('actions', actions.map(({ id, label }) => ({ id, label }))).catch(error => toast(error.message)); };
   events.onerror = () => { $('#robot-connection').textContent = 'Reconnecting…'; };
@@ -163,6 +163,7 @@ function connectRobot() {
     const command = JSON.parse(event.data);
     if (command.generation === commandGeneration && command.sequence <= lastCommand) return;
     commandGeneration = command.generation; lastCommand = command.sequence; commandLevel = null;
+    listening?.command(command);
     const definition = actions.find(a => a.id === command.state);
     let error = '';
     if (!definition) error = 'This state is unavailable in the installed renderer.';
@@ -308,6 +309,8 @@ async function resumeRobotVoice() {
     if (request !== speechRequest) return;
     if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
     await playSpeech(response, command.text || '');
+    // The voice agent keeps the microphone held until this ack, so the chime marks the moment it reopens.
+    if (command.cue === 'listen' && request === speechRequest) await speech.chime();
   } catch (failure) {
     if (failure.name === 'AbortError' || (request !== undefined && request !== speechRequest)) return;
     error = failure.message; toast(error);

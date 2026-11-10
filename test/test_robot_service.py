@@ -285,6 +285,47 @@ class RobotServiceCheck(unittest.TestCase):
                 if stream: stream.close()
                 server.shutdown(); server.server_close(); server_thread.join()
 
+    def test_idle_listening_window_and_reply_cue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = RobotServer(('127.0.0.1', 0), config_file=Path(directory) / 'robot-config.json', static_root=directory)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True); server_thread.start()
+            base = f'http://127.0.0.1:{server.server_port}'
+            def api(route, value=None):
+                request = Request(base + '/api/' + route, data=json.dumps(value).encode() if value is not None else None,
+                                  headers={'Content-Type': 'application/json'})
+                with urlopen(request, timeout=3) as response:
+                    return json.load(response)
+            try:
+                # Typed chat: an awake idle display does not claim to be listening.
+                server.apply_robot_status(dict(status='IDLE', revision=1, source='face-agent-x'))
+                self.assertNotIn('listenSeconds', server.command)
+                api('input-mode', dict(mode='voice'))
+                server.apply_robot_status(dict(status='SLEEPING', revision=2, source='face-agent-x'))
+                self.assertNotIn('listenSeconds', server.command)
+                server.apply_robot_status(dict(status='IDLE', revision=3, source='face-agent-x'))
+                self.assertEqual((server.command['state'], server.command['listenSeconds']), ('idle', serve.IDLE_SECONDS))
+                self.assertEqual(serve.IDLE_SECONDS, 8.0)
+                # A mission never sleeps: the current idle display drops its countdown at once.
+                sequence = server.command['sequence']
+                self.assertEqual(api('listen-window', dict(seconds=None)), dict(seconds=None))
+                self.assertEqual((server.command['sequence'], server.command['listenSeconds']), (sequence + 1, None))
+                api('listen-window', dict(seconds=None))
+                self.assertEqual(server.command['sequence'], sequence + 1)  # Unchanged window: no new command.
+                api('listen-window', dict(seconds=12))
+                server.apply_robot_status(dict(status='LISTENING', revision=4, source='face-agent-x'))
+                self.assertNotIn('listenSeconds', server.command)
+                server.apply_robot_status(dict(status='IDLE', revision=5, source='face-agent-x'))
+                self.assertEqual(server.command['listenSeconds'], 12)
+                for bad in (dict(seconds=0), dict(seconds=-1), dict(seconds=601), dict(seconds='8'), dict(seconds=True),
+                            dict(seconds=float('nan')), dict(), dict(seconds=8, extra=1), [8]):
+                    with self.assertRaises(HTTPError): api('listen-window', bad)
+                # Only the "listen" cue exists, checked before any speech is generated.
+                with self.assertRaises(HTTPError) as rejected:
+                    api('say', dict(text='Hi', cue='beep'))
+                self.assertIn('cue', json.load(rejected.exception)['error'])
+            finally:
+                server.shutdown(); server.server_close(); server_thread.join()
+
     def test_faults_reach_status_and_events_and_clear_on_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / 'faults.log'
