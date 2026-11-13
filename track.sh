@@ -14,4 +14,15 @@ if ! "$tracking_environment/bin/python" -c 'import rclpy, cv2, numpy; assert cv2
   "$tracking_environment/bin/python" -m pip install -r requirements-tracking.txt
 fi
 "$tracking_environment/bin/python" scripts/setup_tracking.py
+# Optional Hailo-8L face backend: install the HailoRT Python binding that matches the
+# installed runtime when an AI HAT is present. Tracking falls back to OpenCV without it.
+if command -v hailortcli >/dev/null 2>&1 && ! "$tracking_environment/bin/python" -c 'import hailo_platform' >/dev/null 2>&1; then
+  hailo_version=$(hailortcli --version 2>/dev/null | grep -o '[0-9][0-9.]*' | head -1)
+  hailo_wheel=$(ls "${HAILO_WHEEL_DIR:-$HOME/hailo-debs}"/hailort-"$hailo_version"-cp3*-linux_aarch64.whl 2>/dev/null | head -1)
+  if [ -n "$hailo_wheel" ]; then
+    "$tracking_environment/bin/python" -m pip install "$hailo_wheel" || printf '%s\n' 'HailoRT Python install failed; tracking uses OpenCV.' >&2
+  else
+    printf 'Hailo runtime %s found but no matching hailort wheel in %s; tracking uses OpenCV.\n' "$hailo_version" "${HAILO_WHEEL_DIR:-$HOME/hailo-debs}" >&2
+  fi
+fi
 exec "$tracking_environment/bin/python" scripts/track_human.py "$@"

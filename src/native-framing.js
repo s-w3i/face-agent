@@ -31,7 +31,7 @@ export class NativeFraming {
     this.reset();
   }
   reset() { this.bounds = null; this.lastLayout = ''; }
-  update(canvas, width, height, rendered) {
+  update(canvas, width, height, rendered, topOffset = 0) {
     if (rendered && this.context) {
       this.context.clearRect(0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
       this.context.drawImage(canvas, 0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
@@ -45,6 +45,7 @@ export class NativeFraming {
     }
     if (!this.bounds || width <= 0 || height <= 0) return null;
     const layout = fittedLayout(this.bounds, width, height);
+    layout.top += topOffset;
     const key = `${layout.size},${layout.left},${layout.top}`;
     if (key === this.lastLayout) return null;
     this.lastLayout = key;

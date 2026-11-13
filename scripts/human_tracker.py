@@ -17,6 +17,11 @@ def cosine(first, second):
 
 
 class Vision:
+    """OpenCV CPU face backend: YuNet detection and SFace identity features."""
+
+    name = 'opencv'
+    default_threshold = .55  # SFace cosine
+
     def __init__(self, detector_path, recognizer_path, threads=1):
         cv2.setNumThreads(threads)
         self.detector = cv2.FaceDetectorYN.create(str(detector_path), '', (320, 240), .8, .3, 500,
@@ -51,6 +56,39 @@ class Vision:
         aligned = self.recognizer.alignCrop(image, face)
         self.recognitions += 1
         return self.recognizer.feature(aligned).copy()
+
+    def close(self):
+        pass
+
+
+OpenCVFaceBackend = Vision
+BACKEND_THRESHOLDS = {'opencv': .55, 'hailo': .45}
+
+
+def make_backend(choice, paths, threads=1, log=print):
+    """`hailo`, `opencv` or `auto`. Hailo problems never stop tracking: they fall back to OpenCV."""
+    cv2.setNumThreads(threads)  # Optical flow and resizing stay on the CPU with either backend.
+    if choice in ('hailo', 'auto'):
+        try:
+            from hailo_faces import HailoFaceBackend
+            backend = HailoFaceBackend()
+            backend.default_threshold = BACKEND_THRESHOLDS['hailo']
+            return backend
+        except Exception as error:  # Import, missing HEF, service down, device busy...
+            log(f'Hailo face backend unavailable ({type(error).__name__}: {error}); using OpenCV on the CPU.')
+    return Vision(*paths, threads=threads)
+
+
+def fall_back_to_cpu(tracker, paths, threads=1):
+    """Swap a failed Hailo backend for OpenCV mid-session. Features are not comparable, so relock."""
+    try:
+        tracker.vision.close()
+    except Exception:
+        pass
+    tracker.vision = make_backend('opencv', paths, threads)
+    tracker.threshold = BACKEND_THRESHOLDS['opencv']
+    tracker.reset()
+    return tracker.vision
 
 
 class PersonTracker:

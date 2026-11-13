@@ -2,6 +2,7 @@
 """Local dots display service: static assets, one config file, and live commands."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import base64
+import hashlib
 import io
 import json
 import math
@@ -14,7 +15,9 @@ import time
 import uuid
 import wave
 from urllib.parse import urlparse
+import faults
 from prerender import RenderPacks
+from robot_states import ANIMATIONS, IDLE_SECONDS, INPUT_STATES, normalize_status
 try:
     from websockets.sync.client import connect
     from websockets.exceptions import InvalidStatus, WebSocketException
@@ -118,7 +121,7 @@ def state_key(value):
 class RobotServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, config_file=None, static_root=None, key_file=None):
+    def __init__(self, address, config_file=None, static_root=None, key_file=None, fault_log=None):
         self.config_file = Path(config_file or os.environ.get('DOTS_CONFIG', ROOT / 'robot-config.json')).resolve()
         self.static_root = Path(static_root or ROOT / 'dist').resolve()
         packs = ROOT / 'public/prerendered'
@@ -130,17 +133,26 @@ class RobotServer(ThreadingHTTPServer):
             raise ValueError('The private key must be outside the workspace and web files.')
         # ponytail: one speech job per robot; add a queue if concurrent callers need it.
         self.speech_lock = threading.Lock()
+        self.wake_ack_lock = threading.Lock()
         self.speech_socket = None; self.speech_identity = None; self.speech_opened = 0
         self.audio = None
         self.changed = threading.Condition()
         self.generation = uuid.uuid4().hex
-        self.command = dict(generation=self.generation, sequence=0, state='idle', level=None)
+        self.command = dict(generation=self.generation, sequence=0, state='sleeping', level=None)
+        self.robot_status = None
+        self.pick_visual=dict(generation=self.generation,sequence=0,mission_id=None,active=False)
+        self.pick_visual_until=0.;self.pick_visual_retired=set()
         self.wake_session = 0
         self.actions = []; self.ack = None; self.displays = 0
         self.gaze = dict(sequence=0, detected=False, x=.5, y=.5); self.gaze_at = time.monotonic()
         self.input_mode = 'words'
         self.mic_forward = 0.; self.mic_clockwise = False
         self.speech_hint = None; self.speech_hint_at = 0
+        self.listening_text = dict(generation=self.generation, sequence=0, text='', final=False, utterance=0)
+        # The voice agent's current idle window (None: it never sleeps, e.g. during a mission).
+        self.listen_seconds = IDLE_SECONDS
+        # Named faults for the corner chip; fault_log=None (tests) keeps them in memory only.
+        self.fault_table = faults.FaultTable(fault_log)
         super().__init__(address, Handler)
 
     def config(self):
@@ -170,8 +182,82 @@ class RobotServer(ThreadingHTTPServer):
             self.speech_hint = None
             self.gaze = dict(sequence=self.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
             self.gaze_at = time.monotonic()
+        if state in ('thinking', 'speaking', 'sleeping', 'error', 'working', 'searching'):
+            self.listening_text = dict(generation=self.generation, sequence=self.listening_text['sequence'] + 1,
+                                       text='', final=False, utterance=0)
         self.command = dict(generation=self.generation, sequence=self.command['sequence'] + 1,
                             state=state, **fields)
+
+    def change_animation(self, animation):
+        # An awake idle display in voice mode shows "Listening…" with a bar that drains
+        # over the idle window. Typed chat and manual animation commands show nothing.
+        if animation == 'idle' and self.input_mode == 'voice':
+            self.change_command(animation, level=None, listenSeconds=self.listen_seconds)
+        else:
+            self.change_command(animation, level=None)
+
+    def set_listen_seconds(self, seconds):
+        with self.changed:
+            if seconds == self.listen_seconds:
+                return
+            self.listen_seconds = seconds
+            if self.command['state'] == 'idle' and not self.command.get('speech'):
+                self.change_animation('idle'); self.ack = None
+            self.changed.notify_all()
+
+    def raise_fault(self, code, component, message='', **fields):
+        with self.changed:
+            if self.fault_table.raise_(code, component, message, **fields):
+                self.changed.notify_all()
+
+    def clear_fault(self, code=None, component=None, **fields):
+        with self.changed:
+            if self.fault_table.clear(code, component, **fields):
+                self.changed.notify_all()
+
+    def apply_robot_status(self, value):
+        status = normalize_status(value['status'])
+        with self.changed:
+            previous = self.robot_status
+            if previous and value['revision'] and value['revision'] <= previous['revision']:
+                return
+            self.robot_status = dict(value, status=status)
+            source = str(value.get('source') or '')
+            if status == 'ERROR' and source == 'connection':
+                self.fault_table.raise_('ros_status_lost', 'display', 'The display lost its /robot/status subscription.')
+            elif status == 'ERROR' and not source.startswith('face-agent-'):
+                self.fault_table.raise_('external_error', 'display', 'ERROR set by ' + (source or 'an unnamed ROS node') + '.')
+            elif status != 'ERROR' and previous and previous['status'] == 'ERROR':
+                # Recovery: blocking faults belong to the episode that just ended.
+                self.fault_table.clear(where=lambda fault: fault['severity'] == 'error' and fault['autoClear'],
+                                       reason='recovered')
+            animation = ANIMATIONS[status]
+            # A delayed SPEAKING notification must not cancel the actual audio command.
+            if self.command['state'] != animation or (self.command.get('speech') and self.command.get('statusRevision') != value['revision']):
+                self.change_animation(animation)
+                self.ack = None
+            self.changed.notify_all()
+
+    def pick_visual_value(self):
+        remaining=max(0.,self.pick_visual_until-time.monotonic())
+        if self.pick_visual['active'] and remaining==0:
+            self.pick_visual=dict(self.pick_visual,active=False,sequence=self.pick_visual['sequence']+1)
+        return dict(self.pick_visual,ttl_ms=round(remaining*1000))
+
+    def update_pick_visual(self,mission_id,active):
+        current=self.pick_visual['mission_id']
+        if active:
+            if mission_id in self.pick_visual_retired:return False
+            if current and current!=mission_id:self.pick_visual_retired.add(current)
+            self.pick_visual_until=time.monotonic()+10.
+        else:
+            self.pick_visual_retired.add(mission_id)
+            if mission_id!=current:return False
+            self.pick_visual_until=0.
+        self.pick_visual=dict(generation=self.generation,sequence=self.pick_visual['sequence']+1,
+                              mission_id=mission_id,active=active)
+        self.changed.notify_all()
+        return True
 
     def api_key(self):
         key = os.environ.get('OPENAI_API_KEY', '').strip()
@@ -259,6 +345,9 @@ class RobotServer(ThreadingHTTPServer):
                         yield chunk
                     elif kind == 'error':
                         code = event.get('error', {}).get('code')
+                        self.raise_fault({'invalid_api_key': 'openai_auth', 'insufficient_quota': 'openai_quota',
+                                          'rate_limit_exceeded': 'openai_rate_limit'}.get(code, 'openai_error'),
+                                         'speech', f'Speech request rejected ({code or "unknown code"}).')
                         messages = {'invalid_api_key': 'OpenAI rejected the API key. Update it in Voice settings.',
                                     'model_not_found': 'This OpenAI project cannot access ' + SPEECH_MODEL + '.',
                                     'insufficient_quota': 'OpenAI quota reached. Check your API billing.',
@@ -268,20 +357,32 @@ class RobotServer(ThreadingHTTPServer):
                         if event.get('response', {}).get('status') != 'completed':
                             raise ValueError('OpenAI did not complete the speech. Please try again.')
                         completed = bool(size); break
+                if completed:
+                    self.clear_fault(component='speech')
                 if not completed:
                     raise ValueError('OpenAI returned no complete speech clip. Please try again.')
                 yield dict(type='done', totalMs=round((time.monotonic() - started) * 1000))
             except InvalidStatus as error:
                 # Never echo provider bodies or connection headers.
+                status_code = error.response.status_code
+                self.raise_fault({401: 'openai_auth', 429: 'openai_rate_limit'}.get(status_code, 'openai_error'),
+                                 'speech', f'Speech connection refused with HTTP {status_code}.')
                 messages = {401: 'OpenAI rejected the API key. Update it in Voice settings.',
                             403: 'This OpenAI project does not have access to ' + SPEECH_MODEL + '.',
                             429: 'OpenAI quota or rate limit reached. Check API billing or try again later.'}
                 raise ValueError(messages.get(error.response.status_code, 'OpenAI Realtime could not generate speech. Please try again.')) from None
-            except (WebSocketException, TimeoutError, OSError):
+            except (WebSocketException, TimeoutError, OSError) as error:
+                self.diagnose_speech(error)
                 raise ValueError('Could not complete the OpenAI Realtime connection. Check your connection and try again.') from None
         finally:
             if not completed: self.close_speech()
             self.speech_lock.release()
+
+    def diagnose_speech(self, error):
+        # The probe takes a few seconds offline; the failed request should not wait for it.
+        message = 'Speech connection failed: ' + type(error).__name__ + '.'
+        threading.Thread(target=lambda: self.raise_fault(faults.network_code() or 'speech_failed', 'speech', message),
+                         daemon=True).start()
 
     def speech(self, value):
         pcm = bytearray()
@@ -291,6 +392,47 @@ class RobotServer(ThreadingHTTPServer):
         with wave.open(audio, 'wb') as wav:
             wav.setparams((1, 2, 24000, 0, 'NONE', 'not compressed')); wav.writeframes(pcm)
         return audio.getvalue()
+
+    def wake_ack(self, *, prepare=False):
+        return self.cached_announcement('Yes? I am here, what can I help you?', 'wake-ack', prepare=prepare)
+
+    def startup_ready_text(self, *, sleeping=True):
+        name = self.config()['appearance']['name']
+        text = f'{name} is ready.'
+        return text + f' Say Hi {name} to wake me up.' if sleeping else text
+
+    def startup_ready(self, *, sleeping=True, prepare=False):
+        return self.cached_announcement(self.startup_ready_text(sleeping=sleeping),
+                                        'startup-ready', prepare=prepare)
+
+    def pick_announcement(self, text):
+        """Return a complete WAV; generate once per text/voice/model before playback."""
+        if not isinstance(text, str) or not 0 < len(text.strip()) <= 4096:
+            raise ValueError('Supply 1–4096 characters of picking announcement text.')
+        return self.cached_announcement(text.strip(), 'pick-announcements', prepare=True)
+
+    def cached_announcement(self, text, cache_name, *, prepare=False):
+        """Generate once per voice/text; cached playback never contacts the cloud."""
+        voice = self.config()['settings'].get('ttsVoice', 'marin')
+        identity = hashlib.sha256(f'{SPEECH_MODEL}|{voice}|{text}'.encode()).hexdigest()
+        cache = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'face-agent' / cache_name
+        path = cache / f'{identity}.wav'
+        with self.wake_ack_lock:
+            if path.exists():
+                return path.read_bytes()
+            if not prepare:
+                raise ValueError('Announcement is not cached for this voice and text. Restart the voice agent.')
+            audio = self.speech(dict(text=text, voice=voice))
+            cache.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix='wake.', dir=cache)
+            try:
+                with os.fdopen(descriptor, 'wb') as output:
+                    output.write(audio)
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            return audio
 
     def finish_clip(self, clip, events, sequence):
         try:
@@ -318,9 +460,15 @@ class Handler(SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
     def end_headers(self):
+        if urlparse(self.path).path == '/' or urlparse(self.path).path.endswith('.html'):
+            self.send_header('Cache-Control', 'no-store')
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
         super().end_headers()
+
+    def log_request(self, code='-', size='-'):
+        if os.environ.get('DOTS_ACCESS_LOG', '1') != '0':
+            super().log_request(code, size)
 
     def reply(self, value, status=200):
         data = json.dumps(value, allow_nan=False).encode()
@@ -398,12 +546,14 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/status':
                 with self.server.changed:
                     self.reply(dict(configFile=str(self.server.config_file), configured=self.server.config_file.exists(),
-                                    displays=self.server.displays, command=self.server.command,
+                                    displays=self.server.displays, command=self.server.command, robotStatus=self.server.robot_status,
+                                    pickVisual=self.server.pick_visual_value(),
                                     acknowledgment=self.server.ack, actions=self.server.actions, gaze=self.server.gaze_value(),
                                     trackingSession=self.server.tracking_session(), awake=self.server.command['state'] != 'sleeping',
                                     inputMode=self.server.input_mode, micForwardDeg=self.server.mic_forward,
                                     micClockwise=self.server.mic_clockwise, speechHint=self.server.speech_hint_value(),
-                                    speechPending=self.server.speech_pending()))
+                                    speechPending=self.server.speech_pending(), listeningText=self.server.listening_text,
+                                    faults=self.server.fault_table.public()))
                 return
             if path == '/api/events':
                 self.events(); return
@@ -430,6 +580,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self.server.render_packs.upload(*upload.groups(), self.rfile.read(size))
                 self.reply(dict(saved=True)); return
             value = self.body()
+            if path == '/api/pick-visual':
+                self.local_voice()
+                if (not isinstance(value,dict) or set(value)!={'mission_id','active'} or
+                        not isinstance(value.get('mission_id'),str) or
+                        not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',value['mission_id']) or type(value.get('active')) is not bool):
+                    raise ValueError('Supply a mission_id and boolean active state.')
+                with self.server.changed:
+                    accepted=self.server.update_pick_visual(value['mission_id'],value['active'])
+                    self.reply(dict(accepted=accepted,visual=self.server.pick_visual_value()))
+                return
             if path == '/api/input-mode':
                 self.local_voice()
                 if not isinstance(value, dict) or set(value) - {'mode', 'micForwardDeg', 'micClockwise'} or value.get('mode') not in ('words', 'voice'):
@@ -442,9 +602,34 @@ class Handler(SimpleHTTPRequestHandler):
                     self.server.input_mode = value['mode']
                     self.server.mic_forward = forward; self.server.mic_clockwise = clockwise
                     self.server.wake_session += 1; self.server.speech_hint = None
+                    self.server.listening_text = dict(generation=self.server.generation,
+                        sequence=self.server.listening_text['sequence'] + 1, text='', final=False, utterance=0)
                     self.server.gaze = dict(sequence=self.server.gaze['sequence'] + 1, detected=False, x=.5, y=.5)
                     self.server.gaze_at = time.monotonic()
                     self.server.changed.notify_all(); self.reply(dict(mode=self.server.input_mode))
+                return
+            if path == '/api/listen-window':
+                self.local_voice()
+                seconds = value.get('seconds', False) if isinstance(value, dict) else False
+                if (not isinstance(value, dict) or set(value) != {'seconds'} or not (seconds is None or
+                        type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 600)):
+                    raise ValueError('Supply the idle listening window in seconds (0–600), or null.')
+                self.server.set_listen_seconds(seconds)
+                self.reply(dict(seconds=seconds)); return
+            if path == '/api/listening-text':
+                self.local_voice()
+                if (not isinstance(value, dict) or set(value) != {'session', 'text', 'final', 'utterance'}
+                        or not isinstance(value['session'], str) or not isinstance(value['text'], str)
+                        or len(value['text']) > 12000 or type(value['final']) is not bool
+                        or type(value['utterance']) is not int or value['utterance'] < 0):
+                    raise ValueError('Supply a session, transcript text, final boolean and utterance number.')
+                with self.server.changed:
+                    if self.server.input_mode != 'voice' or value['session'] != self.server.tracking_session() or self.server.command['state'] in ('thinking', 'speaking', 'error', 'sleeping', 'working', 'searching') or (self.server.robot_status and self.server.robot_status['status'] not in INPUT_STATES) or self.server.speech_pending():
+                        self.reply(dict(error='Transcript is inactive or belongs to an old session.'), 409); return
+                    self.server.listening_text = dict(generation=self.server.generation,
+                        sequence=self.server.listening_text['sequence'] + 1,
+                        text=value['text'], final=value['final'], utterance=value['utterance'])
+                    self.server.changed.notify_all(); self.reply(dict(received=True))
                 return
             if path == '/api/speaker':
                 self.local_voice()
@@ -493,24 +678,61 @@ class Handler(SimpleHTTPRequestHandler):
                 self.reply(dict(configured=True)); return
             if path == '/api/speech-stream':
                 self.local_voice(); self.stream_reply(self.server.speech_events(value)); return
-            if path in ('/api/speech', '/api/say'):
+            if path in ('/api/speech', '/api/say', '/api/wake-ack', '/api/startup-ready', '/api/pick-announcement'):
                 self.local_voice()
+                # "listen": after the reply, the display chimes before acknowledging, while the mic is still held.
+                cue = value.get('cue') if isinstance(value, dict) and path == '/api/say' else None
+                if cue not in (None, 'listen'):
+                    raise ValueError('The only speech cue is "listen".')
+                if path == '/api/pick-announcement':
+                    if (not isinstance(value, dict) or set(value) - {'text', 'prepare', 'statusRevision'}
+                            or type(value.get('prepare', False)) is not bool):
+                        raise ValueError('Supply picking text, prepare, or a robot status revision.')
+                    if value.get('prepare'):
+                        self.server.pick_announcement(value.get('text'))
+                        self.reply(dict(ready=True)); return
+                    if not isinstance(value.get('text'), str) or not 0 < len(value['text'].strip()) <= 4096:
+                        raise ValueError('Supply 1–4096 characters of picking announcement text.')
+                if path == '/api/wake-ack':
+                    if not isinstance(value, dict) or set(value) - {'prepare', 'statusRevision'} or type(value.get('prepare', False)) is not bool:
+                        raise ValueError('Supply prepare or a robot status revision for wake acknowledgment.')
+                    if value.get('prepare'):
+                        self.server.wake_ack(prepare=True)
+                        self.reply(dict(ready=True)); return
+                    value = dict(text='Yes? I am here, what can I help you?', **value)
+                if path == '/api/startup-ready':
+                    if (not isinstance(value, dict) or set(value) - {'prepare', 'statusRevision', 'sleeping'}
+                            or type(value.get('prepare', False)) is not bool
+                            or type(value.get('sleeping', True)) is not bool):
+                        raise ValueError('Supply prepare, sleeping, or a robot status revision for startup announcement.')
+                    sleeping = value.get('sleeping', True)
+                    if value.get('prepare'):
+                        self.server.startup_ready(sleeping=sleeping, prepare=True)
+                        self.reply(dict(ready=True)); return
+                    value = dict(value, text=self.server.startup_ready_text(sleeping=sleeping))
                 if isinstance(value, dict) and 'text' not in value:
                     value = dict(value, text=f"Hi, I am {self.server.config()['appearance']['name']}.")
                 with self.server.changed:
+                    expected_status = value.get('statusRevision') if isinstance(value, dict) else None
+                    if expected_status is not None and (not self.server.robot_status or self.server.robot_status['revision'] != expected_status or self.server.robot_status['status'] != 'SPEAKING'):
+                        self.reply(dict(error='Speech cancelled by a newer robot status.'), 409); return
                     previous_sequence = self.server.command['sequence']
                 streaming = path == '/api/say' and isinstance(value, dict) and value.get('stream') is True
                 events = self.server.speech_events(value) if streaming else None
-                audio = SpeechClip(next(events)) if streaming else self.server.speech(value)
+                audio = (self.server.pick_announcement(value['text']) if path == '/api/pick-announcement' else
+                         self.server.wake_ack() if path == '/api/wake-ack' else
+                         self.server.startup_ready(sleeping=sleeping) if path == '/api/startup-ready' else
+                         SpeechClip(next(events)) if streaming else self.server.speech(value))
                 if path == '/api/speech':
                     self.audio_reply(audio); return
                 with self.server.changed:
-                    if self.server.command['sequence'] != previous_sequence:
+                    if self.server.command['sequence'] != previous_sequence or (expected_status is not None and self.server.robot_status['revision'] != expected_status):
                         if events: events.close()
                         self.reply(dict(error='Speech cancelled by a newer animation command.'), 409); return
                     identifier = uuid.uuid4().hex
                     self.server.audio = (identifier, audio)
-                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip())
+                    self.server.change_command('speaking', level=None, speech='/api/audio/' + identifier, text=value['text'].strip(),
+                                               statusRevision=expected_status, **(dict(cue=cue) if cue else {}))
                     self.server.ack = None; self.server.changed.notify_all()
                     if streaming:
                         threading.Thread(target=self.server.finish_clip, args=(audio, events, self.server.command['sequence']), daemon=True).start()
@@ -520,6 +742,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     atomic_save(self.server.config_file, value); self.server.changed.notify_all()
                 self.reply(dict(saved=True, path=str(self.server.config_file))); return
+            if path == '/api/faults':
+                self.faults_request(value); return
             if path == '/api/actions':
                 if not isinstance(value, list) or len(value) > 100 or any(not isinstance(a, dict) or not re.fullmatch(r'[a-z0-9_:-]{1,100}', a.get('id', '')) or not isinstance(a.get('label'), str) for a in value):
                     raise ValueError('Invalid animation library.')
@@ -553,11 +777,36 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, OSError) as error:
             self.reply(dict(error=str(error)), 400)
 
+    def faults_request(self, value):
+        # Only processes on this machine report faults; the display just reads them.
+        if self.client_address[0] not in ('127.0.0.1', '::1'):
+            raise ValueError('Faults are reported from this device only.')
+        if not isinstance(value, dict) or value.get('action') not in ('raise', 'clear'):
+            raise ValueError('Send action raise or clear.')
+        component = value.get('component')
+        code = value.get('code')
+        if not isinstance(component, str) or not re.fullmatch(r'[a-z0-9_-]{1,40}', component):
+            raise ValueError('Name the reporting component.')
+        if code is not None and code not in faults.CATALOG:
+            raise ValueError('Unknown fault code.')
+        if value['action'] == 'raise':
+            if code is None or not isinstance(value.get('message', ''), str):
+                raise ValueError('A raised fault needs a code and a text message.')
+            title = value.get('title'); detail = value.get('detail')
+            self.server.raise_fault(code, component, value.get('message', ''),
+                                    title=title if isinstance(title, str) else None,
+                                    detail=detail if isinstance(detail, str) else None,
+                                    auto_clear=value.get('autoClear', True) is not False)
+        else:
+            self.server.clear_fault(code, component)
+        with self.server.changed:
+            self.reply(self.server.fault_table.public())
+
     def events(self):
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store'); self.send_header('Connection', 'close'); self.end_headers()
         self.close_connection = True
-        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1
+        seen_config = None; seen_command = -1; seen_pack = None; seen_gaze = -1; seen_text = -1; seen_faults = -1; seen_visual = -1
         with self.server.changed:
             self.server.displays += 1
         try:
@@ -578,10 +827,19 @@ class Handler(SimpleHTTPRequestHandler):
                 with self.server.changed:
                     command = self.server.command.copy()
                     gaze = self.server.gaze_value()
+                    transcript = self.server.listening_text.copy()
+                    fault_state = self.server.fault_table.public()
+                    pick_visual = self.server.pick_visual_value()
                 if command['sequence'] != seen_command:
                     self.event('command', command); seen_command = command['sequence']
+                if pick_visual['sequence'] != seen_visual:
+                    self.event('pick-visual',pick_visual);seen_visual=pick_visual['sequence']
                 if gaze['sequence'] != seen_gaze:
                     self.event('gaze', gaze); seen_gaze = gaze['sequence']
+                if transcript['sequence'] != seen_text:
+                    self.event('listening-text', transcript); seen_text = transcript['sequence']
+                if fault_state['sequence'] != seen_faults:
+                    self.event('faults', fault_state); seen_faults = fault_state['sequence']
                 self.wfile.write(b': alive\n\n'); self.wfile.flush()
                 with self.server.changed:
                     self.server.changed.wait(timeout=1)
@@ -595,14 +853,37 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(f'event: {kind}\ndata: {json.dumps(value, allow_nan=False)}\n\n'.encode()); self.wfile.flush()
 
 
+def watch_network(server, interval):
+    """Name an internet/OpenAI outage even while Kuro sleeps; TCP only, never an API call."""
+    messages = dict(internet_down='Neither api.openai.com nor public internet hosts answer.',
+                    openai_unreachable='Public internet hosts answer, but api.openai.com:443 does not.')
+    while True:
+        code = faults.network_code()
+        if code:
+            server.raise_fault(code, 'network', messages[code], auto_clear=False)
+            server.clear_fault(component='network', where=lambda fault: fault['code'] != code, reason='network changed')
+        else:
+            server.clear_fault('internet_down', reason='network restored')
+            server.clear_fault(component='network', reason='network restored')
+        time.sleep(min(interval, 10) if code else interval)
+
+
 if __name__ == '__main__':
-    server = RobotServer((os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '5173'))))
+    server = RobotServer((os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '5173'))),
+                         fault_log=faults.log_path())
+    interval = float(os.environ.get('DOTS_NET_CHECK_SECONDS', '30') or 0)
+    if interval > 0:
+        threading.Thread(target=watch_network, args=(server, interval), daemon=True).start()
     print(f'Dots studio: http://{server.server_address[0]}:{server.server_port}/original-dots.html', flush=True)
     print(f'Robot display: http://{server.server_address[0]}:{server.server_port}/robot.html', flush=True)
     print(f'Configuration: {server.config_file}', flush=True)
+    from ros_status import DisplayStatus
+    status_bridge = DisplayStatus(server) if os.environ.get('DOTS_ROBOT_STATUS', '1') != '0' and (Path('/opt/ros') / os.environ.get('ROS_DISTRO', 'jazzy') / 'setup.bash').exists() else None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if status_bridge:
+            status_bridge.close()
         server.server_close()

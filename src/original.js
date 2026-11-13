@@ -1,3 +1,4 @@
+import { PickVisual } from './pick-visual.js';
 import './style.css';
 import { attachVoiceMotion, voiceMotionPose } from './native-voice.js';
 import { REST_POSE } from './motion.js';
@@ -5,6 +6,8 @@ import { ORIGINAL_ACTIONS, VOICE_ACTIONS, signatureActions, IdleMovements } from
 import { SpeechPlayer } from './speech.js';
 import { NativeFraming } from './native-framing.js';
 import { matchingBake } from './prerendered.js';
+import { connectListeningText, listeningTop } from './listening-text.js';
+import { connectFaults } from './fault-chip.js';
 
 const $ = selector => document.querySelector(selector);
 const robotView = document.body.dataset.view === 'robot';
@@ -44,6 +47,8 @@ ${actionGroup('Added voice motions', VOICE_ACTIONS)}
 <footer class="page-footer"><span>Original geometry, materials, fur, and motion.</span><a href="./">Back to procedural studio →</a></footer></main><div id="toast" class="toast" role="status"></div>
 <dialog id="tts-key-dialog" class="key-dialog" aria-labelledby="tts-key-title"><form id="tts-key-form"><h2 id="tts-key-title">Add your OpenAI API key</h2><p>Give your dot a voice. The key stays in a private file on this computer, outside the web files and character configuration.</p><label class="field-label" for="tts-key-input">OpenAI API key</label><input id="tts-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">Create an API key ↗</a> · Speech uses your OpenAI API billing.</p><p id="tts-key-error" role="alert"></p><div class="speech-buttons"><button id="tts-key-submit" class="outline-button" type="submit">Save API key</button><button id="tts-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
 if (robotView) {
+  document.querySelector('#app').insertAdjacentHTML('beforeend', '<p id="robot-listening-text" class="robot-listening-text" dir="auto" aria-label="Recognized speech" aria-live="polite" hidden></p>');
+  document.querySelector('#app').insertAdjacentHTML('beforeend', '<div id="fault-chip"></div>');
   document.querySelector('#app').insertAdjacentHTML('beforeend', '<p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>');
   document.querySelector('#app').insertAdjacentHTML('beforeend', '<div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div>');
   for (const selector of ['.topbar', '.intro', '.playback', '.idle-controls', '.animation-library', '.custom-panel', '.page-footer', '.stage-top', '.stage-name', '.stage-bottom']) $(selector).hidden = true;
@@ -59,11 +64,13 @@ const framing = robotView ? new NativeFraming() : null;
 let configLoaded = false, fileConfig, saveQueued = null, saving = false, events, commandLevel = null, desiredState = 'idle', lastCommand = -1;
 let saveAfter = 0;
 let commandGeneration = '';
+const pickVisual = new PickVisual();
+let planningOverlay = false;
 const speech = new SpeechPlayer(text => {
   const subtitles = $('#robot-subtitles');
   if (subtitles) { subtitles.textContent = text; subtitles.hidden = !text; }
 });
-let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch = null;
+let speechRequest = 0, pendingSpeech = null, keyConfigured = false, speechFetch = null, listening = null;
 let voiceInfo = null;
 let voiceMigrationNote = '';
 let toastTimer;
@@ -134,6 +141,9 @@ async function persistConfig(value) {
 }
 function connectRobot() {
   events = new EventSource('/api/events');
+  events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
+  if (robotView) listening = connectListeningText(events, $('#robot-listening-text'), () => framing?.reset());
+  if (robotView) connectFaults(events, $('#fault-chip'));
   events.onopen = () => { $('#robot-connection').textContent = 'Connected'; api('actions', actions.map(({ id, label }) => ({ id, label }))).catch(error => toast(error.message)); };
   events.onerror = () => { $('#robot-connection').textContent = 'Reconnecting…'; };
   events.addEventListener('config-error', event => toast(JSON.parse(event.data).error));
@@ -153,13 +163,17 @@ function connectRobot() {
     const command = JSON.parse(event.data);
     if (command.generation === commandGeneration && command.sequence <= lastCommand) return;
     commandGeneration = command.generation; lastCommand = command.sequence; commandLevel = null;
+    listening?.command(command);
     const definition = actions.find(a => a.id === command.state);
     let error = '';
     if (!definition) error = 'This state is unavailable in the installed renderer.';
     else if (command.state === 'signature' && !signatureAvailable) error = 'Your customized outfit has no original signature. Use a named signature preview or wave.';
     else {
       desiredState = command.state;
-      playAction(command.speech ? 'idle' : command.state, false); commandLevel = command.level;
+      const target = command.speech ? 'idle' : pickVisual.state(command.state, performance.now());
+      const overlay = !command.speech && target !== command.state;
+      if (!(overlay && planningOverlay)) playAction(target, false);
+      planningOverlay = overlay; commandLevel = command.level;
       if (command.speech) {
         pendingSpeech = command;
         resumeRobotVoice();
@@ -295,6 +309,8 @@ async function resumeRobotVoice() {
     if (request !== speechRequest) return;
     if (!response.ok) throw new Error((await response.json()).error || 'Unable to load speech.');
     await playSpeech(response, command.text || '');
+    // The voice agent keeps the microphone held until this ack, so the chime marks the moment it reopens.
+    if (command.cue === 'listen' && request === speechRequest) await speech.chime();
   } catch (failure) {
     if (failure.name === 'AbortError' || (request !== undefined && request !== speechRequest)) return;
     error = failure.message; toast(error);
@@ -386,7 +402,7 @@ function playAction(id, manual = true, keepSpeech = false) {
   const definition = actions.find(action => action.id === id); if (!definition) return;
   framing?.reset();
   if (!keepSpeech) stopSpeech();
-  if (manual) stopTour();
+  if (manual) { desiredState = id; stopTour(); }
   commandLevel = null;
   interruptAction();
   try {
@@ -400,7 +416,7 @@ function playAction(id, manual = true, keepSpeech = false) {
     } else startActivity(definition.activity || 7);
     if (definition.kind === 'voice') { voiceState = id; voiceTime = 0; voicePaused = false; }
     if (definition.duration) {
-      const action = activeAction = { definition, elapsed: 0, started: false, cue: 0, released: false, stopped: false };
+      const action = activeAction = { definition, manual, elapsed: 0, started: false, cue: 0, released: false, stopped: false };
       character.onFirstFrame(() => {
         if (activeAction !== action) return;
         $('#native-loading').hidden = true; syncVoiceControls();
@@ -468,6 +484,12 @@ function frame(now) {
     if (tourIndex >= 0 && !activeAction && now >= nextTourAt) { tourIndex++; stepTour(now); }
     try {
       const dt = Math.min(0.05, Math.max(0, (now - voiceNow) / 1000)); voiceNow = now;
+      const overlay = pickVisual.state(desiredState, now, !!pendingSpeech || !!activeAction?.manual || tourIndex >= 0) !== desiredState;
+      if (overlay && !planningOverlay) { planningOverlay = true; playAction('thinking', false, true); }
+      else if (!overlay && planningOverlay) {
+        planningOverlay = false;
+        if (current === 5 && !activeAction && !voiceState) playAction(desiredState, false, true);
+      }
       tickAction(dt, now / 1000);
       const randomAction = idleMovements.tick(dt, { idle: idleEligible() && !pointerInside,
         enabled: $('#native-auto').checked, reduced: $('#native-reduced').checked, signatureAvailable });
@@ -492,7 +514,8 @@ function frame(now) {
         const subtitles = $('#robot-subtitles');
         if (!subtitles.hidden) bottom = Math.min(bottom, subtitles.getBoundingClientRect().top - 12);
         const canvas = $('#original-character');
-        const size = framing.update(canvas, rect.width, Math.max(1, bottom - rect.top), rendered);
+        const offset = listeningTop($('#robot-listening-text'), rect);
+        const size = framing.update(canvas, rect.width, Math.max(1, bottom - rect.top - offset), rendered, offset);
         if (size) character.setDisplayScale(canvas.width / size);
       }
       if (((savePending && now >= saveAfter) || syncPending) && !previewLook && !character.hasPendingUpdate()) {

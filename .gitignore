@@ -10,3 +10,6 @@ __pycache__/
 .env.*
 respeaker-config.json
 respeaker-backup.json
+ros2/build/
+ros2/install/
+ros2/.build.lock

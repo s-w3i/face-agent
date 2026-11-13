@@ -1,262 +1,687 @@
-# Mimo character studio
+# Face agent · Kuro
 
-A lightweight, real-time 3D companion playground, visually reconstructed around dots' sculptural forms, saturated colors, flocked surfaces, and minimal faces. The procedural studio generates its geometry and animation locally; the optional original mode loads resources imported from the installed app. Customization reference: https://learn.chatgpt.com/docs/dots
+Kuro is a robot companion with a browser face, ReSpeaker voice input, OpenAI conversation and speech, and ROS 2 control. An Orbbec camera can track the person speaking, move the eyes, and provide visual grounding when a question needs it. The Raspberry Pi can play a pre-rendered character while keeping speech and eye tracking live.
 
-The **Reference looks** buttons recreate four visual combinations: blue six-lobed blob with a black beret, lime round body with raised eyes, yellow teardrop with relaxed eyes and glasses, and pink heart with sunglasses. The model has no limbs, mouth, or cheeks. Each look remains fully customizable.
+This guide describes the `pi5` branch on Ubuntu 24.04 with ROS 2 Jazzy. The built web app and an example animation pack are included; Node.js is only needed when changing the frontend.
 
-## Original dots renderer
+## 1. Install and configure
 
-Open `/original-dots.html`, or use **Original dots renderer** in the studio header. This mode uses the actual geometry, materials, fur, character presets, and native activities from the installed desktop app. It includes 108 original presets, native shape/color/eye/glasses/accessory choices, body depth, Compact/Balanced quality, reduced motion, saved appearance, and export/import of the native look.
+Use a graphical Linux session for the robot window. Install ROS 2 Jazzy first, with its apt repository configured. Voice conversations need a ReSpeaker USB microphone, speakers, internet access, and an OpenAI API key with API billing enabled. Camera tracking is optional.
 
-The library exposes every animation action in the copied 0.11.0 binding: all nine activity states, Wave, the current outfit's Signature, native gaze in four directions, native press/drag/release interactions, and four completion outcomes (ArtifactReady, PaymentPaid, InputReceived, ThinkingResolved). Completion demos start the associated activity, send its Stop outcome after 2.5 seconds, then return to Idle / Ready. These visual demos make no payment or network request. All eight original hero signatures have their own preview button. Those previews temporarily show the corresponding outfit, restore your appearance after eight seconds or any manual interruption, and leave the saved look intact. Customization is temporarily disabled during an outfit preview. Custom outfits can use Wave; their current-outfit Signature shortcut is disabled.
-
-**Random idle movements** is on by default. During **Idle / Ready**, a movement plays about every 9–15 seconds: a glance, native press/drag interaction, Wave, or the current hero's Signature. It never changes your outfit and avoids consecutive repeats. Use the interval slider or **Try random now** to test it. Automatic actions wait during all other statuses, cursor tracking, and **Play all**, and pause with Reduced motion or a hidden page. Finite actions return to idle; manual selections cancel the pending action. **Play all** previews 30 library entries, including every original signature and both added voice states, then returns to idle. It omits the redundant current-outfit Signature shortcut.
-
-Sleeping calls the native **Paused** activity (closed eyes and sleep marks). Ready includes cursor-following gaze. The inspected binding has no voice-specific commands. The studio now adds **Listening** (attentive stretch, forward lean, acknowledgment nods) and **Speaking** (syllable stretch, taper and contour ripples) directly to the original character's vertex shader. Body, fitted face parts, fur, and shadow geometry share the deformation; the copied runtime files are unchanged. This is a local renderer integration, not a published OpenAI SDK.
-
-Select Listening or Speaking to enable **Body motion time**, **Pause body motion**, and **Motion strength**. Scrubbing freezes the added deformation at an exact time; the original Ready idle/blinks continue underneath. Speaking defaults to a five-second demo phrase. **Speech drive → Fixed speech level** allows comparison from silence (0%, neutral body) to full level (100%). Reduced motion makes the added pose static and gentler. OpenAI speech playback now supplies the actual audio amplitude to `voiceMotionPose()` in `src/native-voice.js`. The demo/fixed controls remain available for silent animation tests. Terminal chatbot input is available through `scripts/chat.py`, with `--mode words` or `--mode voice`.
-
-The extension is verified against the copied 0.11.0 renderer. It patches only this canvas's shader compilation and reads the body's bounds from its existing uniform upload. It adds no new render pass, graphics library, or per-frame mesh rebuild. Because this is an internal renderer layout, an app update requires rechecking the shader and uniform layout before importing its resources.
-
-## Terminal chatbot (OpenAI Agents SDK)
-
-Start `./run.sh` or `./run.sh --robot`, then in another terminal run:
+Clone into your home directory, or use your existing checkout:
 
 ```bash
-.venv/bin/python scripts/chat.py
-# Explicit typed input with camera-only tracking:
-.venv/bin/python scripts/chat.py --mode words
-# Microphone/STT input with speech-direction-assisted camera tracking:
+cd ~
+git clone --branch pi5 https://github.com/s-w3i/face-agent.git
+cd face-agent
+```
+
+Install the application dependencies and build its ROS message/service types:
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv build-essential cmake \
+  ros-jazzy-ament-cmake ros-jazzy-rosidl-default-generators
+source /opt/ros/jazzy/setup.bash
+bash scripts/setup_respeaker.sh
+bash scripts/setup_robot_status.sh
+```
+
+The setup creates `.venv/`. Wake detection uses Whisper base on the Hailo-8L when its model files are installed (`scripts/setup_respeaker.sh` downloads them); otherwise local Whisper on the CPU handles it and downloads its model on first use, so the first voice launch can take longer. See [docs/wake-word.md](docs/wake-word.md).
+
+Install Chromium if needed:
+
+```bash
+sudo snap install chromium
+```
+
+Alternatively, set `DOTS_BROWSER=/absolute/path/to/chromium` when launching. The browser must run in your desktop session.
+
+Start the local service:
+
+```bash
+./run.sh
+```
+
+Open [the character studio](http://127.0.0.1:5173/original-dots.html). Set **Character name** to **Kuro**, choose a **Speaking voice**, and use **Voice → Set up API key**. Test the speaker with **Play sample**. Appearance, name, voice, and display settings save automatically to `robot-config.json`.
+
+The key is stored separately at `~/.config/mimo-dots/openai-api-key`, outside the repository, with private file permissions. You can instead supply `OPENAI_API_KEY` to both the service and chatbot terminals. Each computer needs its own key setup; copying character files does not copy the key.
+
+Stop this setup server with **Ctrl+C** before starting the robot window below.
+
+## 2. Run the robot and chatbot
+
+Run each component in its own terminal. Begin each terminal in the repository:
+
+```bash
+cd ~/face-agent
+source /opt/ros/jazzy/setup.bash
+```
+
+**Terminal 1 — robot display:**
+
+```bash
+DOTS_RENDERER=prerendered ./run.sh --robot
+```
+
+This opens a fullscreen Chromium window with automatic audio playback. The pre-rendered mode uses the bundled animation pack. Use `./run.sh --robot` to follow the renderer selected in the saved configuration. Set `DOTS_FULLSCREEN=0` for a normal window.
+
+**Terminal 2 — camera, if tracking is wanted:**
+
+```bash
+./camera.sh
+```
+
+See [camera and eye tracking](#camera-and-eye-tracking) for driver installation and the point-cloud profile. Skip this terminal if you are running without a camera.
+
+**Terminal 3 — voice conversation:**
+
+```bash
 .venv/bin/python scripts/chat.py --mode voice
 ```
 
-Words mode is the default. It starts asleep and sends `sleeping` to the connected display. At `you>`, submit `Hi {name}` using the current Character name from settings (for example, `Hi Shiro`). The greeting is case-insensitive and may include a command, such as `Hi Shiro, what time is it?`. Input without the wake greeting is silently ignored while asleep, with no model or speech request. Once awake, type ordinary messages. Thirty seconds without a submitted line after spoken playback finishes sends the robot back to sleep; wake it again with the greeting. The countdown starts on the connected display’s playback acknowledgment, rather than when speech is queued. You can submit another command while it is speaking in words mode. With `--no-speak`, or with no connected display, the countdown starts after the printed reply. Terminal input counts when you press Enter. Standalone thanks or farewells (including “thankyou”) get a natural closing reply, then sleep immediately after speech completes. If the same message contains another request, the chatbot handles it and stays awake. Conversation history survives sleep, until `/reset` or exit; `/quit` exits even while asleep. The [OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/quickstart?lang=python) runs the chatbot with tools to list and play supported animations. Open the robot display to load those animations. The character shows Thinking while answering and returns to Idle unless the agent chose an animation. Typed chat works even with the display/service offline.
-
-Voice mode starts the existing ReSpeaker pipeline and calibrates background on every launch. Keep silent until `Voice mode ready` appears, then speak normally without a wake phrase. Partial transcription updates the terminal line; each final transcript goes to the same `Chatbot.reply()` history and tools as typed text. The main chat prompt shows conversation text rather than microphone diagnostic JSON. End-of-speech detection, channel 0 and opening-word pre-roll are retained. `/reset` and `/quit` remain terminal controls. After idle sleep or a closing reply, the next detected speech starts a new interaction. Choose the mode when launching chat; the microphone process is only started in voice mode.
-
-Voice mode confirms the microphone's pause before inference and before sending a spoken reply. While paused, speech clips, diagnostic audio and new STT audio stop; local DSP processing continues to keep the array warm. Active speech/pre-roll and delayed transcripts are discarded at the gate. The display's matching playback acknowledgment releases input, with a 0.5-second clearance before the Listening animation returns. Unconfirmed playback is cancelled first; unavailable playback status keeps input closed. This is a half-duplex conversation: speak when the robot returns to Listening. Typed input keeps its existing ability to interrupt replies. Restart the updated robot service before using voice mode. A lost USB device or interrupted capture triggers up to five microphone restart attempts, two seconds apart. Each successful restart repeats background calibration with input closed, clears old audio/hints, and preserves agent history. Keep silent during recalibration. Input resumes only after checking current robot playback. Missing hardware after five attempts, API failures and configuration errors stop voice chat with a short error. Microphone stderr is in `~/.cache/face-agent/microphone-chat.log` (`XDG_CACHE_HOME` overrides the cache root).
-
-The confirmed mounting is native microphone **0° at camera centre, increasing toward camera left**. Voice-mode face selection combines that DOA hint with `/head_camera/color/camera_info` intrinsics. It requires a fresh front-facing hint, a face within 20° of it, a clear 5° advantage over other candidate faces, and the existing three identity confirmations. Missing calibration, rear sound, stale hints and ambiguous matches cannot select a new person. Once selected, visual identity tracking follows that person through movement, occlusion and robot speech. A new utterance can select a different speaker after the same confirmations; a single noisy DOA update cannot switch the target. Words mode retains camera-centre acquisition and its camera-only person lock until sleep. `--mic-forward-deg ANGLE` and `--mic-clockwise` override mounting alignment for another robot; `--language en` and `--stt-model gpt-transcribe` configure the microphone input. Setup and practical limits are in [human tracking](docs/human-tracking.md) and the ReSpeaker section below.
-
-The chatbot uses `OPENAI_API_KEY` or the private key saved through studio Voice settings. Internet and API billing are required. History stays in process memory and is sent to OpenAI each turn; SDK trace uploads are disabled. The reasoning backend defaults to `gpt-6-luna`. Use `--model MODEL_ID` or `OPENAI_CHAT_MODEL` to override it. `--url` or `DOTS_URL` selects the display service.
-
-Replies print in the terminal and speak by default through the existing speech service, saved voice, subtitles, and body motion. Use `--no-speak` for text-only replies. Speech needs the local service and a display with audio enabled. Voice input also needs the updated local service for playback gating and camera hints, plus the one-time ReSpeaker setup below.
-
-Offline checks: `.venv/bin/python -m unittest discover -s test -p test_chat.py` and `.venv/bin/python -m unittest discover -s test -p test_voice_input.py`.
-
-The chatbot reads its name from `appearance.name` in the live service's settings on every turn (falling back to `DOTS_CONFIG` or `robot-config.json` if offline). Change **Character name** in the studio and the next turn uses it. Its date/time tool reads the computer clock, defaulting to `Asia/Kuala_Lumpur`; set `DOTS_TIMEZONE` to another IANA timezone if needed. Keep the computer clock synchronized for accurate answers.
-
-OpenAI's hosted web-search tool is enabled with live internet access, using the same API key. The bot can search current facts and weather, with conversational replies; source sections and links are removed before display and speech. Weather prioritizes the city you specify or have established in the conversation. Otherwise, the current_location tool estimates the robot computer’s city through https://ipapi.co/json/ before asking. This sends a request to ipapi.co (which sees the public IP); only city, region, and country are returned to the model, not the IP itself. IP location can be inaccurate, especially with VPNs, and locates the robot computer’s connection rather than GPS. If lookup fails it asks for a city. Set DOTS_CITY="Kajang, Malaysia" to use a fixed city without contacting the location provider. Search adds API usage charges. Try “What is your name?”, “What date and time is it?”, “Search today's technology news”, or “What is the weather in Kuala Lumpur today?”.
-
-## Turtlesim MCP control
-
-The chatbot can connect to `scripts/turtlesim_mcp.py`, a local stdio MCP server using native `rclpy` communication. Movement publishes `geometry_msgs/Twist` on `/turtle1/cmd_vel`, reads `turtlesim/Pose` from `/turtle1/pose`, and runs the `turtlesim/RotateAbsolute` action on `/turtle1/rotate_absolute` for heading commands. It never shells out to `ros2 topic pub` or `ros2 action send_goal`. Turtlesim has no native go-to-position action; room navigation uses a 20 Hz pose-feedback controller over its velocity topic.
-
-With ROS 2 Humble and turtlesim installed, source ROS in the terminal that runs the chatbot, then install the optional dependencies once:
+The chatbot starts the eye tracker automatically. To run voice without a camera:
 
 ```bash
-source /opt/ros/humble/setup.bash
-.venv/bin/python -m pip install -r requirements-turtlesim.txt
-.venv/bin/python scripts/chat.py --turtlesim
+.venv/bin/python scripts/chat.py --mode voice --no-track
 ```
 
-Launch your turtlesim separately and keep its `ROS_DOMAIN_ID`, ROS middleware, and discovery settings consistent with the chatbot. The chatbot starts and closes the MCP server automatically. Startup commands above only launch software; robot commands flow through MCP and ROS APIs. Python must match your ROS installation (Humble on this machine uses Python 3.10). Speech still uses the face display service.
+For typed input, use:
 
-Wake with `Hi Shiro` (or your saved character name), then ask “Go to the kitchen”, “Where is the turtle?”, “Stop the turtle”, or “Turn to face north”. The MCP tools are `list_destinations`, `go_to_room`, `robot_status`, `stop_robot`, `rotate_robot`, `move_straight`, and `turn_robot`. Movement tools queue their request without moving the turtle. The chatbot generates and speaks its departure announcement first, waits for the display’s successful playback acknowledgment, then releases the queued motion through a runtime-only MCP tool (hidden from the model). If speech fails, is interrupted, has no connected display, or is not confirmed within 120 seconds, motion is cancelled. In explicit --no-speak mode, the printed announcement releases motion immediately. It then monitors live MCP status to generate a spoken arrival or failure report automatically, once per motion. The report waits until any current spoken reply finishes; input remains available while moving. Completion reports cannot invoke movement tools. Stop before sending a different destination while it is moving. “Go straight” moves one simulation unit; “go straight two meters” moves two units along the current heading. Turtlesim has no real meter scale, so this interface maps a requested meter to one simulation unit. Negative distance in move_straight moves backwards. “Turn left” or “turn right” defaults to ninety degrees; explicit relative turns support one through 180 degrees. Targets beyond the safe canvas boundary are rejected. Sleep does not cancel an active navigation task; stopping or exiting the MCP server does.
+```bash
+.venv/bin/python scripts/chat.py --mode words --no-track
+```
 
-Fixed points are in `turtlesim-waypoints.json`:
+Replies speak through the browser and appear as subtitles. Add `--no-speak` for text-only replies. `/reset` clears conversation history; `/quit` exits. `--help` lists all chatbot options. Keep the service and a display open for speech playback.
 
-| Room | x | y |
+### Conversation and sleep behavior
+
+A newly started status manager begins in **IDLE**. If a manager is already running, its current state is reused.
+
+- **IDLE:** monitors the ReSpeaker hardware voice flag. Speech starts **LISTENING** and opens recording.
+- **LISTENING:** records one utterance, ending after **2 seconds of continuous nonspeech**, then enters **THINKING**. A conversation or another ROS node can also request LISTENING directly when an answer is needed.
+- **THINKING / SPEAKING:** command capture is paused, but the wake word stays live. **Barge-in:** saying “Hi Kuro” while Kuro is **thinking** cancels that turn (its answer is never spoken or shown) and moves to LISTENING. Anything said straight after the phrase (“Hi Kuro, stop. What's the weather?”) is kept as the new request. There's no spoken acknowledgment; the LISTENING animation and the LED ring are the feedback. Interrupting **speech** as well needs the speaker on the ReSpeaker jack (hardware echo cancellation, see “Speaker and echo cancellation”), so it's off until `DOTS_BARGE_IN_SPEAKING=1` (chat `--barge-in-speaking`). After an interrupted spoken reply, the agent is told that the user interrupted it. `DOTS_BARGE_IN=0` (`--no-barge-in`) disables barge-in entirely. It needs a streaming wake engine (rolling or openWakeWord) and isn't available in legacy `--no-robot-status` mode. After the reply finishes, Kuro returns to IDLE.
+- **SLEEPING:** the **rolling** wake engine listens for **“Hi Kuro”** (or “Hey Kuro”) on the continuous microphone stream: every second, while there is speech, Whisper base on the Hailo-8L scores how likely the last 3 seconds are to contain the phrase, with a CPU Whisper tiny.en check for borderline windows ([docs/wake-word.md](docs/wake-word.md)). It works for any speaker and any character name without training, and it keeps listening through TV and conversation. Without the Hailo model files, a matching [openWakeWord](docs/wake-word-training.md) model is used, else local Whisper checks VAD segments for “Hi <name>” (`Wake engine: …` in the agent log says which one is active). Other speech is ignored. Wake detection never appears on the display, and sleeping audio is not sent to OpenAI. A command spoken in the same breath (“Hi Kuro, what time is it?”) is answered with any engine.
+- **WORKING / DETECTING / ERROR:** show their corresponding animation and pause microphone capture. The wake word is heard but never interrupts navigation or motion.
+
+Kuro sleeps after **8 seconds of inactivity** while command input is available (`IDLE_SECONDS` in `scripts/robot_states.py`). Recording, transcription, thinking, and speech playback do not count toward that timeout. A goodbye or thank-you without a further request produces a closing reply and then sleeps.
+
+**Knowing when Kuro is listening.** Whenever Kuro is awake and waiting for you in voice mode, **“Listening…”** appears above the character with a thin bar under it that drains over the 8 seconds. When the bar runs out, Kuro falls asleep, and you need “Hi Kuro” again. After each spoken reply, a short two-note **chime** marks the moment the microphone opens again, so you can ask a follow-up without the wake word. The chime plays while capture is still held, so it is never transcribed. The wake greeting (“Yes? I am here…”) and closing replies have no chime. During a pick mission, when Kuro never falls asleep, the caption shows without the bar. Typed chat shows neither.
+
+Conversation input appears centered above the character, in place of “Listening…”; smaller reply subtitles appear below. Input text clears on entering THINKING or any other non-input state. Awake commands use GPT Realtime transcription; wake detection stays local.
+
+Temporary Realtime disconnections, transcription timeouts, audio queue overflow, an unexpected voice worker exit, or a stalled playback gate automatically restart the microphone/transcription worker. The agent shows ERROR with input paused while reconnecting, then returns to IDLE only after the replacement worker is ready. Retries wait 1, 2, 4, 8, 15, then 30 seconds between attempts, continuing at 30 seconds while unavailable. Conversation history stays intact; repeat the interrupted utterance, which is never automatically replayed. Recovery stops if another ROS node changes the status, including publishing its own ERROR. Rejected credentials, quota, or configuration need correction; after fixing them, set IDLE to retry. Other unrelated errors remain visible as ERROR. The corner chip and `./doctor.sh` name the cause in each case (see [Diagnosing problems](#diagnosing-problems)), and update it while retrying, for example from **No internet** to **OpenAI unreachable**.
+
+Inside the microphone worker, every thread is supervised:
+- Audio that overflows or drops during an utterance discards only that utterance.
+- If the command recorder raises, it discards its utterance and restarts, up to 3 times a minute.
+- If the wake-word thread raises, it restarts up to 3 times in 5 minutes. After that the worker reports a `wake_engine` failure, and the replacement worker uses Whisper wake detection for the rest of the session.
+- A thread that stops responding for 2 seconds is logged with its stack, and the worker is replaced through the reconnect path above.
+- A stalled audio stream is reopened three times before it counts as a USB disconnect.
+
+Once a minute the worker writes a `metrics` line to `~/.cache/face-agent/microphone-chat.log`: frames, overflows, stream reopens, per-consumer queue depth and drops, wake detections and peak score, CPU seconds per thread, RSS and thread count. Warnings are logged there too, for example a wake detector that drops more than 1% of audio over 10 seconds. None of this is sent to the display or to OpenAI.
+
+To start asleep, run the manager **before** the display or chatbot in another terminal:
+
+```bash
+./robot-status.sh --initial-status SLEEPING
+```
+
+That option only sets the initial state of a new manager. Use the service below to change an existing manager.
+
+### Ask questions that need vision
+
+Vision is enabled by default in both voice and typed chat. Start the ROS camera, then speak naturally:
+
+- “Hi Kuro, is my outfit suitable for a casual lunch out?”
+- “What am I holding?”
+- “What is this?” while showing an object.
+- “Can you read what this says?”
+
+The agent decides from the request and conversation whether it needs a camera image. No separate vision mode or trigger is needed. Ordinary greetings, general knowledge, and questions about pasted code/errors do not require camera capture. Visual reasoning stays in THINKING with microphone capture paused, and the answer uses the normal voice/subtitles.
+
+Kuro requests a fresh color frame from `/head_camera/color/image_raw/compressed`, then reasons over the actual image with the conversation model. Small objects can get one focused second look; each turn allows at most two captures. If the view is unclear or the camera is unavailable, Kuro should say so and ask for a clearer view. Hold objects near enough to see their shape/details; step back to show your full outfit. A single camera view cannot reveal parts outside the frame or reliably identify which person you mean in a crowd.
+
+The chatbot starts a persistent ROS camera subscriber at launch, retaining only the latest compressed frame in memory. Requested snapshots reuse that subscriber, avoiding Python startup and ROS discovery on every visual question. It encodes images only on request and closes its helper when the chatbot exits. Disconnected helpers restart on the next request; cancelled requests discard their helper so a late response cannot enter another turn. Camera failures do not prevent ordinary conversation.
+
+Only requested snapshots are sent to OpenAI, using the existing API key. The camera helper limits them to 1280 pixels on the longest side and rejects frames older than one second. Images are not saved to disk or retained in the next turn's conversation history; text observations/replies remain available for follow-up. This is on-demand image input, not continuous video upload. Visual requests add image API usage. Eye tracking itself continues to process images locally.
+
+A typical visual answer uses two model calls: one to request the camera tool, then one to answer from the image. A focused second look adds another call. The persistent subscriber speeds up local capture; it does not remove these model calls. Vision logs include the snapshot duration to distinguish camera delay from model/network delay. The diagnostic command below uses a separate one-shot subscriber, so its startup time does not represent warm chatbot snapshots.
+
+Use `--no-vision` to disable image access, or set `DOTS_VISION=0` in the startup settings. `--no-track` disables eye tracking independently and leaves vision available. For another ROS color topic:
+
+```bash
+.venv/bin/python scripts/chat.py --mode voice \
+  --camera-topic /head_camera/color/image_raw/compressed
+```
+
+`DOTS_CAMERA_TOPIC` supplies the same setting, including through `~/.config/face-agent/startup.env`. Vision needs the system `python3-pil` package, installed by `scripts/setup_respeaker.sh`. For a local capture check without sending an image to OpenAI:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 scripts/camera_snapshot.py --check
+```
+
+This prints timestamp, size, and freshness only. Use a vision-capable model if overriding `--model`; the default `gpt-6-luna` accepts image input. See the [OpenAI image input guide](https://developers.openai.com/api/docs/guides/images-vision) for API behavior.
+
+### Stop and restart
+
+Use `/quit` or **Ctrl+C** in the chatbot terminal to stop voice input and its owned tracker. Close the robot window or press **Ctrl+C** in its launcher terminal. Stop the camera with **Ctrl+C** in its terminal.
+
+The shared status manager survives display/chat exits. If started explicitly with `./robot-status.sh`, stop it in that terminal with **Ctrl+C**. Otherwise, restarting the display/chat reuses it; set IDLE through the service to resume an existing sleeping or busy session.
+
+## Start the full stack automatically at boot
+
+After completing the one-time setup above, install desktop startup **as your normal user, without sudo**:
+
+```bash
+cd ~/face-agent
+python3 scripts/install_startup.py
+scripts/desktop_start.sh
+```
+
+This installs the `face-agent.service` user service and a desktop autostart entry. It launches the ROS status manager, camera, fullscreen face display, and voice chatbot with eye tracking. The chatbot waits until the display and ROS status are ready. Failed components restart automatically; closing the face window while the service is running opens it again.
+
+A fresh manager starts in SLEEPING, waiting for “Hi Kuro” or a ROS status command. An existing status manager keeps its state. The startup camera profile is `camera-rgbd.sh`, providing color, depth, and an XYZ point cloud. To run the same stack manually in the foreground, use `./start-stack.sh`; **Ctrl+C** stops its components. Stop any separately launched display/camera/chat first.
+
+The display requires a logged-in desktop. Enable **Automatic Login** for your account in Ubuntu **Settings → System → Users** to launch after power-on without signing in. On this Pi's GDM desktop, the alternative helper is:
+
+```bash
+scripts/enable_autologin.sh
+```
+
+Run the helper as your desktop user, without sudo. It uses Ubuntu AccountsService and may show an administrator authentication dialog. The change applies on the next boot without restarting the current session. Automatic login opens the desktop without a password after power-on.
+
+Startup settings are in `~/.config/face-agent/startup.env`:
+
+```bash
+DOTS_RENDERER=prerendered
+DOTS_FULLSCREEN=1
+DOTS_CAMERA_PROFILE=rgbd  # Use color for the lower-bandwidth camera.sh profile.
+# DOTS_CAMERA_USB_RESET=1  # 0 disables the automatic USB reset when the Orbbec gets stuck after a USB drop
+DOTS_INITIAL_STATUS=SLEEPING
+# PORT=5173
+# ROS_DOMAIN_ID=0
+# DOTS_WAKE_ENGINE=auto            # auto | rolling | oww | whisper
+# DOTS_WAKE_ROLLING_THRESHOLD=-3.3 # rolling: lower wakes more easily (and falsely)
+# DOTS_WAKE_VERIFY_FLOOR=-5.5      # rolling: higher (e.g. -5.0) saves CPU in noisy rooms, misses more
+# DOTS_WAKE_MODEL_PATH=~/.local/share/face-agent/wake/hi_kuro.onnx
+# DOTS_BARGE_IN=1                  # 0 disables wake-word barge-in
+# DOTS_BARGE_IN_SPEAKING=0         # 1 only with the speaker on the ReSpeaker jack
+# DOTS_TRACKER_BACKEND=auto        # auto | hailo | opencv
+# DOTS_OFFLINE_STT=hailo           # hailo | cpu | off
+```
+
+Edit the file, then restart the service. The installer preserves existing startup settings. An API key supplied only in the installer's environment is saved to the application's private key file so it is available after reboot; it is never placed in the service or desktop entry.
+
+```bash
+systemctl --user restart face-agent.service
+systemctl --user status face-agent.service
+journalctl --user -u face-agent.service -f
+
+# Stop the stack for manual testing:
+systemctl --user stop face-agent.service
+# Disable startup and stop the stack; keep settings and API key:
+python3 scripts/install_startup.py --remove
+```
+
+Component logs are `~/.cache/face-agent/stack-{status,camera,display,agent}.log`. Every `*.log` in that directory is rotated by the stack supervisor (checked every minute and at startup): a file over `DOTS_LOG_MAX_MB` (default 10) keeps its newest `DOTS_LOG_MAX_MB` as `<name>.log.1`, older backups shift up to `DOTS_LOG_KEEP` (default 3), and the live file is truncated in place. Set these in the startup settings. Routine HTTP access logs are off in stack mode; set `DOTS_ACCESS_LOG=1` in the startup settings to enable them. Re-run the installer if you move the repository. Startup does not install missing ROS or microphone dependencies; complete setup first.
+
+## Diagnosing problems
+
+When something goes wrong, a small chip in the top-right corner of the face names it: **No internet**, **Mic disconnected**, **API key rejected**, **OpenAI unreachable** and so on. Blocking problems (Kuro shows ERROR) appear in a muted red. Problems Kuro works around (offline transcription, tracking on the CPU, camera missing) appear as a fainter grey chip while the face carries on normally. Tap the chip for the message, the fix and how long it has lasted. The chip disappears once the problem clears. If Kuro is in ERROR without a reported cause, the chip says **Error · run ./doctor.sh**; if the face loses the local service for more than 5 seconds, it says **Service offline**.
+
+On the robot, run:
+
+```bash
+./doctor.sh            # active faults, live checks, the last 24 h of faults, recent log warnings
+./doctor.sh --detail   # also tracebacks and component log tails
+./doctor.sh -f         # follow new fault events live
+./doctor.sh --since 2h --json
+```
+
+The live checks cover internet vs. OpenAI reachability (TCP only; no API request or key is sent), the ReSpeaker USB device and its permissions, the default PipeWire microphone, the Orbbec camera, Hailo-8L and `hailort.service`, `face-agent.service`, the ROS status manager, the API key file, the navigation robot from `DOTS_NAV_MCP_URL`, and disk space. The exit status is 1 while any check fails or a blocking fault is active.
+
+Faults are recorded in `~/.cache/face-agent/faults.log`, one JSON object per line: `raise`, `update` (new message) and `clear` events with the code, component, message, fix and, for errors, the traceback. Repeats during a retry loop are counted rather than logged again, and the log is rotated with the other component logs. The display service keeps the live fault table; every component reports to it and writes the file directly only while the display service is down. The display itself never receives tracebacks. The service checks the network every 30 seconds (`DOTS_NET_CHECK_SECONDS`, `0` disables), so an outage is named even while Kuro sleeps. Another ROS node's ERROR shows as **Error set externally** with that node's `source`.
+
+| Code | Severity | Chip | Fix |
+| --- | --- | --- | --- |
+| `openai_auth` | error | API key rejected | Update the key in the studio (Voice → Set up API key), then set IDLE or restart face-agent.service. |
+| `openai_quota` | error | OpenAI quota used up | Add credit or raise the limit in OpenAI billing, then set IDLE or restart face-agent.service. |
+| `internet_down` | error | No internet | Check the Wi-Fi/Ethernet link and the router. Kuro retries by itself. |
+| `mic_disconnected` | error | Mic disconnected | Replug the ReSpeaker USB cable (try another port or hub). Kuro reconnects by itself. |
+| `mic_permission` | error | Mic access denied | USB permission denied: add the udev rule and the plugdev group (README → ReSpeaker), then replug. |
+| `openai_unreachable` | error | OpenAI unreachable | The internet works but api.openai.com does not answer. Check status.openai.com, DNS or a firewall. Kuro retries by itself. |
+| `ros_status_lost` | error | ROS status lost | The ROS status bridge stopped. Check stack-status.log and ROS_DOMAIN_ID, then restart face-agent.service. |
+| `mic_worker_failed` | error | Microphone failed | The microphone worker failed. See microphone-chat.log; Kuro restarts it by itself. |
+| `realtime_unavailable` | error | Transcription down | OpenAI Realtime transcription failed although the network works. Kuro reconnects by itself. |
+| `openai_rate_limit` | error | OpenAI rate limited | Too many requests. Wait a minute; Kuro retries by itself. |
+| `openai_timeout` | error | OpenAI timed out | A slow network or a slow OpenAI response. If it keeps happening, check the connection. |
+| `openai_error` | error | OpenAI error | OpenAI returned an error. Run ./doctor.sh --detail for the message. |
+| `speech_failed` | error | Speech failed | The spoken reply could not be generated or played. Run ./doctor.sh --detail. |
+| `external_error` | error | Error set externally | Another ROS node set ERROR. Fix that node, then set IDLE. |
+| `agent_error` | error | Agent error | An unexpected error. Run ./doctor.sh --detail for the traceback. |
+| `component_restarting` | degraded | Restarting | A stack component exited and is restarting. Run ./doctor.sh --detail for its last log lines. |
+| `stt_offline` | degraded | Offline speech | OpenAI Realtime is unreachable; commands are transcribed locally until it reconnects. |
+| `camera_unavailable` | degraded | Camera unavailable | Vision questions cannot see. Check the Orbbec USB cable and stack-camera.log. |
+| `tracking_unavailable` | degraded | Eye tracking off | The eye tracker stopped; chat continues. See tracking-chat.log, then restart face-agent.service. |
+| `tracker_cpu_fallback` | degraded | Tracking on CPU | The Hailo-8L is unavailable (check hailort.service). Restart face-agent.service to retry it. |
+| `wake_whisper_fallback` | degraded | Wake word: Whisper | Neither the rolling Hailo engine nor openWakeWord is in use, so Whisper listens for the wake phrase (more CPU, slower). |
+| `wake_model_missing` | info | No wake model | Whisper listens for the wake phrase: no Hailo Whisper files and no openWakeWord model (docs/wake-word.md). |
+
+## ROS 2 robot status
+
+The display and agent independently subscribe to `/robot/status`. Other nodes change the state through `/robot/set_status`, so status control works even when the chatbot is closed. The first subscriber automatically starts one shared manager if none is available.
+
+Source ROS and the custom interfaces in a new terminal:
+
+```bash
+cd ~/face-agent
+source /opt/ros/jazzy/setup.bash
+source ros2/install/local_setup.bash
+
+# Read the latest state, including when subscribing after a change:
+ros2 topic echo /robot/status robot_status_interfaces/msg/RobotStatus \
+  --qos-durability transient_local
+```
+
+Call the service from a separate terminal with the same setup:
+
+```bash
+# Wake/resume voice monitoring without a spoken wake phrase:
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: IDLE}"
+
+# Ask for input directly:
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: LISTENING}"
+
+# Other examples:
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: WORKING}"
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: DETECTING}"
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: ERROR}"
+ros2 service call /robot/set_status robot_status_interfaces/srv/SetRobotStatus "{status: SLEEPING}"
+```
+
+| Status | Display animation | Voice input |
 | --- | --- | --- |
-| living room | 2.0 | 2.0 |
-| bedroom | 8.5 | 8.5 |
-| kitchen | 8.5 | 2.0 |
+| `IDLE` | Idle / Ready | Waits for speech without recording |
+| `LISTENING` | Needs input | Records the current utterance |
+| `THINKING` | Thinking | Paused |
+| `SPEAKING` | Speaking, driven by audio | Paused |
+| `WORKING` | Working | Paused |
+| `DETECTING` | Searching | Paused |
+| `ERROR` | Error | Paused |
+| `SLEEPING` | Sleeping | Local wake detection only |
 
-Edit these coordinates before restarting the chatbot; `TURTLESIM_WAYPOINTS` selects another JSON file. Coordinates must lie between 0.5 and 10.5. Navigation stops within 0.12 units, limits velocity, fails after 60 seconds, and stops publishing motion if pose feedback becomes older than one second. This is a straight-line turtlesim controller; there is no obstacle map or real-world navigation stack.
+The topic type is `robot_status_interfaces/msg/RobotStatus`, containing `status`, `revision`, and `source`. It uses reliable, transient-local QoS with depth one. The service type is `robot_status_interfaces/srv/SetRobotStatus`:
 
-Run the live integration check with `.venv/bin/python -m unittest discover -s test -p test_turtlesim_mcp.py`. It launches its own headless simulator in a separate ROS domain, exercises MCP room navigation, the rotation action, stopping, and lost-pose handling, then cleans up. It does not require an OpenAI request.
+- Request: `status`, optional `source`, and `expected_revision` (`0` means unconditional).
+- Response: `success`, `message`, and `current` status.
 
-## Robot display and local configuration
+Call the service instead of publishing competing status messages. The agent uses revision checks so a cancelled reply cannot overwrite a newer external command. Nodes must share `ROS_DOMAIN_ID` and compatible discovery settings. Build and source the interface package on other computers that use these types.
 
-The studio now saves **appearance, character name, speaking voice, rendering quality, reduced motion, random idle behavior/interval, voice motion strength/source/level, and robot background** automatically to **`robot-config.json` in the workspace root**. **Save configuration** writes to that same file on demand. The initial migration reads the existing browser appearance once; subsequent loads use the file as the source of truth. Temporary original-outfit previews and the current test animation are not saved as character configuration. Invalid saves leave the previous file intact; writes replace it atomically. To use another location, set `DOTS_CONFIG=/absolute/path/robot-config.json` when starting the service.
+Legacy deployments can opt out with chatbot `--no-robot-status` and display `DOTS_ROBOT_STATUS=0`. The old `/kuro/wake` service belongs to that compatibility mode; the shared status service above is the default interface.
 
-### Speaking voice and API key
+## Camera and eye tracking
 
-In the studio, edit **Character name**, choose a **Speaking voice**, then press **Play sample** to hear “Hi, I am {name}.” The original character moves with the actual audio amplitude and returns to Idle / Ready when playback finishes. **Stop** cancels playback; selecting another animation also interrupts speech. The selected voice saves in the same `robot-config.json` as `settings.ttsVoice`.
+The launchers target an Orbbec Gemini 330-series camera. Install the driver and compressed-image support once, with the ROS apt repository configured:
 
-Speech generation uses **`gpt-realtime-2.1-mini`**, OpenAI's [recommended replacement for the retiring TTS models](https://developers.openai.com/api/docs/deprecations). The server connects to the Realtime API over WebSocket and streams the returned 24 kHz PCM chunks immediately to native browser Web Audio playback. An 80 ms initial playback buffer smooths network jitter. Successful requests reuse the same connection and use minimal reasoning; a voice/key change, expired session, cancellation, or connection failure opens a fresh session. Each request supplies only its own text, without accumulating conversation history. The Voice panel shows measured **First audio** time and whether the connection was warm. This measures the server's request-to-first-audio time; browser scheduling adds about 80 ms, and network/provider load can vary. It requires internet access and OpenAI API billing. The server uses the small Python `websockets` dependency; the browser gains no additional dependencies. Speech generation is isolated in `RobotServer.speech_events()`.
-
-The picker includes the model's [10 supported voices](https://developers.openai.com/api/docs/guides/realtime-conversations): Marin, Cedar, Alloy, Ash, Ballad, Coral, Echo, Sage, Shimmer, and Verse. Marin is the default. Fable, Nova, and Onyx belonged to the previous speech model and are unavailable here. Opening the studio with one of those saved voices selects and saves Marin, with a visible migration notice; you can choose another voice. The existing character appearance and other settings are preserved. Samples and terminal `say` commands play incrementally while generation continues, and the actual playback amplitude drives Speaking.
-
-When no key is available, the page asks for one. Paste it into the password field and choose **Save API key**. You can dismiss this prompt with **Later** and continue using the renderer. **Set up API key / Change API key** reopens it. The key travels only to this local service and to OpenAI for speech generation. The input clears after submission/closing, and the key is never returned by the API or included in character exports, configuration, event streams, logs or browser localStorage.
-
-The server stores the key in `~/.config/mimo-dots/openai-api-key` (or beneath `XDG_CONFIG_HOME`), outside the workspace and web files. The directory is mode `0700` and the file is mode `0600`; writes are atomic. This is a private plaintext file protected by OS permissions, not an encrypted vault: processes running as your OS account or root can read it. Alternatively, provide `OPENAI_API_KEY` through the server environment, which takes precedence over the saved file. Credential setup and billable speech requests accept only local-machine access with a localhost Host header; cross-origin JSON requests are rejected. Configure the Pi's own key locally rather than putting it in `dist/` or `robot-config.json`.
-
-The robot page starts voice automatically and has no Enable voice control. Launch it with `./run.sh --robot` for unattended speech: this starts the service and opens a dedicated Chromium window with audio allowed from startup. Closing that window or pressing Ctrl+C stops both processes. `say` alone speaks the saved greeting; `say Hello, I am your robot` speaks custom text using the saved voice. The audio drives Speaking and returns to idle after it finishes. Audio clips stay in server memory, with only the latest robot clip retained; they are not written to disk.
-
-Start the robot on this machine or a graphical Raspberry Pi:
-
-```sh
-PORT=5174 ./run.sh --robot
+```bash
+sudo apt install -y ros-jazzy-orbbec-camera ros-jazzy-image-transport-plugins
 ```
 
-The launcher finds Chromium or Google Chrome in PATH. Set `DOTS_BROWSER=/path/to/browser` to select another Chromium executable; `DOTS_BROWSER_PROFILE` overrides its separate profile at `~/.config/face-agent-chromium`. This machine also supports the official Chrome for Testing binary in `~/.cache/face-agent/chrome/chrome-linux64/chrome`. The browser uses Chrome's [documented autoplay flag](https://developer.chrome.com/blog/autoplay/#developer-switches). Voice still needs the configured OpenAI API key and an audio output device. Plain `./run.sh` runs only the service: opening its URL in an ordinary browser or the Codex preview may still require a tap or key press under that browser's autoplay rules. The latest queued speech plays after that interaction, without a dedicated activation button.
+Choose **one** camera launcher:
 
-```sh
-python3 scripts/dotsctl.py --url http://127.0.0.1:5174 say
-python3 scripts/dotsctl.py --url http://127.0.0.1:5174 say "Hello, I am your robot"
+| Command | Color | Depth / point cloud | Purpose |
+| --- | --- | --- | --- |
+| `./camera.sh` | 640 × 480 MJPG, 15 FPS | Off | Lower-bandwidth face tracking |
+| `./camera-rgbd.sh` | 1280 × 720 MJPG, 15 FPS | 640 × 480 depth at 30 FPS; XYZ cloud | Image plus point cloud |
+
+Both profiles support the current USB 2 connection. The RGB-D profile disables frame sync and colored point clouds and uses laser energy level 5, which was stable in testing on this Pi. These are requested rates; delivered FPS depends on the cable, hub, USB power, scene, and processing load. Only one process can own the camera.
+
+**AI HAT (Hailo-8L):** face detection and identity features run on the Hailo-8L when it's available (`DOTS_TRACKER_BACKEND=auto`, the default), and on the CPU with OpenCV otherwise (`DOTS_TRACKER_BACKEND=opencv`). Sharing the chip needs `hailort.service` to be active. If the accelerator or its service fails while tracking, the tracker reconnects once and then continues on the CPU for the rest of the session. See [docs/human-tracking.md](docs/human-tracking.md#hailo-8l-face-backend-ai-hat) for the identity threshold and measurements.
+
+Launch arguments can override the profile, for example:
+
+```bash
+./camera.sh color_width:=640 color_height:=480 color_fps:=15
 ```
 
-For robot software, `POST /api/say` with `{"text":"Hello!","stream":true}` starts speech and sends it to the robot display as soon as the first audio chunk is available. An optional `voice` overrides the saved voice for that request. The CLI and studio terminal use this streaming mode. `POST /api/speech-stream` returns newline-delimited JSON audio events (`type: "audio"`, base64 PCM16LE in `pcm`, 24 kHz mono), followed by `done` or a safe `error`. The first audio event includes `firstAudioMs` and `warm`. Audio arrives before generation completes. `POST /api/speech` and `/api/say` without `stream:true` retain the complete WAV behavior for compatibility. `GET /api/voice` returns setup status, model name, and available voices; `POST /api/key` accepts `{"apiKey":"..."}` and returns only a success flag. Never put a key in a URL or browser code. Provider errors are mapped to safe messages rather than returning raw provider response bodies. A mid-stream failure stops playback; audio already heard cannot be recalled.
+Useful ROS topics:
 
-Open **Robot display** in the header, or `/robot.html`. This page fills the window with the saved character, without the studio controls. It uses the same native renderer and action controller. Configuration changes and animation commands arrive through a local event stream, including direct edits to the same JSON file. Use **F**, double-click the character, or the fullscreen button at the bottom edge to enter browser fullscreen. Move to the bottom edge to reveal the small studio/fullscreen controls. The character automatically fills the available space with a small safety margin. Framing includes moving props, accessories, sleep marks and signatures, and makes room above subtitles. Each action retains its widest observed bounds so breathing does not continually change the zoom. A 64 × 64 alpha sample measures rendered pixels; Compact rendering still caps the backing canvas at 512 pixels and Balanced at 1024 pixels. Pi performance remains unmeasured.
-
-Spoken messages show subtitles centered at the bottom of the robot display. The text appears when audio playback starts and clears when it ends, fails, or is interrupted by another animation or message. Long sentences wrap onto multiple lines within the screen; unusually long words also wrap. Very long messages use a scrollable caption area capped at 38% of the display height. Subtitles use the supplied speech text, with no word-by-word highlighting. Animation-only `speaking` commands have no subtitles. Speech commands include the actual requested `text`, including the saved default greeting, alongside their audio URL.
-
-Start the service and an interactive animation terminal:
-
-```sh
-./run.sh
-python3 scripts/dotsctl.py
+```bash
+ros2 topic list
+ros2 topic hz /head_camera/color/image_raw/compressed
+ros2 topic hz /head_camera/depth/points
 ```
 
-For the current preview on port 5174, run:
+The cloud topic is available with `camera-rgbd.sh`. Tracking uses `/head_camera/color/image_raw/compressed` and camera intrinsics from `/head_camera/color/camera_info`.
 
-```sh
-python3 scripts/dotsctl.py --url http://127.0.0.1:5174
+Prepare/check the tracker before starting chat:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+./track.sh --check
 ```
 
-At `dots>` type `listening`, `thinking`, `speaking`, `speaking 0.8`, `sleeping`, `idle` (or `ready`), `wave`, or any library state. `Felipe signature` selects that temporary original preview. `say [text]` plays real speech with the configured voice. `states` lists every supported identifier, `status` shows the file path, display connections, latest command and acknowledgment, and `quit` exits. Looping statuses continue until another command; finite actions return to Idle / Ready. Commands are live session state and do not overwrite the character configuration. A command sent before the display opens is applied when it connects.
+This creates a separate tracking environment and downloads its local face models on first use. For standalone tracking diagnostics with the display and camera running, use `./track.sh --stats`. The chatbot normally manages the tracker for you.
 
-One-shot commands are also available:
+Voice mode combines face detections with ReSpeaker direction-of-arrival hints to select a speaker, then keeps a visual identity lock. Typed mode acquires a person near the camera center. Tracking is active while awake; missing targets ease the eyes back to the original animation. Tracking images are processed locally; the separate on-demand vision tool sends snapshots to OpenAI only for visual requests.
 
-```sh
-python3 scripts/dotsctl.py sleeping
-python3 scripts/dotsctl.py speaking 0.8
-python3 scripts/dotsctl.py idle
-```
-
-The studio's **Animation terminal** panel sends the same commands. For robot software, send JSON to the local service:
-
-```sh
-curl -X POST http://127.0.0.1:5173/api/command \
-  -H 'Content-Type: application/json' \
-  -d '{"state":"listening"}'
-```
-
-`GET /api/config` reads the shared file; `PUT /api/config` validates and saves it; `GET /api/status` reports command and display status. Configuration, animation commands, and the terminal use Python's standard library; OpenAI voice generation additionally uses `websockets`. No shell commands from the animation terminal are executed. The display needs a browser with WebGL 2 and shared WASM memory. For Raspberry Pi deployment, commit the bundled `dist/`, `public/local-dots/`, `robot-config.default.json`, `requirements.txt`, `run.sh`, and the service/terminal scripts with the project. Clone the repository and run `./run.sh`. Node.js is needed for development builds, but not for running the bundled build on the Pi. Pi rendering performance remains unmeasured.
-
-Import resources from a local installation, then build:
-
-```sh
-pnpm import:dots
-pnpm build
-./run.sh
-```
-
-On this Linux machine the importer defaults to `/usr/lib/chatgpt/resources/app.asar`. For another installation, pass its archive to `python3 scripts/import_dots.py /path/to/app.asar`. Imported files, API declarations, and original third-party notices are in `public/local-dots/`, which can be committed with the application. Vite includes the entire folder in `dist/local-dots/` during a build. The complete imported bundle is approximately 11 MB before compression. A clone containing the bundled `dist/` needs no installed ChatGPT app, additional asset transfer, or frontend build. The launcher installs its Python voice dependency on first use. Device configuration is seeded from `robot-config.default.json`, then saved only to the device's ignored `robot-config.json`; the API key is set up separately on each device. Importing does not establish a redistribution license for the bundled OpenAI assets.
-
-The original renderer requires WebGL 2, shared WASM memory, and cross-origin isolation. Both Vite and `run.sh` supply the required HTTP headers. To try it on the Pi, use this same local build and static server, including `scripts/serve.py`; start in Compact mode. Native Pi performance has not been measured. A procedural-only build can be made without `public/local-dots/`; the original-renderer page then explains how to import the missing resources.
-
-## Open the preview
-
-The production build in `dist/` is included in repository packaging. After committing and pushing the complete project, clone it on the Pi and run:
-
-```sh
-git clone https://github.com/s-w3i/face-agent.git
-cd face-agent
-./run.sh
-```
-
-The launcher creates `.venv`, installs the one Python voice dependency if needed, seeds the default character configuration if no device configuration exists, and starts the local service. First launch needs internet for dependency installation. Subsequent launches reuse the environment and preserve your saved settings. `DOTS_CONFIG` still selects another configuration path. There is no Node.js or pnpm requirement on the Pi when using the bundled frontend.
-
-Use Python 3.10 or newer with venv support and a graphical Chromium browser supporting WebGL 2. Raspberry Pi OS requires third-party Python packages to use a [virtual environment](https://www.raspberrypi.com/documentation/computers/os.html#use-python-on-a-raspberry-pi). If Python venv support is missing, install it once with `sudo apt install python3-venv`, then rerun the launcher. Raspberry Pi OS Lite additionally needs a graphical session and suitable browser for displaying the character. Set up the OpenAI API key through the configuration page on the Pi.
-
-Open http://localhost:5173/original-dots.html for configuration and http://localhost:5173/robot.html for the robot face. If another preview is already running, open that URL or use `PORT=5174 ./run.sh` and pass that URL to `dotsctl.py`.
-
-To run on a Raspberry Pi, clone the complete project or copy its deployment files, run the launcher, and open the URL in Chromium with WebGL 2 enabled. Fonts, graphics, and JavaScript are local; robot commands and configuration use local API calls; OpenAI voice playback requires an API key and internet. The studio defaults to a 30 fps target with capped render resolution. Actual Pi rendering performance has not been measured.
-
-## Try the character
-
-- **Animations:** Idle, Listening, Thinking, Speaking, Sleeping, Happy, Curious, Bounce, Spin, Stretch, Wobble, and Wake up. Select any tile; select it again to restart. Speaking is a visual simulation, with no audio input or output.
-- **Timeline:** scrub Animation time to pause at an exact pose. The selected animation tile restarts playback; Resume continues from that time.
-- **Play all:** runs all 12 motions once, then returns to idle. Selecting any motion stops the tour. Pause/resume and speed controls also work during the tour.
-- **Appearance:** five body shapes, any body color, four eye styles, round/square glasses or sunglasses, beret/cap/sprout/halo/headphones, and flocked/matte/gloss finishes. Appearance saves to browser local storage. Version 2 uses a new storage key; earlier saved appearances remain preserved under their original key. Version 1 character exports can still be imported, with pebble mapped to blob.
-- **Behavior:** random idle actions with no consecutive repeats, adjustable interval, optional sleep timer, and cursor-following eyes. Any manually selected animation wakes the character. Auto motions only start during idle. Sleep timing is independent of the random-motion switch.
-- **Scene:** three backgrounds, lightweight/studio rendering, live performance counters, and character import. Export in the header saves a versioned JSON appearance file. Behavior and scene controls apply to the current session.
-- Drag to orbit, scroll to zoom, use Reset view to return to the front. Expand opens a full-screen character view. Reduced-motion preferences start the studio paused with spontaneous motions off.
-
-## Develop and test
-
-Use Node.js 22.12 or newer and pnpm:
-
-```sh
-pnpm install --frozen-lockfile
-pnpm dev
-pnpm test
-python3 -m unittest discover -s test -p 'test_*.py'
-pnpm build
-```
-
-After frontend or imported-resource changes, run `pnpm build` on your development machine and commit the updated `dist/` alongside the source before pushing. The Pi runs that prebuilt version. Update `robot-config.default.json` deliberately when you want a new default for fresh installations; existing device configuration takes precedence. This file contains character settings only and must never contain credentials.
-
-During development, run the Python service on port 5174 alongside Vite on 5173. Vite proxies `/api` to that service; both use the same configuration file. The Python check exercises atomic saves, rejected input preserving the saved file, state commands, speech levels, live event delivery, external file edits and display acknowledgments. The voice check also exercises private file permissions, request validation, provider request fields, safe error messages, CLI speech and transient audio delivery using a mocked OpenAI response.
-
-The procedural browser renderer uses Three.js; the original mode uses the imported native renderer. OpenAI speech uses Python `websockets` on the server. Vite is the development/build tool. `src/character.js` contains the renderer and procedural model. `src/motion.js` defines expressive body poses; `src/deformation.js` applies them to the body, face, and fur on the GPU. `src/fur.js` builds short instanced fibers and a tiny felt texture. `src/model.js` owns validated appearance settings and the animation scheduler. `src/main.js` connects the controls. Tests cover interruption, idle scheduling, sleep/wake, pause/speed, the complete tour, import validation, preset compatibility, distinct status silhouettes, stable deformations, smooth transitions, and timeline seeking.
-
-For the procedural studio, future voice/chat integration can call `director.play('listening')`, `director.play('thinking')`, `director.play('speaking')`, and `director.play('idle')` at the appropriate interaction boundaries. The original mode's added motion accepts a speech level through `voiceMotionPose()`; its UI currently supplies the demo or fixed level. The original robot view now uses the OpenAI voice and server-only credentials described above. The terminal chatbot drives this display through the local service with typed input or ReSpeaker transcription.
-
-The procedural renderer's soft contact shadow is a tiny generated texture; that renderer has no dynamic shadow maps, downloaded models, large textures, or post-processing passes. Its flocked surface combines a 256px texture with short fiber ribbons in instanced draws; lightweight mode uses half the fiber density. The coat moves with the body without CPU hair simulation. Speaking reshapes the contour in synthetic syllable phrases. Sleeping settles into a low, wide shape; listening bends forward; thinking curves and sways. Hats retain their form while following the deformed body. Lightweight is a starting profile to benchmark on the intended Pi, not a hardware performance guarantee.
-
-Font licenses are included in `public/fonts/` (DM Sans and Manrope, SIL Open Font License).
-
-The motion study and original-renderer observations are documented in [docs/dots-motion-reference.md](docs/dots-motion-reference.md). Procedural animations are independently authored interpretations. Original mode uses the imported local runtime, which is included in repository packaging and copied into the build when present.
+The pre-rendered body **does not need full 3D rendering for live gaze**. The included pack has eye positions; the player moves small eye patches over the baked body. Customized looks with obscured eyes may need verification in **Test gaze**. For another microphone mounting, use `--mic-forward-deg ANGLE` and `--mic-clockwise` as appropriate. This robot uses native 0° at camera center, increasing toward camera left.
 
 ## ReSpeaker robot microphone
 
-The connected v3 array now exposes six channels: processed audio, four raw microphones, and a playback reference. Linux USB audio and USB control access work on this PC. ODAS uses the four raw microphones for localization, tracking, separation and adaptive post-filtering, as described in [Seeed's documentation](https://github.com/respeaker/usb_4_mic_array/blob/master/README.md).
+Test the microphone separately with the chatbot stopped:
 
 ```bash
-# One-time dependency/build setup on another Linux robot:
-bash scripts/setup_respeaker_odas.sh
-# Start listening and live OpenAI transcription on this PC:
-.venv/bin/python scripts/respeaker.py
-# Bounded recording, after startup calibration:
-.venv/bin/python scripts/respeaker.py --seconds 10
-# Lower-cost transcription after each utterance finishes:
-.venv/bin/python scripts/respeaker.py --stt-model gpt-transcribe
-# Local recording only:
-.venv/bin/python scripts/respeaker.py --no-stt
+# USB/VAD/direction diagnostics; does not record:
+.venv/bin/python scripts/respeaker.py doctor --diagnostics
+
+# Record and transcribe one utterance through Realtime:
+.venv/bin/python scripts/respeaker.py --once --diagnostics
+
+# Record and transcribe locally instead:
+.venv/bin/python scripts/respeaker.py --stt-model small --once --diagnostics
+
+# Record one utterance without transcription:
+.venv/bin/python scripts/respeaker.py --no-stt --once --diagnostics
 ```
 
-Live speech-to-text defaults to `gpt-live-transcribe` with `low` delay, following [OpenAI's live transcription guide](https://developers.openai.com/api/docs/guides/realtime-transcription). It uses `OPENAI_API_KEY`, or the existing private studio key at `~/.config/mimo-dots/openai-api-key` (under `XDG_CONFIG_HOME` when set). On another machine, provide an API key before launching. Install updated Python dependencies with `.venv/bin/python -m pip install -r requirements-respeaker.txt`; the setup script does this too. Audio stays on the Pi for calibration and waiting; only detected utterances, including their opening buffer and the silence used to detect their end, stream to OpenAI. Recordings remain 16 kHz; a streaming resampler converts API audio to 24 kHz PCM16. Transcription runs asynchronously so capture continues while text arrives. Normal terminal output shows partial transcription on one updating line, replaced by the final sentence when each utterance finishes. When redirected or piped, output contains one plain final transcript per line. DOA, levels, track IDs, recording paths and routine status messages are hidden. Errors still go to stderr. Add `--diagnostics` for the original JSON output: `transcript_partial` events contain incremental `delta` text; `transcript_final` contains the complete `text`, local `wav`, and originating `track_id`. Track IDs describe ODAS source association, not confirmed speaker identity or isolation in channel 0.
+The worker keeps **one continuous 16 kHz capture stream** open and fans it out in memory to its consumers. The last 8 seconds stay in an in-memory ring buffer that is never written to disk or sent anywhere unless a recording is triggered. The hardware voice flag is polled every 50 ms. When it fires, the recording starts with 0.3 seconds of pre-roll from that ring (`--preroll-seconds`), so the first syllable isn't clipped. Overflowing or dropped audio during an utterance discards it rather than transcribing incomplete speech. If the stream stops delivering audio for 0.5 s, it is reopened up to three times before the worker reports a reconnectable microphone error.
 
-`--language en` supplies an optional language hint; omit it for automatic multilingual transcription. `--stt-delay minimal` reduces the model's context delay, while `medium` or `high` gives it more context; actual latency and accuracy need testing with the robot's audio. `gpt-transcribe` begins transcription only after the local end-of-speech commit. Startup retries transient connection failures up to three times. If the connection fails during capture, the script stops and retains the active WAV; restart to reconnect. Ctrl+C allows up to 15 seconds for final transcripts after queued audio is sent. There is no automatic reconnection during a session.
+Voice chat runs **one long-lived microphone worker**. Falling asleep or waking switches its mode with a control message: waking opens the Realtime socket, and sleeping closes it. The worker isn't restarted, and a Whisper wake model, when used, stays loaded (about 400 MB RSS). Recording runs in its own thread, and every recording or transcription holds a cancel token, so a pause, mode switch or newer trigger drops only older work. If Realtime can't connect on waking, the worker stays asleep with wake detection running and the usual recovery retries. Capture uses 16 kHz mono PCM. WebRTC VAD uses mode 2, checks 20 ms frames and stops after 0.8 seconds of consecutive nonspeech; new speech resets that countdown. Utterances are limited to 10 seconds. Voice chat uses `small` locally with a 0.4-second silence timeout for wake detection. Awake command recording uses 0.8 seconds of silence. Both modes retain the 10-second recording cap and VAD mode 2. Standalone capture can override them with `--silence-seconds`, `--max-seconds`, and `--vad-mode` (0–3).
 
-Current transcription prices in USD, checked October 8, 2026 against [OpenAI pricing](https://developers.openai.com/api/docs/pricing):
+Standalone options include `--silence-seconds`, `--max-seconds`, `--device INDEX_OR_NAME`, and `--no-led`. Unique WAV files are saved under ignored `test-output/`, including the trailing silence. Local Whisper needs its model downloaded once; Realtime needs the configured API key and internet access. Playback pauses end the active recording (the recorder releases the stream) before speech output resumes; the shared capture stream itself stays open.
 
-| Model | Text delivery | Per audio minute | Per audio hour |
-| --- | --- | ---: | ---: |
-| `gpt-live-transcribe` (default) | While speaking | $0.017 | $1.02 |
-| `gpt-transcribe` | After utterance commit | $0.0045 | $0.27 |
-| `gpt-realtime-whisper` (alternative, not configured here) | While speaking | $0.017 | $1.02 |
+### Speaker and echo cancellation
 
-These are costs for submitted audio, not hours the robot waits silently. The opening buffer and endpoint silence add billable duration. For 1,000 utterances of 10 submitted seconds each, estimated transcription cost is $2.83 with the live model or $0.75 with `gpt-transcribe`. This excludes assistant replies and speech generation, which this microphone script does not request. Older `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe-diarize` and `whisper-1` are [deprecated for removal on February 26, 2027](https://developers.openai.com/api/docs/deprecations#2026-08-26-transcription-models).
+The XVF3000 removes the robot's own voice from the processed microphone channel (hardware AEC) only when playback goes through the **ReSpeaker's 3.5 mm output**; that playback is its echo reference. Connect a powered speaker or small amplifier to that jack (line/headphone level), then make it the default speaker:
 
-The channel-0 profile uses automatic gain (maximum 31.6×, target power 0.005), 70 Hz high-pass filtering, adaptive beamforming and balanced documented noise-suppression factors/floors (stationary 1.0/0.15; nonstationary 1.1/0.3). This replaces the earlier aggressive suppression and fixed gain, which could weaken distant speech. It is a documented baseline, not proof of optimal acoustic performance. Playback-reference echo cancellation cannot remove independent external music.
+```bash
+scripts/audio_output.sh status       # current and persisted default sink
+scripts/audio_output.sh respeaker    # ReSpeaker jack (needed for barge-in while speaking)
+scripts/audio_output.sh jieli        # back to the separate USB speaker
+```
 
-Every launch verifies the onboard suppression settings, allows ten seconds for adaptive processing, then measures background for eight seconds. Stay silent during measurement with the normal fans, motors and music running. Listening starts automatically afterward; recordings start when sustained speech is detected. No wake word, spoken calibration or angular offset is required. Calibration measures nonspeech residual levels; if no residual source is tracked, the software floor defaults to -60 dBFS. The adaptive ODAS post-filter continues operating as the robot moves.
+Chromium plays through the PipeWire default sink. `pactl set-default-sink` is persisted by WirePlumber in `~/.local/state/wireplumber/default-nodes`, so the choice survives a reboot. Verify the echo cancellation with the stack stopped:
 
-With `--diagnostics`, JSON output reports the unmodified `native_doa_deg` and each tracked source's `azimuth_deg`, speech classification and level five times per second. Native DOA describes the dominant source. ODAS azimuth is counterclockwise from its microphone geometry x-axis; it is a separate coordinate frame and has not been physically aligned to the robot's front.
+```bash
+systemctl --user stop face-agent.service
+.venv/bin/python scripts/respeaker.py doctor --aec --sink jieli       # reference run
+.venv/bin/python scripts/respeaker.py doctor --aec --sink respeaker   # after connecting the jack
+.venv/bin/python scripts/respeaker.py doctor --aec --compare
+systemctl --user start face-agent.service
+```
 
-Each launch writes unique files in ignored `test-output/`: one mono WAV per utterance, a continuous four-channel separated/post-filtered sources WAV, tracking JSONL, the ODAS configuration and a diagnostic log. Audio is PCM16LE at 16 kHz. An utterance begins after 200 ms of sustained speech above the measured floor, keeps a 1.2-second rolling buffer (up to one second before speech confirmation begins), and follows the same track ID even when its channel slot changes. A single six-channel capture feeds both ODAS and this buffer, keeping their hops aligned. Every utterance and the live mono PCM stream use the microphone’s onboard processed channel 0 throughout, including the buffered opening, as in Seeed’s channel-0 recording example. ODAS separation is retained only for source diagnostics and speech endpoint detection; it does not supply the utterance audio. The onboard beamformer may select other dominant sounds; a tracked source ID cannot steer or isolate channel 0. One second without speech from that track ends the clip, trimmed to 200 ms of trailing audio. Shorter pauses stay within the clip. Each clip has a 30-second maximum, after which listening resumes. The first clip uses the selected WAV name; subsequent clips append -002, -003, etc. No mono file is created for a session without detected speech. Four-channel source slots can be reassigned; use track IDs in the JSONL to follow sources. Ctrl+C saves any active utterance and closes the WAV headers. `--wav /absolute/path/new.wav` selects another destination; existing recordings are never overwritten. `--pcm /path/to/file-or-fifo` also exports live processed channel-0 PCM while an utterance is active, with silence while waiting and a buffered opening when speech starts; start a FIFO reader before launching.
+Each run records 3 s of quiet and 10 s of looped speech playback on all six channels (firmware: 0 processed, 1–4 raw microphones, 5 playback reference) and saves the WAV and JSON under `test-output/aec/`. `echo_suppression_db` is how far channel 0 sits below the raw microphones during playback; `aec_reference_present` shows whether the XVF3000 actually receives the playback. With the jack, expect channel 0 to drop by at least 15 dB compared with the Jieli run. Talking over the playback should stay clearly audible in channel 0.
 
-`--noise-seconds` changes the measurement duration and `--settle-seconds` changes adaptive settling. `doctor` reads USB control information and settings, `tune` applies the DSP profile, `calibrate` performs startup measurement only, and `restore` restores the initial writable DSP settings saved in ignored `respeaker-backup.json`. Normal listening reapplies the profile. `respeaker-config.json` stores measurement results; every launch measures again. Legacy `--backend dsp` requires single-channel firmware and is not the current default.
+If USB access is denied, add the device rule and your account to `plugdev`:
 
-The one-time USB permissions rule is `/etc/udev/rules.d/70-respeaker.rules`: `SUBSYSTEM=="usb", ATTR{idVendor}=="2886", ATTR{idProduct}=="0018", GROUP="plugdev", MODE="0660"`. The robot account must belong to `plugdev`. Firmware is not reflashed at startup. This setup requires the v3 six-channel firmware; do not flash a v2 image onto a v3 array.
+```bash
+sudo groupadd -f plugdev
+sudo usermod -aG plugdev "$USER"
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2886", ATTR{idProduct}=="0018", GROUP="plugdev", MODE="0660"' \
+  | sudo tee /etc/udev/rules.d/70-respeaker.rules
+sudo udevadm control --reload-rules
+```
 
-On this Ubuntu desktop, PulseAudio exposes the six-channel input without an input port entry; GNOME Sound Settings can omit it even while recording works. A runtime `module-remap-source` named `respeaker_channel0` was added as **ReSpeaker Channel 0**, mapping only `front-left` (processed channel 0) to mono with `remix=no`. It is the desktop default input. The robot script continues to capture all six original channels directly. The virtual source is a desktop session setting and may need to be recreated after a USB disconnect or audio-server restart. It does not repair an unstable USB connection.
+Replug the microphone and log out/in for new group membership. If PipeWire/PulseAudio owns the hardware, make the ReSpeaker the default input. Check `pactl get-default-source`; an unrelated default source can record the wrong microphone.
 
-Hardware capture and DSP readbacks are checked on this PC. Synthetic directional audio checks source localization; physical competing-speaker accuracy remains unverified. Speech classification can include recorded vocals, so this pipeline cannot guarantee it follows a human instead of music. Speech-to-text does not change channel-0 source selection or separate speakers. External music has no playback reference for echo cancellation. Robot playback can supply that reference through the ReSpeaker USB output; integrated voice chat also pauses recording until playback finishes. Real API tests on a clean synthetic English sample preserved the opening phrase, returned partial text before commit with the live model, and returned final text with both configured models. Hardware playback-gate checks confirmed no recorded audio growth while paused; API checks confirmed discarded turns do not appear in later transcripts. Raspberry Pi 5 performance, crowded-room transcription, and unattended long sessions remain unverified.
+### Offline speech-to-text
 
-Offline checks: `.venv/bin/python -m unittest discover -s test -p 'test_respeaker*.py'`.
+Awake commands normally use OpenAI Realtime. If Realtime is unreachable with a temporary error (no network, timeouts), commands are transcribed locally instead, and Realtime is retried in the background; the next command after it reconnects uses Realtime again. The agent log shows `transcribing commands locally with hailo` and `Realtime transcription reconnected.`.
+
+`DOTS_OFFLINE_STT` in `~/.config/face-agent/startup.env` (chat worker `--offline-stt`) chooses the engine:
+
+- `hailo` (default): Whisper base on the Hailo-8L, about 1.3 s for a short command with almost no CPU. `scripts/setup_respeaker.sh` installs the models (about 310 MB) in `~/.local/share/face-agent/whisper-hailo8l/`; `DOTS_HAILO_WHISPER_DIR` overrides the folder. It needs `hailort.service`.
+- `cpu`: faster-whisper `base.en` with 2 threads. This is also what `hailo` falls back to if the models or the accelerator aren't available.
+- `off`: no fallback; a Realtime failure shows ERROR and recovers as before.
+
+The engine loads on first need, so the first offline command takes about 2 seconds longer, and audio stays on the robot. Partial text isn't shown while offline; the whole transcript arrives at once. Local accuracy is lower than Realtime's. Rejected credentials or quota are not treated as offline: they still show ERROR. Replies still need the OpenAI agent, so while fully offline the reply fails with the usual network error; this fallback removes speech-to-text as the point of failure.
+
+## Customize or pre-render on another computer
+
+Open [the original character studio](http://127.0.0.1:5173/original-dots.html) to change appearance, name, voice, background, motion, and renderer settings. `/robot.html` is the clean robot display; `/` is the separate procedural character playground.
+
+For a new animation pack:
+
+1. Run the project on the stronger computer and customize the character in the studio.
+2. Under **Raspberry Pi playback**, click **Bake saved character** and keep the tab visible until complete.
+3. Use **Test pre-rendered display** and **Test gaze** to check the result. For older packs, **Prepare eye tracking** adds eye positions without re-rendering the body.
+4. Copy `public/prerendered/` and `robot-config.json` to the same locations in the Pi checkout.
+5. Restart with `DOTS_RENDERER=prerendered ./run.sh --robot`.
+
+No frontend build is needed after copying the pack. Re-bake after changing appearance, motion strength, reduced motion, or background. Name, voice, subtitles, and gaze remain live settings. Keep the API key device-local, and install environments/build ROS interfaces separately on each machine.
+
+See [pre-rendered playback details](docs/prerendered.md) for pack format and gaze limitations, [tracking details](docs/human-tracking.md) for model/camera internals, and [motion reference](docs/dots-motion-reference.md) for renderer observations. The runtime commands and status behavior in this README describe the current `pi5` branch.
+
+## Real robot navigation over LAN MCP
+
+The face agent can connect to the robot navigation server from the Pi without
+installing ROS navigation packages or copying the map/waypoint XML to the Pi.
+The MCP link uses the private LAN; existing cloud chat/voice services retain their
+normal connectivity requirements.
+
+Actual robot navigation is the saved default on this Pi. These settings in
+`~/.config/face-agent/startup.env` persist across stack relaunches and logins:
+
+```bash
+DOTS_NAV_MCP_URL=http://192.168.10.10:8000/mcp
+DOTS_NAV_MCP_MOCK=0
+```
+
+After changing these settings, restart the desktop service:
+
+```bash
+systemctl --user restart face-agent.service
+```
+
+For a manual chat session use `--navigation-mcp-url http://192.168.10.10:8000/mcp`
+(or its alias `--mcp-url`). `DOTS_NAV_MCP_URL` supplies the default. Explicit
+`--turtlesim` selects the simulator instead of the configured real robot.
+
+Check the same connection without a cloud request, camera, microphone, or motion:
+
+```bash
+cd ~/face-agent
+.venv/bin/python scripts/chat.py --navigation-mcp-url http://192.168.10.10:8000/mcp --check-navigation-mcp
+```
+
+Navigation tools connect on demand; startup does not contact the remote server. Requests such as “Go to
+the kitchen” use `navigate_to_region` and the names loaded by `wp_map_tools` on
+the robot. The current names are `kitchen`, `bedroom`, and `living room`.
+Navigation tools wait for Nav2 to finish, and the agent only reports arrival
+when the navigation result confirms success. Simulator queue/status/announcement
+hooks are disabled for this connection. Movement requests are not automatically
+retried after connection failures.
+
+Keep the robot MCP server, Nav2, localization, and waypoint bridge running at
+`192.168.10.10:8000`. The robot pose must be localized before requesting movement.
+Read startup diagnostics in `~/.cache/face-agent/stack-agent.log`.
+
+After the local voice worker is ready, the voice agent
+says “Kuro is ready. Say Hi Kuro to wake me up.” once per start. The microphone
+is paused through playback, then local wake listening resumes. Wait for this
+announcement before saying “Hi Kuro”; the face display can appear earlier.
+Realtime command transcription connects after waking. A fixed “Yes? I am here, what can I help you?” WAV is generated once
+for the selected voice before the startup-ready announcement and stored under
+`~/.cache/face-agent/wake-ack/`. Waking replays this local clip while Realtime
+connects, with the microphone held closed through playback and connection. A
+bare “Hi Kuro” skips the generated greeting; a command after the wake phrase
+still reaches the agent. With a streaming wake engine, the worker checks whether you keep talking right after the phrase.
+If you do (“Hi Kuro, what time is it?”), the spoken acknowledgment is skipped and the command is captured
+from the in-memory ring buffer (from the phrase with the rolling engine, just after it with openWakeWord), so no robot audio plays over it. Cached acknowledgment playback needs no network.
+Changing the speech voice requires restarting the agent to prepare its clip.
+`DOTS_WAKE_ENGINE` (`auto`, `rolling`, `oww` or `whisper`) and `DOTS_WAKE_MODEL_PATH` choose the wake engine and model;
+see [docs/wake-word.md](docs/wake-word.md).
+`DOTS_WAKE_MODEL` or `--wake-model` overrides the default `small` Whisper wake model. `--no-speak` also disables
+the startup announcement. An external ROS status change takes precedence.
+
+Startup readiness audio is also persisted under
+`~/.cache/face-agent/startup-ready/`, keyed by the selected voice and robot name.
+Both sleeping and already-awake startup phrases are prepared once; subsequent
+starts play the local WAV without a cloud speech connection. Changing the voice
+or robot name requires one online preparation before offline playback is available.
+The microphone remains paused through the announcement, then wake listening resumes.
+
+## Voice tests with the robot stationary
+
+Use the standalone mock endpoint `http://192.168.10.10:8001/mcp` while the real
+robot setup is incomplete. This server reads the same waypoint XML but imports
+no ROS code and has no publishers, Nav2 actions, or physical robot connection.
+Its three tools simulate pose, named navigation, and cancellation.
+
+To temporarily select mock mode, replace the actual-mode settings in
+`~/.config/face-agent/startup.env` with these values and restart the service:
+
+```bash
+DOTS_NAV_MCP_URL=http://192.168.10.10:8001/mcp
+DOTS_NAV_MCP_MOCK=1
+```
+
+Mock mode probes the endpoint before attaching its tools and refuses a real
+server. It never falls back to the real MCP URL. Stop the real MCP endpoint
+when running this stationary test. Keep voice mode running normally, say “Hi Kuro”, then test:
+
+- “Go to the kitchen.”
+- “Go to the bedroom.”
+- “Go to the living room.”
+
+The voice reply should clearly describe a completed mock test with the robot
+staying still. All reported navigation poses and arrivals are simulated.
+
+Read-only check on the Pi:
+
+```bash
+.venv/bin/python scripts/chat.py --navigation-mcp-url http://192.168.10.10:8001/mcp --navigation-mcp-mock --check-navigation-mcp
+```
+
+Start the mock server on the robot computer:
+
+```bash
+/home/robot10/MCP-for-Robocup-Malaysia-2026/.venv/bin/python -m robot_mcp.mock_region_nav_server --host 192.168.10.10 --port 8001 --waypoints /home/robot10/maps/waypoints.xml
+```
+
+When the physical setup is complete, explicitly restore port 8000, set
+`DOTS_NAV_MCP_MOCK=0`, restart the real MCP server, and restart the face-agent
+service to enable physical navigation again.
+
+## Optional turtlesim control
+
+Keep the face display running. Install the optional dependencies:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+sudo apt install -y ros-jazzy-turtlesim
+.venv/bin/python -m pip install -r requirements-turtlesim.txt
+```
+
+Start the simulator in one terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 run turtlesim turtlesim_node
+```
+
+In another terminal, start the chatbot with its local MCP controller:
+
+```bash
+cd ~/face-agent
+source /opt/ros/jazzy/setup.bash
+.venv/bin/python scripts/chat.py --mode voice --turtlesim --no-track
+```
+
+Use `--mode words` for typed commands. Try “Go to the kitchen”, “Turn left ninety degrees”, “Where is the turtle?”, or “Stop the turtle”. Destinations are configured in `turtlesim-waypoints.json`; restart chat after editing them.
+
+Movement starts after the departure announcement finishes successfully. Failed or interrupted speech cancels queued movement; explicit `--no-speak` releases it after the printed reply. This is a straight-line simulator controller without obstacle avoidance. All ROS processes must use the same domain, and Python must match the ROS installation.
+
+## Troubleshooting and configuration
+
+| Symptom | Check |
+| --- | --- |
+| `Install Chromium to use --robot` | Install Chromium or set `DOTS_BROWSER` to its executable; launch from a graphical session. |
+| No voice or subtitles | Keep `/robot.html` open; test **Play sample**, API key, speaker output, and internet. A regular browser tab may need an initial click to enable audio. |
+| No microphone response | Check `/robot/status`: IDLE waits for speech, SLEEPING waits for “Hi Kuro”, busy/error states pause input. Run the standalone microphone diagnostics. |
+| `Microphone failed` | Read `~/.cache/face-agent/microphone-chat.log`; check USB permissions, device connection, and default audio source. Stop other microphone tests before chat. |
+| ROS interface import failure | Source Jazzy, run `bash scripts/setup_robot_status.sh`, and source `ros2/install/local_setup.bash` again. |
+| Camera disconnects or no eyes moving | Run only one camera launcher; try `camera.sh`, then `./track.sh --check`. Confirm the compressed image and camera-info topics exist. |
+| Kuro cannot see an object or outfit | Run `camera_snapshot.py --check` with ROS sourced. Confirm the color topic and `python3-pil`; move the object closer or step back to show the outfit. Vision messages appear in `stack-agent.log`. |
+| Display is slow | Use pre-rendered playback; bake customized looks on a stronger computer. |
+| Port 5173 is already in use | Stop the old launcher or choose another port, and point chat/tracking at that service. |
+
+For another port:
+
+```bash
+# Display terminal:
+PORT=5174 DOTS_RENDERER=prerendered ./run.sh --robot
+# Chat terminal:
+.venv/bin/python scripts/chat.py --mode voice --no-track --url http://127.0.0.1:5174
+```
+
+Useful settings: `DOTS_CONFIG` selects the character configuration file; `DOTS_URL` supplies the chatbot service URL; `--model` or `OPENAI_CHAT_MODEL` selects the conversation model; `--wake-model` selects local Whisper; `--language en` or `--language auto` controls recognition language. `DOTS_TIMEZONE` defaults to `Asia/Kuala_Lumpur`. Set `DOTS_CITY` for a fixed weather location; otherwise location lookup may use the connection's public IP through ipapi.co.
+
+Logs are under `~/.cache/face-agent/`: `microphone-chat.log`, `tracking-chat.log`, `robot-status.log`, and `robot-status-bridge.log`. History stays in chatbot process memory and is sent to OpenAI during conversation; SDK trace uploads are disabled.
+
+## Update and develop
+
+To update a clean checkout, stop the application components, then:
+
+```bash
+cd ~/face-agent
+git switch pi5
+git pull --ff-only origin pi5
+.venv/bin/python -m pip install -r requirements.txt -r requirements-respeaker.txt
+bash scripts/setup_robot_status.sh
+```
+
+Restart using the commands above. Local configuration, API keys, virtual environments, and recordings are not committed.
+
+Frontend development needs Node.js **22.12+** and pnpm:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+pnpm test
+```
+
+Commit the regenerated `dist/` after frontend changes so `run.sh` serves the updated app. For hot reload, run `PORT=5174 ./run.sh` in one terminal and `pnpm dev` in another; Vite serves port 5173 and proxies API/pack requests to port 5174. Point chat at the Python service with `--url http://127.0.0.1:5174`.
+
+Focused Python checks:
+
+```bash
+.venv/bin/python -m unittest discover -s test -p test_chat.py
+.venv/bin/python -m unittest discover -s test -p test_voice_input.py
+.venv/bin/python -m unittest discover -s test -p test_voice_recovery.py
+.venv/bin/python -m unittest discover -s test -p 'test_respeaker*.py'
+.venv/bin/python -m unittest discover -s test -p test_robot_service.py
+.venv/bin/python -m unittest discover -s test -p test_camera_vision.py
+# Requires built ROS interfaces and ROS 2 Jazzy:
+.venv/bin/python -m unittest discover -s test -p test_global_status.py
+# ROS/Pillow snapshot tests use the system interpreter, in an isolated ROS domain:
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 -m unittest discover -s test -p test_camera_snapshot.py
+```
+
+Bundled runtime notices are in [public/local-dots/THIRD_PARTY_NOTICES.txt](public/local-dots/THIRD_PARTY_NOTICES.txt). Font licenses are in [public/fonts/](public/fonts/).
+
+
+### Boot readiness
+
+The desktop autostart helper imports the graphical-session environment before
+starting `face-agent.service`. The service waits for DISPLAY or WAYLAND_DISPLAY
+instead of failing before graphical login. The face, camera, microphone and
+cached ready announcement start independently of the remote navigation server.
+
+Navigation tool definitions are stored locally in
+`scripts/navigation_tool_manifest.json`. Tool discovery and ordinary conversation
+make no network request to the navigation MCP. Each actual navigation-tool call
+opens a connection, validates the remote tools (and mock identity when enabled),
+calls once, then closes it. An unavailable server returns a tool error while chat
+continues; a later explicit request tries again. A lost in-flight request is
+reported as unconfirmed and movement is never automatically replayed.
+`--check-navigation-mcp` remains an explicit read-only connectivity check. Update
+the local tool manifest if the remote navigation tool contract changes.
+
+On the robot computer, `region-nav-mcp.service` is enabled and the robot10 user
+manager has lingering enabled so its endpoint can start before desktop login.
+The face agent does not depend on this service being available.

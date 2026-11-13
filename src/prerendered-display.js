@@ -1,3 +1,4 @@
+import { PickVisual } from './pick-visual.js';
 import './style.css';
 import { BakedRenderer, bakedFrame, matchingBake } from './prerendered.js';
 import { IdleMovements } from './native-actions.js';
@@ -5,6 +6,8 @@ import { fittedLayout } from './native-framing.js';
 import { SpeechPlayer } from './speech.js';
 import { SmoothGaze } from './gaze.js';
 import { gazeControls } from './gaze-controls.js';
+import { connectListeningText, listeningTop } from './listening-text.js';
+import { connectFaults } from './fault-chip.js';
 
 async function api(path, value) {
   const response = await fetch(`/api/${path}`, value === undefined ? { cache: 'no-store' } : {
@@ -18,7 +21,9 @@ export async function startBakedDisplay(config) {
   document.body.classList.add('robot-display');
   document.querySelector('#app').innerHTML = `<div class="baked-viewport" id="native-viewport"><canvas id="original-character" role="img" aria-label="Pre-rendered dots character"></canvas></div>
     <p id="robot-subtitles" class="robot-subtitles" dir="auto" aria-label="Speech subtitles" hidden></p>
+    <p id="robot-listening-text" class="robot-listening-text" dir="auto" aria-label="Recognized speech" aria-live="polite" hidden></p>
     <div class="baked-loading" id="baked-loading" role="status">Loading saved animation pack…</div>
+    <div id="fault-chip"></div>
     <div class="robot-hud"><span>AI-generated voice · OpenAI</span><a href="./original-dots.html">Studio</a><button id="device-key-open">API key</button><button id="robot-fullscreen">Enter fullscreen</button><span id="robot-connection" role="status">Connecting…</span></div><div id="toast" class="toast" role="status"></div>
     <dialog id="device-key-dialog" class="key-dialog" aria-labelledby="device-key-title"><form id="device-key-form"><h2 id="device-key-title">Set up this device’s API key</h2><p>Each device needs its own OpenAI API key setup. The key stays in a private file on this device and is excluded from Git, character configuration and animation packs.</p><label class="field-label" for="device-key-input">OpenAI API key</label><input id="device-key-input" class="full-input" type="password" autocomplete="new-password" placeholder="sk-…" required><p id="device-key-error" role="alert"></p><div class="speech-buttons"><button id="device-key-submit" class="outline-button" type="submit">Save API key</button><button id="device-key-later" class="text-button" type="button">Later</button></div></form></dialog>`;
   const $ = selector => document.querySelector(selector);
@@ -31,8 +36,10 @@ export async function startBakedDisplay(config) {
   const canvas = $('#original-character'), renderer = new BakedRenderer(canvas, manifest);
   const clips = new Map(manifest.clips.map(clip => [clip.id, clip]));
   const idle = new IdleMovements(); idle.reset(config.settings.idleInterval);
+  const pickVisual = new PickVisual();
+  let desiredState = 'idle', planningOverlay = false;
   let active, elapsed = 0, started = 0, commandLevel = null, smoothedLevel = 0, lastFrame = 0, drawn = '';
-  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision;
+  let pendingSpeech, speechFetch, request = 0, playTicket = 0, events, lastCommand = -1, generation = '', toastTimer, packRevision, listening;
   const speech = new SpeechPlayer(text => { $('#robot-subtitles').textContent = text; $('#robot-subtitles').hidden = !text; drawn = ''; });
   const toast = message => { $('#toast').textContent = message; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 6000); };
   const gaze = new SmoothGaze(), controls = gazeControls(api, toast);
@@ -76,6 +83,8 @@ export async function startBakedDisplay(config) {
       const onEnd = () => { play('idle').catch(failure => toast(failure.message)); };
       if (response.headers.get('Content-Type')?.includes('application/x-ndjson')) await speech.stream(response, onStart, onEnd, () => {}, command.text || '');
       else await speech.play(await response.blob(), onStart, onEnd, command.text || '');
+      // The voice agent keeps the microphone held until this ack, so the chime marks the moment it reopens.
+      if (command.cue === 'listen' && token === request) await speech.chime();
     } catch (failure) {
       if (failure.name === 'AbortError' || (token !== undefined && token !== request)) return;
       error = failure.message; toast(error); play('idle').catch(() => {});
@@ -86,6 +95,9 @@ export async function startBakedDisplay(config) {
   renderer.prepare(clips.get('speaking')).catch(error => toast(error.message));
   await api('actions', manifest.clips.map(({ id, label }) => ({ id, label })));
   events = new EventSource('/api/events');
+  events.addEventListener('pick-visual', event => pickVisual.receive(JSON.parse(event.data), performance.now()));
+  listening = connectListeningText(events, $('#robot-listening-text'), () => { drawn = ''; });
+  connectFaults(events, $('#fault-chip'));
   events.onopen = status;
   events.onerror = () => { $('#robot-connection').textContent = 'Reconnecting…'; };
   events.addEventListener('config-error', event => toast(JSON.parse(event.data).error));
@@ -104,9 +116,13 @@ export async function startBakedDisplay(config) {
     const command = JSON.parse(event.data);
     if (command.generation === generation && command.sequence <= lastCommand) return;
     generation = command.generation; lastCommand = command.sequence;
+    desiredState = command.state; listening.command(command);
     let error = '';
     try {
-      await play(command.speech ? 'idle' : command.state);
+      const target = command.speech ? 'idle' : pickVisual.state(command.state, performance.now());
+      const overlay = !command.speech && target !== command.state;
+      if (!(overlay && planningOverlay)) await play(target);
+      planningOverlay = overlay;
       if (command.generation !== generation || command.sequence !== lastCommand) return;
       commandLevel = command.level;
       if (command.speech) {
@@ -120,8 +136,15 @@ export async function startBakedDisplay(config) {
   function frame(now) {
     if (!document.hidden && active && now - lastFrame >= 1000 / 30) {
       const dt = Math.min(.1, (now - lastFrame) / 1000); lastFrame = now;
+      const overlay = pickVisual.state(desiredState, now, !!pendingSpeech) !== desiredState;
+      if (overlay && !planningOverlay) {
+        planningOverlay = true; play('thinking', true).catch(error => toast(error.message));
+      } else if (!overlay && planningOverlay) {
+        planningOverlay = false;
+        play(desiredState, true).catch(error => toast(error.message));
+      }
       elapsed = (now - started) / 1000;
-      if (active.id !== 'speaking' && active.loopStart === null && elapsed >= active.count / manifest.fps) play('idle').catch(error => toast(error.message));
+      if (active.id !== 'speaking' && active.loopStart === null && elapsed >= active.count / manifest.fps) { desiredState = 'idle'; play('idle').catch(error => toast(error.message)); }
       const random = idle.tick(dt, { idle: active.id === 'idle', enabled: config.settings.autoIdle,
         reduced: config.settings.reducedMotion, signatureAvailable: clips.has('signature') });
       if (random && !(gaze.tracking && random.startsWith('look-'))) play(random).catch(error => toast(error.message));
@@ -138,7 +161,9 @@ export async function startBakedDisplay(config) {
       const rect = $('#native-viewport').getBoundingClientRect();
       const subtitles = $('#robot-subtitles');
       const bottom = subtitles.hidden ? rect.bottom : Math.min(rect.bottom, subtitles.getBoundingClientRect().top - 12);
-      const layout = fittedLayout(active.bounds, rect.width, Math.max(1, bottom - rect.top));
+      const offset = listeningTop($('#robot-listening-text'), rect);
+      const layout = fittedLayout(active.bounds, rect.width, Math.max(1, bottom - rect.top - offset));
+      layout.top += offset;
       Object.assign(canvas.style, { width: `${layout.size}px`, height: `${layout.size}px`, left: `${layout.left}px`, top: `${layout.top}px` });
     } else if (document.hidden) { started += Math.max(0, now - lastFrame); lastFrame = now; }
     requestAnimationFrame(frame);

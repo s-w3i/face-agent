@@ -1,3 +1,5 @@
 # CPU-only ARM64 wheels; keep this environment separate from voice and ROS packages.
 numpy>=1.24,<2
 opencv-python-headless==4.11.0.86
+# Optional Hailo-8L backend: track.sh installs hailort==<runtime version> from ~/hailo-debs
+# (HAILO_WHEEL_DIR) when hailortcli is present; it brings netaddr, netifaces, future, contextlib2.

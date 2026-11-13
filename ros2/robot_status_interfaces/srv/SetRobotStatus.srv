@@ -1,0 +1,11 @@
+# IDLE, LISTENING, THINKING, SPEAKING, ERROR, SLEEPING, WORKING, DETECTING.
+# Status matching is case insensitive.
+string status
+# Zero means unconditional. Agents use the current revision to avoid overwriting
+# a newer command from another node while a model or speech job was running.
+uint64 expected_revision
+string source
+---
+bool success
+string message
+RobotStatus current

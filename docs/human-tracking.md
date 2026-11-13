@@ -18,6 +18,78 @@ Install Python venv support if it is missing:
 sudo apt install python3-venv
 ```
 
+### Ubuntu 24.04 / ROS 2 Jazzy on this Pi
+
+This Pi uses the official ARM64 `ros-jazzy-orbbec-camera` package (2.9.3),
+installed under `/opt/ros/jazzy`, with the image transport plugins. A source
+workspace is not required for this installation.
+
+With the current USB 2 cable, launch `./camera.sh` from the repository. It sources
+Jazzy and publishes `/head_camera/color/image_raw/compressed` and camera
+calibration at 640×480 / 15 fps using V4L2. Depth and point clouds are disabled;
+the face tracker only needs color images. This profile streamed successfully
+on the connected Gemini 335. Earlier simultaneous color/depth configurations
+with the projector at level 6 repeatedly disconnected on this USB connection.
+
+For color and point-cloud output above 10 delivered FPS over the current USB 2
+connection, use the separate RGB-D launcher:
+
+```sh
+bash /home/cutiepie/face-agent/camera-rgbd.sh
+```
+
+It uses **1280×720 MJPEG color at 15 fps** and **640×480 Y16 depth at 30 fps**,
+with XYZ point clouds on `/head_camera/depth/points` and no cloud decimation.
+The final 90-second launcher test delivered 15.43 fps compressed color, 11.90 fps
+raw color, 25.08 fps raw depth, and 23.36 fps point clouds, with approximately
+288,000 valid points in the final cloud and no USB disconnects. All four streams
+averaged above 10 fps. Face tracking uses
+`/head_camera/color/image_raw/compressed`; this is not a colored point cloud.
+Frame synchronization is disabled, so color and depth run at their own rates.
+The larger 848×480 depth mode, configured for 10 fps, delivered only 7.95 fps
+point clouds. Configuring 640×480 depth at 15 fps delivered 10.99 fps point clouds;
+using its supported 30 fps mode provides more headroom above the 10 fps target.
+
+The important setting for this cable is **`laser_energy_level:=5`** with
+`enable_laser:=true`. Level 6 reproduced the USB disconnect loop even at low
+resolution and with depth alone. Levels 1, 3 and 5 streamed usable depth; level 5
+is retained for the faster profile. Disabling the projector also
+worked, with less depth coverage on the tested scene. These results identify a
+working configuration, but do not establish whether the underlying fault is in
+the cable/power path or camera firmware. The current device does not support
+`color_mjpeg_quality`, so that option is omitted.
+
+For maximum resolution at lower FPS, the earlier 90-second high-resolution test
+had zero USB disconnects, 689 distinct
+compressed color frames (7.99 fps), and 384 XYZ clouds (4.47 fps), with about
+908,000 valid points in the final cloud. Rates can fall further when the Pi is
+also running tracking, local Whisper, or RViz. These measurements describe this
+machine and scene, rather than a guarantee for every USB 2 cable or power supply.
+That profile remains available through launcher overrides:
+
+```sh
+bash /home/cutiepie/face-agent/camera-rgbd.sh \
+  color_width:=1920 color_height:=1080 color_fps:=8 \
+  depth_width:=1280 depth_height:=800 depth_fps:=6
+```
+
+Stop any previous camera launch with Ctrl+C before starting either launcher.
+Only one driver process should own the camera at a time.
+
+Start `./run.sh --robot` in another terminal. For chat with automatic tracking,
+run these commands in a third terminal:
+
+```sh
+source /opt/ros/jazzy/setup.bash
+.venv/bin/python scripts/chat.py --mode words
+```
+
+Wake the saved character with `Hi Kuro`. To test tracking without chat, use
+`source /opt/ros/jazzy/setup.bash` followed by `./track.sh --stats` while the
+robot is awake. Ctrl+C stops each foreground process.
+
+### Other ROS installations / source workspace
+
 Keep the camera workspace in a persistent directory such as `~/orbbec_ws`.
 The previous `/tmp/orbbec-ros-check` build disappeared when the temporary directory
 was cleared. On a new device, follow the
@@ -90,18 +162,37 @@ then start voice chat with the updated robot service and camera running:
 .venv/bin/python scripts/chat.py --mode voice --url http://127.0.0.1:5174
 ```
 
-Stay silent during startup background calibration. After `Voice mode ready`,
-speak normally; voice mode needs no wake phrase. Partial and final transcription
-appear in the terminal and feed the existing agent, history and tools. The
-microphone pauses before inference and robot speech, discards buffered input,
-and resumes after the display confirms playback completion plus a 0.5-second
-clearance. Speak when Shiro returns to Listening. `/reset` and `/quit` still work
-as terminal commands. Words mode starts no microphone process.
+Wait while local Whisper loads. After `Voice mode ready`, say **Hi Kuro** to
+wake the robot. Wake detection stays local on the Pi. While awake, command audio
+streams to GPT Realtime transcription; partial words appear above the character.
+Hardware VAD starts recording without idle capture, and 2 seconds of consecutive
+audio nonspeech ends it. The existing agent, history and tools receive the final
+transcript. The microphone pauses before inference and robot speech, discards
+partial input, and resumes after playback plus a 0.5-second clearance.
+Kuro sleeps after **3 seconds of inactivity**, starting after its reply finishes.
+Recording, the two-second silence endpoint, transcription, Thinking, and Speaking
+do not count as inactivity. A standalone goodbye or thank-you
+sleeps after the closing reply and returns transcription to local Whisper;
+further requests in the same message keep it awake. `/reset` and `/quit` remain
+terminal commands. Words mode starts no microphone process.
 
-A USB microphone interruption triggers automatic restart attempts and background
-recalibration while input remains closed. Chat history survives, but old buffered
+The chatbot also exposes ROS 2 `/kuro/wake` automatically. From another terminal:
+
+```sh
+source /opt/ros/jazzy/setup.bash
+ros2 service call /kuro/wake std_srvs/srv/Trigger '{}'
+```
+
+This wakes Kuro into Listening without a spoken greeting. The response confirms
+success only after the voice backend is ready. An already-awake call resets the
+three-second timer; a call during a reply waits for that turn to finish. Use the
+same ROS domain/discovery settings as chat. The service exists while chat runs;
+`--no-ros-wake` disables it. ROS logs are in `~/.cache/face-agent/ros-wake.log`.
+
+A USB microphone interruption triggers automatic restart attempts while input
+remains closed. Chat history survives, but old queued
 speech and camera hints are cleared. The tracker gets a fresh session before
-new speech can select someone. Wait through recalibration and robot playback
+new speech can select someone. Wait through microphone restart and robot playback
 before speaking again. Recovery cannot repair a faulty USB cable or hub.
 
 The confirmed microphone mounting is native DOA **0° straight ahead at camera
@@ -139,7 +230,7 @@ Run this check before starting tracking on a new device:
 ./track.sh --check
 ```
 
-It checks ROS imports and actually executes both CPU models, then exits. The Pi
+It checks ROS imports and actually executes both models of the selected backend (Hailo-8L or CPU), then exits; the JSON includes `backend` and `threshold`. The Pi
 output should show `platform: aarch64`. If your active `python3` does not match
 ROS, select its interpreter, for example `TRACKING_PYTHON=/usr/bin/python3`.
 Horizontal camera coordinates are mirrored by default for the front-facing robot:
@@ -214,6 +305,25 @@ is controlled by its own terminal.
 The `--stats` output shows processed fps, mean processing time, model call counts,
 and lock state. `--duration 30` runs a bounded 30-second test. Evaluate these with
 the robot display and voice running together on the actual Pi.
+
+## Hailo-8L face backend (AI HAT)
+
+With the Raspberry Pi AI HAT (Hailo-8L), face detection (SCRFD 2.5g) and identity features (ArcFace MobileFaceNet) run on the accelerator instead of the CPU. The optical flow, speaker selection, DOA fusion, identity lock and gaze logic are unchanged.
+
+- **Selection:** `--tracker-backend auto` (default) uses the Hailo-8L when available and otherwise OpenCV, logging one line why. `hailo` prefers it the same way; `opencv` always uses the CPU models. Set `DOTS_TRACKER_BACKEND` in `~/.config/face-agent/startup.env` to choose it for chat-started tracking.
+- **Requirements:**
+  - HailoRT 4.23 and its PCIe driver (apt).
+  - **`hailort.service` running**, so the tracker and other processes share the device: `systemctl status hailort.service`.
+  - The HEFs in `/usr/local/hailo/resources/models/hailo8l/` (`scrfd_2.5g.hef`, `arcface_mobilefacenet.hef`). Override them with `DOTS_HAILO_FACE_DETECTOR` / `DOTS_HAILO_FACE_RECOGNIZER`.
+  - `./track.sh` installs the matching `hailort` Python wheel from `~/hailo-debs/` (`HAILO_WHEEL_DIR`) into the tracking environment when `hailortcli` is present.
+- **Fallback:** if the binding, the service, the device or a model is unavailable, tracking starts on OpenCV. Hailo problems never stop tracking.
+- **Threshold:** ArcFace similarities differ from SFace's, so the default is per backend: `.45` for Hailo and `.55` for OpenCV.
+  - On Hailo's three sample identities, ArcFace kept same-person pairs at ≥ .937 and different people at ≤ .04 (SFace: ≥ .836 / ≤ .16).
+  - Validate `.45` on your robot with three people before relying on it.
+- **CPU:** replaying 60 s of video through the tracker:
+  - The face-model work per frame dropped from 3.6 ms to 0.3 ms.
+  - Total tracker CPU dropped about 40%, because JPEG decoding and resizing (about 4.8 ms per frame) stay on the CPU.
+  - Measure with `~/.cache/face-agent/tracking-venv/bin/python scripts/tracker_bench.py VIDEO`.
 
 ## Validation and limits
 
